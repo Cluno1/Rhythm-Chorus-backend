@@ -88,7 +88,20 @@ curl http://10.88.0.1:8010/healthz
 
 启动时自动执行 Alembic upgrade。运维与备份见 `docs/deployment.md`。
 
-当前 `0.3.0` 已于 `2026-09-03` 部署到该中心机，v1 数据保留在 `rhythm.sqlite3`，v2 独立使用 `rhythm-v2.sqlite3`。v1 -> v2 业务数据尚未导入。
+当前 `0.3.0` 已于 `2026-09-03` 部署到该中心机，v1 数据保留在 `rhythm.sqlite3`，v2 独立使用 `rhythm-v2.sqlite3`。旧 v1 业务数据尚未迁移；v2 已导入下述 COS 典型测试样本。
+
+## COS 典型样本导入
+
+`scripts/import_cos_samples.py` 从 GMUSIC Mongo 索引和 COS 导入一组固定的小样本，用来验证多谱、修订、扫描附件、MIDI Rendition、Asset 去重和 Range 播放。当前样本为 `321`、`348`、`528`、`test1`、`110`。
+
+脚本要求环境中提供 `RHYTHM_BOOTSTRAP_TOKEN`、`COS_*` 与 `MONGO_*` 配置，并使用已安装 `pymongo`、`cos-python-sdk-v5` 的 ingestion Python：
+
+```bash
+python scripts/import_cos_samples.py --dry-run
+python scripts/import_cos_samples.py
+```
+
+导入以 `gmusic` alias、Score label、修订链和 SHA-256 判重，可以重复运行。GMUSIC MusicXML 的标准 Recordare 外部 DTD 会在上传前移除，以满足后端的 XXE 防护；Asset source ref 会同时记录原 COS key、原始 SHA-256、原始大小和转换版本，COS 原文件不会被修改。
 
 ## 验证
 
