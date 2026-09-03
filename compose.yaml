@@ -1,0 +1,38 @@
+services:
+  api:
+    container_name: rhythm-metadata-api
+    build:
+      context: .
+      network: host
+      args:
+        HTTP_PROXY: http://127.0.0.1:7890
+        HTTPS_PROXY: http://127.0.0.1:7890
+        NO_PROXY: 127.0.0.1,localhost,10.88.0.0/24
+    network_mode: host
+    command:
+      - uvicorn
+      - rhythm_metadata_api.main:app
+      - --host
+      - 10.88.0.1
+      - --port
+      - "8010"
+    environment:
+      RHYTHM_ENVIRONMENT: production
+      RHYTHM_BOOTSTRAP_TOKEN: ${RHYTHM_BOOTSTRAP_TOKEN:?set RHYTHM_BOOTSTRAP_TOKEN}
+      RHYTHM_DATABASE_PATH: /data/rhythm.sqlite3
+      RHYTHM_V2_DATABASE_PATH: /data/rhythm-v2.sqlite3
+      RHYTHM_LOCAL_OBJECT_ROOT: /data/objects
+    volumes:
+      - ./data:/data
+    init: true
+    mem_limit: 256m
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://10.88.0.1:8010/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
