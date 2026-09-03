@@ -88,6 +88,8 @@ curl http://10.88.0.1:8010/healthz
 
 启动时自动执行 Alembic upgrade。运维与备份见 `docs/deployment.md`。
 
+当前 `0.3.0` 已于 `2026-09-03` 部署到该中心机，v1 数据保留在 `rhythm.sqlite3`，v2 独立使用 `rhythm-v2.sqlite3`。v1 -> v2 业务数据尚未导入。
+
 ## 验证
 
 ```bash
@@ -101,4 +103,4 @@ ruff check src tests
 
 - Release、Lyrics、Artwork 与 metadata suggestions。
 - 删除墓碑、对象 GC、转码/预览 worker、COS adapter。
-- 旧 v1 Demo 数据一次性导入与线上 v2 部署。
+- 旧 v1 Demo 数据一次性导入与 Android v2 端到端联调。
