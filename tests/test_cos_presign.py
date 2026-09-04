@@ -25,8 +25,8 @@ def test_presign_cos_get_is_deterministic_golden() -> None:
         "?q-sign-algorithm=sha1&q-ak=AKIDx"
         "&q-sign-time=1700000000;1700000900"
         "&q-key-time=1700000000;1700000900"
-        "&q-header-list=&q-url-param-list="
-        "&q-signature=7e3e47f1975f75d35e4c46ee828e0781bc3efd4b"
+        "&q-header-list=host&q-url-param-list="
+        "&q-signature=783730746a6143aa1c3aefecfa2853ef4169ec04"
     )
     assert expires_at == datetime(2023, 11, 14, 22, 28, 20, tzinfo=UTC)
 
