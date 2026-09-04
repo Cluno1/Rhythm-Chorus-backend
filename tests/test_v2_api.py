@@ -12,11 +12,15 @@ from rhythm_metadata_api.infrastructure.db.models import (
     Arrangement,
     Asset,
     AssetLocation,
+    Contributor,
     Release,
     ReleaseItem,
     Rendition,
     RenditionAsset,
+    Score,
+    ScoreRevision,
     Work,
+    WorkCredit,
     utc_now,
 )
 from rhythm_metadata_api.main import create_app
@@ -100,6 +104,29 @@ def test_asset_delivery_and_native_library_projection(client: TestClient) -> Non
         arrangement = Arrangement(work_id=work.id, name="Imported")
         session.add(arrangement)
         session.flush()
+        score = Score(
+            arrangement_id=arrangement.id,
+            label="Published score",
+            origin="ocr",
+            lyrics="score lyrics",
+        )
+        contributor = Contributor(display_name="Composer")
+        session.add_all([score, contributor])
+        session.flush()
+        revision = ScoreRevision(score_id=score.id, revision_no=1)
+        session.add(revision)
+        session.flush()
+        score.head_revision_id = revision.id
+        score.published_revision_id = revision.id
+        arrangement.preferred_score_id = score.id
+        session.add(
+            WorkCredit(
+                work_id=work.id,
+                contributor_id=contributor.id,
+                role="composer",
+                position=1,
+            )
+        )
         rendition = Rendition(
             arrangement_id=arrangement.id,
             label="Your Faithfulness",
@@ -120,8 +147,8 @@ def test_asset_delivery_and_native_library_projection(client: TestClient) -> Non
             [
                 AssetLocation(
                     asset_id=audio.id,
-                    provider="cos",
-                    storage_key="bible-1328751369/music/example.mp3",
+                    provider="local",
+                    storage_key="sha256/aa/example.mp3",
                 ),
                 RenditionAsset(rendition_id=rendition.id, asset_id=audio.id, role="stream"),
             ]
@@ -152,6 +179,11 @@ def test_asset_delivery_and_native_library_projection(client: TestClient) -> Non
         session.flush()
         session.add_all(
             [
+                AssetLocation(
+                    asset_id=second_audio.id,
+                    provider="local",
+                    storage_key="sha256/bb/second.mp3",
+                ),
                 RenditionAsset(
                     rendition_id=second_rendition.id,
                     asset_id=second_audio.id,
@@ -189,6 +221,33 @@ def test_asset_delivery_and_native_library_projection(client: TestClient) -> Non
                     release_id=release.id,
                     rendition_id=midi_rendition.id,
                     display_order=3,
+                ),
+            ]
+        )
+        no_location_audio = Asset(
+            sha256="f" * 64,
+            byte_size=100,
+            detected_media_type="audio/mpeg",
+            state="ready",
+        )
+        no_location_rendition = Rendition(
+            arrangement_id=arrangement.id,
+            label="No Location Song",
+            kind="performance",
+        )
+        session.add_all([no_location_audio, no_location_rendition])
+        session.flush()
+        session.add_all(
+            [
+                RenditionAsset(
+                    rendition_id=no_location_rendition.id,
+                    asset_id=no_location_audio.id,
+                    role="stream",
+                ),
+                ReleaseItem(
+                    release_id=release.id,
+                    rendition_id=no_location_rendition.id,
+                    display_order=5,
                 ),
             ]
         )
@@ -235,12 +294,12 @@ def test_asset_delivery_and_native_library_projection(client: TestClient) -> Non
             "rendition_id": rendition_id,
             "album_id": release_id,
             "title": "Your Faithfulness",
-            "artist": None,
+            "artist": "Composer",
             "album_title": "ihope",
             "duration_ms": 123000,
             "track_no": 109,
             "cover_url": None,
-            "lyrics": "work lyrics",
+            "lyrics": "score lyrics",
         }
     ]
     second_page = client.get(

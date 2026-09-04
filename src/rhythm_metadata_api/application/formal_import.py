@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+import unicodedata
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ from rhythm_metadata_api.infrastructure.db.models import (
     AssetSource,
     ChangeEvent,
     ChangeEventWork,
+    Contributor,
     Release,
     ReleaseItem,
     Rendition,
@@ -28,6 +30,7 @@ from rhythm_metadata_api.infrastructure.db.models import (
     ScoreRevisionAsset,
     Work,
     WorkAlias,
+    WorkCredit,
 )
 
 MUSICXML_MEDIA_TYPE = "application/vnd.recordare.musicxml+xml"
@@ -53,6 +56,12 @@ class ScoreManifestRow:
     media_type: str = MUSICXML_MEDIA_TYPE
     language: str | None = None
     lyrics: str | None = None
+    composers: tuple[str, ...] = ()
+    lyricists: tuple[str, ...] = ()
+    key_signature: str | None = None
+    time_signature: str | None = None
+    tempo: str | None = None
+    year: str | None = None
     verified: bool = False
 
 
@@ -86,6 +95,8 @@ class ImportSummary:
     release_items: int
     assets: int
     cos_locations: int
+    contributors: int
+    work_credits: int
 
 
 def deterministic_id(kind: str, source_key: str) -> str:
@@ -118,6 +129,12 @@ def read_score_manifest(path: Path) -> list[ScoreManifestRow]:
                         media_type=str(value.get("media_type") or MUSICXML_MEDIA_TYPE),
                         language=_optional(value.get("language") or value.get("lyrics_lang")),
                         lyrics=_optional(value.get("lyrics")),
+                        composers=_names(value.get("composers") or value.get("composer")),
+                        lyricists=_names(value.get("lyricists") or value.get("lyricist")),
+                        key_signature=_optional(value.get("key_signature")),
+                        time_signature=_optional(value.get("time_signature")),
+                        tempo=_optional(value.get("tempo")),
+                        year=_optional(value.get("year")),
                         verified=_bool(value.get("verified")),
                     )
                 )
@@ -194,6 +211,38 @@ class FormalCatalogImporter:
         invalid = [key for key in imported_work_keys if canonical_by_work[key] != 1]
         if invalid:
             raise FormalImportError(f"works must have one canonical revision: {invalid[:5]}")
+        canonical_keys = {row.work_key for row in score_rows if row.status == "canonical"}
+        candidate_only_keys = {
+            row.work_key for row in score_rows if row.status == "candidate"
+        } - canonical_keys
+        allowed_match_methods = {
+            "normalized-exact",
+            "semantic-confirmed",
+            "candidate-title",
+            "song-only",
+        }
+        for row in song_rows:
+            if row.match_method not in allowed_match_methods:
+                raise FormalImportError(f"unsupported match method: {row.match_method}")
+            if row.confidence.casefold() == "low":
+                raise FormalImportError(f"low-confidence mapping is not importable: {row.mp3_cos_key}")
+            if row.score_status == "canonical":
+                if row.mongo_work_key not in canonical_keys or row.match_method not in {
+                    "normalized-exact",
+                    "semantic-confirmed",
+                }:
+                    raise FormalImportError(f"invalid canonical mapping: {row.mp3_cos_key}")
+            elif row.score_status == "candidate-only":
+                if (
+                    row.mongo_work_key not in candidate_only_keys
+                    or row.match_method != "candidate-title"
+                ):
+                    raise FormalImportError(f"invalid candidate mapping: {row.mp3_cos_key}")
+            elif row.score_status == "no-score":
+                if row.mongo_work_key is not None or row.match_method != "song-only":
+                    raise FormalImportError(f"invalid song-only mapping: {row.mp3_cos_key}")
+            else:
+                raise FormalImportError(f"unsupported score status: {row.score_status}")
         imported_scores = [row for row in score_rows if row.status in {"canonical", "superseded"}]
         work_keys = {row.work_key for row in imported_scores}
         song_only = {
@@ -213,6 +262,19 @@ class FormalCatalogImporter:
             release_items=len(song_rows),
             assets=len(asset_keys),
             cos_locations=len(asset_keys),
+            contributors=len(
+                {
+                    _normalized_name(name)
+                    for row in imported_scores
+                    if row.status == "canonical"
+                    for name in (*row.composers, *row.lyricists)
+                }
+            ),
+            work_credits=sum(
+                len(set(row.composers)) + len(set(row.lyricists))
+                for row in imported_scores
+                if row.status == "canonical"
+            ),
         )
 
     def import_all(
@@ -227,7 +289,8 @@ class FormalCatalogImporter:
         for work_key, rows in sorted(by_work.items()):
             canonical = next(row for row in rows if row.status == "canonical")
             work = self._ensure_work(work_key, canonical.title, canonical.language, canonical.lyrics)
-            arrangement = self._ensure_arrangement(work, work_key)
+            self._ensure_work_credits(work, canonical.composers, canonical.lyricists)
+            arrangement = self._ensure_arrangement(work, work_key, canonical.key_signature)
             arrangements[work_key] = arrangement
             self._ensure_score(work_key, arrangement, rows)
 
@@ -248,7 +311,7 @@ class FormalCatalogImporter:
                 work = self._ensure_work(
                     work_key, row.song_title, _normalize_language(row.language_variant), None
                 )
-                arrangement = self._ensure_arrangement(work, work_key)
+                arrangement = self._ensure_arrangement(work, work_key, None)
                 arrangements[work_key] = arrangement
             release_work_ids.add(arrangement.work_id)
             asset = self._ensure_asset(
@@ -291,6 +354,10 @@ class FormalCatalogImporter:
             work = self.session.get(Work, alias.work_id)
             if work is None:
                 raise FormalImportError(f"dangling work alias {work_key}")
+            expected = (title, language, lyrics, "active")
+            actual = (work.canonical_title, work.language, work.lyrics, work.status)
+            if actual != expected:
+                raise FormalImportError(f"work manifest drift for {work_key}")
             return work
         work = Work(
             id=deterministic_id("work", work_key),
@@ -319,7 +386,9 @@ class FormalCatalogImporter:
         )
         return work
 
-    def _ensure_arrangement(self, work: Work, work_key: str) -> Arrangement:
+    def _ensure_arrangement(
+        self, work: Work, work_key: str, key_signature: str | None
+    ) -> Arrangement:
         arrangement_id = deterministic_id("arrangement", work_key)
         arrangement = self.session.get(Arrangement, arrangement_id)
         if arrangement is None:
@@ -327,9 +396,16 @@ class FormalCatalogImporter:
                 id=arrangement_id,
                 work_id=work.id,
                 name="正式编配",
+                key_signature=key_signature,
             )
             self.session.add(arrangement)
             self.session.flush()
+        elif (
+            arrangement.work_id != work.id
+            or arrangement.name != "正式编配"
+            or arrangement.key_signature != key_signature
+        ):
+            raise FormalImportError(f"arrangement manifest drift for {work_key}")
         self._ensure_change_event(
             entity_type="arrangement",
             entity_id=arrangement.id,
@@ -343,6 +419,7 @@ class FormalCatalogImporter:
         self, work_key: str, arrangement: Arrangement, rows: list[ScoreManifestRow]
     ) -> Score:
         score_id = deterministic_id("score", work_key)
+        canonical = next(row for row in rows if row.status == "canonical")
         score = self.session.get(Score, score_id)
         if score is None:
             score = Score(
@@ -350,9 +427,17 @@ class FormalCatalogImporter:
                 arrangement_id=arrangement.id,
                 label="GMUSIC OCR",
                 origin="ocr",
+                lyrics=canonical.lyrics,
             )
             self.session.add(score)
             self.session.flush()
+        elif (
+            score.arrangement_id != arrangement.id
+            or score.label != "GMUSIC OCR"
+            or score.origin != "ocr"
+            or score.lyrics != canonical.lyrics
+        ):
+            raise FormalImportError(f"score manifest drift for {work_key}")
         revisions: dict[int, ScoreRevision] = {}
         previous: ScoreRevision | None = None
         for row in sorted(rows, key=lambda value: value.revision_no):
@@ -407,7 +492,6 @@ class FormalCatalogImporter:
                 work_ids=[arrangement.work_id],
                 payload={"mongo_id": row.mongo_id, "status": row.status},
             )
-        canonical = next(row for row in rows if row.status == "canonical")
         score.head_revision_id = revisions[max(revisions)].id
         score.published_revision_id = revisions[canonical.revision_no].id
         arrangement.preferred_score_id = score.id
@@ -492,11 +576,11 @@ class FormalCatalogImporter:
 
     def _ensure_rendition(self, arrangement: Arrangement, row: SongMappingRow) -> Rendition:
         rendition_id = deterministic_id("rendition", row.mp3_cos_key)
+        label = row.song_title
+        if _normalize_language(row.language_variant) == "en":
+            label = f"{label} ({row.language_variant})"
         rendition = self.session.get(Rendition, rendition_id)
         if rendition is None:
-            label = row.song_title
-            if row.language_variant and row.language_variant.lower() not in {"中文", "chinese"}:
-                label = f"{label} ({row.language_variant})"
             rendition = Rendition(
                 id=rendition_id,
                 arrangement_id=arrangement.id,
@@ -506,6 +590,13 @@ class FormalCatalogImporter:
             )
             self.session.add(rendition)
             self.session.flush()
+        elif (
+            rendition.arrangement_id != arrangement.id
+            or rendition.label != label
+            or rendition.kind != "performance"
+            or rendition.duration_ms != row.duration_ms
+        ):
+            raise FormalImportError(f"rendition manifest drift for {row.mp3_cos_key}")
         self._ensure_change_event(
             entity_type="rendition",
             entity_id=rendition.id,
@@ -541,6 +632,8 @@ class FormalCatalogImporter:
             release = Release(id=deterministic_id("release", key), key=key, title=title)
             self.session.add(release)
             self.session.flush()
+        elif release.title != title:
+            raise FormalImportError(f"release manifest drift for {key}")
         return release
 
     def _ensure_release_item(
@@ -564,8 +657,7 @@ class FormalCatalogImporter:
                 )
             )
         elif item.track_no != track_no or item.display_order != display_order:
-            item.track_no = track_no
-            item.display_order = display_order
+            raise FormalImportError(f"release item manifest drift for {rendition.id}")
 
     def _summary(self) -> ImportSummary:
         return ImportSummary(
@@ -583,7 +675,43 @@ class FormalCatalogImporter:
                     )
                 )
             ),
+            contributors=self._count(Contributor),
+            work_credits=self._count(WorkCredit),
         )
+
+    def _ensure_work_credits(
+        self, work: Work, composers: tuple[str, ...], lyricists: tuple[str, ...]
+    ) -> None:
+        for role, names in (("composer", composers), ("lyricist", lyricists)):
+            for position, name in enumerate(dict.fromkeys(names), 1):
+                normalized = _normalized_name(name)
+                contributor_id = deterministic_id("contributor", normalized)
+                contributor = self.session.get(Contributor, contributor_id)
+                if contributor is None:
+                    contributor = Contributor(id=contributor_id, display_name=name.strip())
+                    self.session.add(contributor)
+                    self.session.flush()
+                elif _normalized_name(contributor.display_name) != normalized:
+                    raise FormalImportError(f"contributor manifest drift for {name}")
+                credit_id = deterministic_id("work-credit", f"{work.id}:{role}:{normalized}")
+                credit = self.session.get(WorkCredit, credit_id)
+                if credit is None:
+                    self.session.add(
+                        WorkCredit(
+                            id=credit_id,
+                            work_id=work.id,
+                            contributor_id=contributor.id,
+                            role=role,
+                            position=position,
+                        )
+                    )
+                elif (
+                    credit.work_id != work.id
+                    or credit.contributor_id != contributor.id
+                    or credit.role != role
+                    or credit.position != position
+                ):
+                    raise FormalImportError(f"work credit manifest drift for {work.id}:{role}")
 
     def _ensure_change_event(
         self,
@@ -671,3 +799,14 @@ def _normalize_language(value: str | None) -> str | None:
     if normalized in {"中文", "chinese", "zh", "zh-cn", "zh-hans"}:
         return "zh-Hans"
     return value
+
+
+def _names(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    values = value if isinstance(value, list) else [value]
+    return tuple(str(item).strip() for item in values if str(item).strip())
+
+
+def _normalized_name(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value).split()).casefold()

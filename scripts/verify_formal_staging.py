@@ -16,6 +16,8 @@ EXPECTED_COUNTS = {
     "v2_release_items": 73,
     "v2_assets": 166,
     "v2_asset_locations": 166,
+    "v2_contributors": 108,
+    "v2_work_credits": 129,
 }
 
 
@@ -74,6 +76,11 @@ def main() -> None:
                 SELECT min(r2.revision_no) FROM v2_score_revisions r2 WHERE r2.score_id=r.score_id
             ) AND r.based_on_revision_id IS NULL
         """,
+        "works_with_lyrics": "SELECT count(*) FROM v2_works WHERE lyrics IS NOT NULL",
+        "scores_with_lyrics": "SELECT count(*) FROM v2_scores WHERE lyrics IS NOT NULL",
+        "arrangements_with_key_signature": """
+            SELECT count(*) FROM v2_arrangements WHERE key_signature IS NOT NULL
+        """,
     }
     values = {name: connection.execute(query).fetchone()[0] for name, query in checks.items()}
     report["checks"] = values
@@ -89,6 +96,9 @@ def main() -> None:
         "change_events": 458,
         "works_with_bundle_version": 107,
         "broken_revision_parents": 0,
+        "works_with_lyrics": 77,
+        "scores_with_lyrics": 77,
+        "arrangements_with_key_signature": 77,
     }
     if values != required:
         failures.append(f"business invariant mismatch: expected={required}, actual={values}")

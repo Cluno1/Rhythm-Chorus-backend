@@ -17,6 +17,26 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    with op.batch_alter_table("v2_works") as batch_op:
+        batch_op.create_foreign_key(
+            "fk_v2_works_cover_asset", "v2_assets", ["cover_asset_id"], ["id"], ondelete="SET NULL"
+        )
+    with op.batch_alter_table("v2_arrangements") as batch_op:
+        batch_op.create_foreign_key(
+            "fk_v2_arrangements_cover_asset",
+            "v2_assets",
+            ["cover_asset_id"],
+            ["id"],
+            ondelete="SET NULL",
+        )
+    with op.batch_alter_table("v2_renditions") as batch_op:
+        batch_op.create_foreign_key(
+            "fk_v2_renditions_cover_asset",
+            "v2_assets",
+            ["cover_asset_id"],
+            ["id"],
+            ondelete="SET NULL",
+        )
     op.create_table(
         "v2_releases",
         sa.Column("id", sa.String(length=36), nullable=False),
@@ -65,3 +85,9 @@ def downgrade() -> None:
     op.drop_table("v2_release_items")
     op.drop_index("v2_releases_title_idx", table_name="v2_releases")
     op.drop_table("v2_releases")
+    with op.batch_alter_table("v2_renditions") as batch_op:
+        batch_op.drop_constraint("fk_v2_renditions_cover_asset", type_="foreignkey")
+    with op.batch_alter_table("v2_arrangements") as batch_op:
+        batch_op.drop_constraint("fk_v2_arrangements_cover_asset", type_="foreignkey")
+    with op.batch_alter_table("v2_works") as batch_op:
+        batch_op.drop_constraint("fk_v2_works_cover_asset", type_="foreignkey")

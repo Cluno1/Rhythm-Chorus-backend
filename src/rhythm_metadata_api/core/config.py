@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     def reject_default_production_token(self) -> "Settings":
         if self.environment == "production" and self.bootstrap_token == "change-me-in-development":
             raise ValueError("RHYTHM_BOOTSTRAP_TOKEN must be set in production")
+        if bool(self.cos_secret_id) != bool(self.cos_secret_key):
+            raise ValueError("RHYTHM_COS_SECRET_ID and RHYTHM_COS_SECRET_KEY must be set together")
+        if not 60 <= self.cos_presign_expires_seconds <= 3600:
+            raise ValueError("RHYTHM_COS_PRESIGN_EXPIRES_SECONDS must be between 60 and 3600")
         return self
 
 

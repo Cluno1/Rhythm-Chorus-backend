@@ -18,12 +18,14 @@ from rhythm_metadata_api.infrastructure.db.models import (
     AssetLocation,
     ChangeEvent,
     ChangeEventWork,
+    Contributor,
     Release,
     ReleaseItem,
     Rendition,
     Score,
     ScoreRevision,
     Work,
+    WorkCredit,
 )
 
 
@@ -52,6 +54,9 @@ def score_rows() -> list[ScoreManifestRow]:
             sha256="2" * 64,
             byte_size=120,
             lyrics="lyrics",
+            composers=("Composer",),
+            lyricists=("Lyricist",),
+            key_signature="3#/0b major",
             verified=True,
         ),
     ]
@@ -82,7 +87,7 @@ def song_rows() -> list[SongMappingRow]:
             mp3_cos_key="music/999-Only Song-English.mp3",
             source_filename="999-Only Song-English.mp3",
             song_title="Only Song",
-            language_variant="English",
+            language_variant="未标注",
             track_no_hint=999,
             mongo_work_key=None,
             score_status="no-score",
@@ -115,6 +120,8 @@ def test_formal_import_is_direct_cos_and_idempotent() -> None:
         assert first.release_items == 2
         assert first.assets == 4
         assert first.cos_locations == 4
+        assert first.contributors == 2
+        assert first.work_credits == 2
         assert not list(
             session.scalars(select(AssetLocation).where(AssetLocation.provider == "local"))
         )
@@ -129,8 +136,18 @@ def test_formal_import_is_direct_cos_and_idempotent() -> None:
         assert len(list(session.scalars(select(Work)))) == 2
         only_song_work = session.scalar(select(Work).where(Work.canonical_title == "Only Song"))
         assert only_song_work is not None
-        assert only_song_work.language == "en"
+        assert only_song_work.language is None
+        only_song = session.scalar(select(Rendition).where(Rendition.label == "Only Song"))
+        assert only_song is not None
         assert len(list(session.scalars(select(Arrangement)))) == 2
+        assert len(list(session.scalars(select(Contributor)))) == 2
+        assert len(list(session.scalars(select(WorkCredit)))) == 2
+        scored_arrangement = session.scalar(
+            select(Arrangement).where(Arrangement.preferred_score_id.is_not(None))
+        )
+        assert scored_arrangement is not None
+        assert scored_arrangement.key_signature == "3#/0b major"
+        assert score.lyrics == "lyrics"
         assert len(list(session.scalars(select(ChangeEvent)))) == 10
         assert len(list(session.scalars(select(ChangeEventWork)))) == 11
         revisions = list(session.scalars(select(ScoreRevision).order_by(ScoreRevision.revision_no)))
@@ -147,3 +164,28 @@ def test_formal_import_rejects_unverified_or_wrong_album() -> None:
             importer.validate([replace(score_rows()[0], verified=False)], song_rows())
         with pytest.raises(FormalImportError, match="album_key=ihope"):
             importer.validate(score_rows(), [replace(song_rows()[0], album_key="other")])
+        with pytest.raises(FormalImportError, match="low-confidence"):
+            importer.validate(score_rows(), [replace(song_rows()[0], confidence="low")])
+        with pytest.raises(FormalImportError, match="invalid canonical mapping"):
+            importer.validate(
+                score_rows(),
+                [replace(song_rows()[0], mongo_work_key="gmusic:missing")],
+            )
+
+
+def test_formal_import_rejects_changed_mapping_on_rerun() -> None:
+    engine = create_v2_engine(":memory:")
+    migrate_v2_database(engine, ":memory:")
+    with Session(engine) as session, session.begin():
+        importer = FormalCatalogImporter(session)
+        importer.import_all(score_rows(), song_rows())
+        changed = [
+            replace(
+                song_rows()[0],
+                song_title="Changed title",
+                duration_ms=1,
+            ),
+            song_rows()[1],
+        ]
+        with pytest.raises(FormalImportError, match="manifest drift"):
+            importer.import_all(score_rows(), changed)

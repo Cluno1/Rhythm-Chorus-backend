@@ -78,7 +78,13 @@ def main() -> None:
                 "byte_size": actual_size,
                 "media_type": "application/vnd.recordare.musicxml+xml",
                 "language": optional_text(document.get("lyrics_lang")),
-                "lyrics": optional_text(document.get("lyrics")),
+                "lyrics": lyrics_from_document(document),
+                "composers": names_from_document(document.get("composer")),
+                "lyricists": names_from_document(document.get("lyricist")),
+                "key_signature": optional_text(document.get("key_signature")),
+                "time_signature": optional_text(document.get("time_signature")),
+                "tempo": optional_text(document.get("tempo")),
+                "year": optional_text(document.get("year")),
                 "verified": True,
             }
         )
@@ -171,6 +177,18 @@ def optional_text(value: Any) -> str | None:
     else:
         normalized = str(value).strip()
     return normalized or None
+
+
+def lyrics_from_document(document: dict[str, Any]) -> str | None:
+    """GMUSIC uses lyrics_text; lyrics remains a backwards-compatible fallback."""
+    return optional_text(document.get("lyrics_text") or document.get("lyrics"))
+
+
+def names_from_document(value: Any) -> list[str]:
+    if value is None:
+        return []
+    values = value if isinstance(value, list) else [value]
+    return [str(item).strip() for item in values if str(item).strip()]
 
 
 if __name__ == "__main__":

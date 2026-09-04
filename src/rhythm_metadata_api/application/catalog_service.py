@@ -10,7 +10,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, TypeVar
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -1476,8 +1476,10 @@ class CatalogService:
             supports_range=True,
         )
 
-    @staticmethod
-    def _library_song_statement():
+    def _library_song_statement(self):
+        deliverable_providers = ["local"]
+        if self.settings.cos_secret_id and self.settings.cos_secret_key:
+            deliverable_providers.append("cos")
         return (
             select(ReleaseItem, Release, Rendition, Arrangement, Work)
             .join(Release, Release.id == ReleaseItem.release_id)
@@ -1497,6 +1499,13 @@ class CatalogService:
                     Asset.state == "ready",
                     Asset.deleted_at.is_(None),
                     Asset.detected_media_type.in_(PLAYABLE_AUDIO_MEDIA_TYPES),
+                    select(AssetLocation.id)
+                    .where(
+                        AssetLocation.asset_id == Asset.id,
+                        AssetLocation.state == "available",
+                        AssetLocation.provider.in_(deliverable_providers),
+                    )
+                    .exists(),
                 )
                 .exists(),
             )
@@ -1523,11 +1532,29 @@ class CatalogService:
                 select(Contributor.display_name)
                 .join(WorkCredit, WorkCredit.contributor_id == Contributor.id)
                 .where(WorkCredit.work_id == work.id)
-                .order_by(WorkCredit.position, WorkCredit.id)
+                .order_by(
+                    case((WorkCredit.role == "composer", 0), else_=1),
+                    WorkCredit.position,
+                    WorkCredit.id,
+                )
                 .limit(1)
             )
-        cover_asset_id = rendition.cover_asset_id or release.cover_asset_id or work.cover_asset_id
+        cover_asset_id = (
+            rendition.cover_asset_id
+            or release.cover_asset_id
+            or arrangement.cover_asset_id
+            or work.cover_asset_id
+        )
         cover_url = self._local_cover_url(session, cover_asset_id)
+        score_lyrics = None
+        if arrangement.preferred_score_id:
+            score_lyrics = session.scalar(
+                select(Score.lyrics).where(
+                    Score.id == arrangement.preferred_score_id,
+                    Score.published_revision_id.is_not(None),
+                    Score.deleted_at.is_(None),
+                )
+            )
         return LibrarySongResponse(
             work_id=work.id,
             arrangement_id=arrangement.id,
@@ -1539,18 +1566,25 @@ class CatalogService:
             duration_ms=rendition.duration_ms,
             track_no=item.track_no,
             cover_url=cover_url,
-            lyrics=rendition.lyrics or work.lyrics,
+            lyrics=rendition.lyrics or score_lyrics or work.lyrics,
         )
 
     def _library_album_response(
         self, session: Session, release: Release
     ) -> LibraryAlbumResponse:
+        deliverable_providers = ["local"]
+        if self.settings.cos_secret_id and self.settings.cos_secret_key:
+            deliverable_providers.append("cos")
         song_count = session.scalar(
             select(func.count(ReleaseItem.id))
             .join(Rendition, Rendition.id == ReleaseItem.rendition_id)
+            .join(Arrangement, Arrangement.id == Rendition.arrangement_id)
+            .join(Work, Work.id == Arrangement.work_id)
             .where(
                 ReleaseItem.release_id == release.id,
                 Rendition.deleted_at.is_(None),
+                Arrangement.deleted_at.is_(None),
+                Work.deleted_at.is_(None),
                 select(RenditionAsset.id)
                 .join(Asset, Asset.id == RenditionAsset.asset_id)
                 .where(
@@ -1559,6 +1593,13 @@ class CatalogService:
                     Asset.state == "ready",
                     Asset.deleted_at.is_(None),
                     Asset.detected_media_type.in_(PLAYABLE_AUDIO_MEDIA_TYPES),
+                    select(AssetLocation.id)
+                    .where(
+                        AssetLocation.asset_id == Asset.id,
+                        AssetLocation.state == "available",
+                        AssetLocation.provider.in_(deliverable_providers),
+                    )
+                    .exists(),
                 )
                 .exists(),
             )
@@ -1578,10 +1619,14 @@ class CatalogService:
         if asset_id is None:
             return None
         location = session.scalar(
-            select(AssetLocation).where(
+            select(AssetLocation)
+            .join(Asset, Asset.id == AssetLocation.asset_id)
+            .where(
                 AssetLocation.asset_id == asset_id,
                 AssetLocation.provider == "local",
                 AssetLocation.state == "available",
+                Asset.state == "ready",
+                Asset.deleted_at.is_(None),
             )
         )
         return f"/v2/assets/{asset_id}/content" if location is not None else None
