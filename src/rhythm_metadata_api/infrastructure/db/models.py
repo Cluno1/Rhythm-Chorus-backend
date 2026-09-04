@@ -353,6 +353,48 @@ class RenditionAsset(Base):
     )
 
 
+class Release(RevisionedMixin, Base):
+    """A client-visible album that may collect renditions from many works."""
+
+    __tablename__ = "v2_releases"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    key: Mapped[str] = mapped_column(String(200), nullable=False, unique=True)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    album_artist: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    release_date: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    cover_asset_id: Mapped[str | None] = mapped_column(
+        ForeignKey("v2_assets.id", ondelete="SET NULL"), nullable=True
+    )
+
+    __table_args__ = (Index("v2_releases_title_idx", "title"),)
+
+
+class ReleaseItem(Base):
+    __tablename__ = "v2_release_items"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    release_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_releases.id", ondelete="CASCADE"), nullable=False
+    )
+    rendition_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_renditions.id", ondelete="CASCADE"), nullable=False
+    )
+    disc_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    track_no: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    display_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    __table_args__ = (
+        UniqueConstraint("release_id", "rendition_id", name="uq_v2_release_rendition"),
+        UniqueConstraint("release_id", "display_order", name="uq_v2_release_display_order"),
+        CheckConstraint("disc_no >= 1", name="release_item_disc_no"),
+        CheckConstraint("track_no IS NULL OR track_no >= 1", name="release_item_track_no"),
+        CheckConstraint("display_order >= 1", name="release_item_display_order"),
+        Index("v2_release_items_release_idx", "release_id", "display_order"),
+    )
+
+
 class UploadSession(Base):
     __tablename__ = "v2_upload_sessions"
 

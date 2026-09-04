@@ -265,6 +265,11 @@ def get_asset(asset_id: str, service: Catalog, _: Actor) -> Response:
     return model_response(item, headers={"ETag": f'"sha256:{item.sha256}"'})
 
 
+@router.get("/assets/{asset_id}/delivery")
+def get_asset_delivery(asset_id: str, service: Catalog, _: Actor) -> Response:
+    return model_response(service.asset_delivery(asset_id))
+
+
 @router.get("/assets/{asset_id}/content")
 def get_asset_content(asset_id: str, service: Catalog, _: Actor) -> Response:
     path, asset = service.asset_content(asset_id)
@@ -400,6 +405,39 @@ def get_playback(
     prefer: str | None = None,
 ) -> Response:
     return model_response(service.playback(rendition_id, prefer))
+
+
+@router.get("/library/songs")
+def list_library_songs(
+    service: Catalog,
+    _: Actor,
+    cursor: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> dict[str, Any]:
+    items, next_cursor = service.list_library_songs(cursor, limit)
+    return {
+        "items": [item.model_dump(mode="json") for item in items],
+        "next_cursor": next_cursor,
+    }
+
+
+@router.get("/library/albums")
+def list_library_albums(
+    service: Catalog,
+    _: Actor,
+    cursor: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> dict[str, Any]:
+    items, next_cursor = service.list_library_albums(cursor, limit)
+    return {
+        "items": [item.model_dump(mode="json") for item in items],
+        "next_cursor": next_cursor,
+    }
+
+
+@router.get("/library/albums/{album_id}")
+def get_library_album(album_id: str, service: Catalog, _: Actor) -> Response:
+    return model_response(service.get_library_album(album_id))
 
 
 @router.get("/sync/changes")

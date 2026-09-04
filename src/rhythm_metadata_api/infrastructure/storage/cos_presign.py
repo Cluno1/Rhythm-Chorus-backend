@@ -42,9 +42,8 @@ def presign_cos_get(
     sign_key = hmac.new(secret_key.encode(), key_time.encode(), hashlib.sha1).hexdigest()
     headers_str = "host=" + quote(host, safe="-_.~")
     http_string = f"get\n{raw_path}\n\n{headers_str}\n"
-    string_to_sign = "sha1\n{}\n{}\n".format(
-        key_time, hashlib.sha1(http_string.encode()).hexdigest()
-    )
+    http_digest = hashlib.sha1(http_string.encode()).hexdigest()
+    string_to_sign = f"sha1\n{key_time}\n{http_digest}\n"
     signature = hmac.new(sign_key.encode(), string_to_sign.encode(), hashlib.sha1).hexdigest()
 
     query = (

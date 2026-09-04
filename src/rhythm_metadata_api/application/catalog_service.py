@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from collections.abc import Callable
@@ -9,7 +10,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, TypeVar
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -27,11 +28,15 @@ from rhythm_metadata_api.domain.v2.schemas import (
     ArrangementCreate,
     ArrangementPatch,
     ArrangementResponse,
+    AssetDeliveryResponse,
     AssetResponse,
     ChangeResponse,
     ChangesResponse,
     ContributorCreate,
     ContributorResponse,
+    LibraryAlbumDetailResponse,
+    LibraryAlbumResponse,
+    LibrarySongResponse,
     PartInput,
     PartResponse,
     PlaybackResponse,
@@ -70,8 +75,11 @@ from rhythm_metadata_api.infrastructure.db.models import (
     Contributor,
     IdempotencyKey,
     Part,
+    Release,
+    ReleaseItem,
     Rendition,
     RenditionAsset,
+    RenditionCredit,
     Score,
     ScoreRevision,
     ScoreRevisionAsset,
@@ -586,6 +594,12 @@ class CatalogService:
         with self.uow_factory() as uow:
             return self._asset_response(self._require_asset(uow.session, asset_id))
 
+    def asset_delivery(self, asset_id: str) -> AssetDeliveryResponse:
+        """Return a short-lived COS URL or the authenticated local fallback."""
+        with self.uow_factory() as uow:
+            asset = self._require_asset(uow.session, asset_id)
+            return self._asset_delivery_response(uow.session, asset)
+
     def asset_content(self, asset_id: str) -> tuple[Path, Asset]:
         with self.uow_factory() as uow:
             asset = self._require_asset(uow.session, asset_id)
@@ -930,58 +944,76 @@ class CatalogService:
             _, asset = selected
             if asset.state != "ready":
                 raise V2Conflict("selected asset is not ready")
-            locations = list(
-                uow.session.scalars(
-                    select(AssetLocation)
-                    .where(
-                        AssetLocation.asset_id == asset.id,
-                        AssetLocation.state == "available",
-                    )
-                    .order_by(AssetLocation.provider)
-                )
-            )
-            if not locations:
-                raise V2NotFound("selected asset has no available content")
-            # issue 11：优先为 COS 位置签发 presigned 直连 URL（配了凭据时），
-            # 让客户端绕过后端代理直接从对象存储下载音频；否则回退到本地代理。
-            cos_location = next((loc for loc in locations if loc.provider == "cos"), None)
-            if cos_location is not None and self.settings.cos_secret_id:
-                bucket, _, key = cos_location.storage_key.partition("/")
-                if not bucket or not key:
-                    raise V2Conflict("COS location has an invalid storage key")
-                url, expires_at = presign_cos_get(
-                    bucket=bucket,
-                    region=self.settings.cos_region,
-                    key=key,
-                    secret_id=self.settings.cos_secret_id,
-                    secret_key=self.settings.cos_secret_key,
-                    expires_seconds=self.settings.cos_presign_expires_seconds,
-                )
-                return PlaybackResponse(
-                    rendition_id=rendition.id,
-                    asset_id=asset.id,
-                    media_type=asset.detected_media_type,
-                    byte_size=asset.byte_size,
-                    delivery="signed_url",
-                    url=url,
-                    cache_key=f"rhythm:asset:{asset.id}:{asset.sha256}",
-                    etag=f'"sha256:{asset.sha256}"',
-                    supports_range=True,
-                    expires_at=expires_at,
-                )
-            local_location = next((loc for loc in locations if loc.provider == "local"), None)
-            if local_location is None:
-                raise V2Conflict("configured storage provider cannot issue a playback URL yet")
+            delivery = self._asset_delivery_response(uow.session, asset)
+            playback_fields = delivery.model_dump(exclude={"sha256"})
             return PlaybackResponse(
                 rendition_id=rendition.id,
-                asset_id=asset.id,
-                media_type=asset.detected_media_type,
-                byte_size=asset.byte_size,
-                delivery="authenticated_url",
-                url=f"/v2/assets/{asset.id}/content",
-                cache_key=f"rhythm:asset:{asset.id}:{asset.sha256}",
-                etag=f'"sha256:{asset.sha256}"',
-                supports_range=True,
+                **playback_fields,
+            )
+
+    def list_library_songs(
+        self, cursor: str | None, limit: int
+    ) -> tuple[list[LibrarySongResponse], str | None]:
+        with self.uow_factory() as uow:
+            statement = self._library_song_statement()
+            if cursor:
+                cursor_release, cursor_order, cursor_id = decode_song_cursor(cursor)
+                statement = statement.where(
+                    or_(
+                        Release.key > cursor_release,
+                        and_(
+                            Release.key == cursor_release,
+                            ReleaseItem.display_order > cursor_order,
+                        ),
+                        and_(
+                            Release.key == cursor_release,
+                            ReleaseItem.display_order == cursor_order,
+                            ReleaseItem.id > cursor_id,
+                        ),
+                    )
+                )
+            rows = uow.session.execute(
+                statement.order_by(Release.key, ReleaseItem.display_order, ReleaseItem.id).limit(
+                    limit + 1
+                )
+            ).all()
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            next_cursor = None
+            if has_more and rows:
+                item, release, *_ = rows[-1]
+                next_cursor = encode_song_cursor(release.key, item.display_order, item.id)
+            return [self._library_song_response(uow.session, *row) for row in rows], next_cursor
+
+    def list_library_albums(
+        self, cursor: str | None, limit: int
+    ) -> tuple[list[LibraryAlbumResponse], str | None]:
+        with self.uow_factory() as uow:
+            statement = select(Release).where(Release.deleted_at.is_(None))
+            if cursor:
+                statement = statement.where(Release.id > cursor)
+            rows = list(uow.session.scalars(statement.order_by(Release.id).limit(limit + 1)))
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            return [self._library_album_response(uow.session, row) for row in rows], (
+                rows[-1].id if has_more and rows else None
+            )
+
+    def get_library_album(self, album_id: str) -> LibraryAlbumDetailResponse:
+        with self.uow_factory() as uow:
+            release = uow.session.scalar(
+                select(Release).where(Release.id == album_id, Release.deleted_at.is_(None))
+            )
+            if release is None:
+                raise V2NotFound("album not found")
+            rows = uow.session.execute(
+                self._library_song_statement()
+                .where(ReleaseItem.release_id == release.id)
+                .order_by(ReleaseItem.display_order, ReleaseItem.id)
+            ).all()
+            return LibraryAlbumDetailResponse(
+                album=self._library_album_response(uow.session, release),
+                songs=[self._library_song_response(uow.session, *row) for row in rows],
             )
 
     def work_bundle(self, work_id: str) -> WorkBundleResponse:
@@ -1387,6 +1419,173 @@ class CatalogService:
             ],
         )
 
+    def _asset_delivery_response(
+        self, session: Session, asset: Asset
+    ) -> AssetDeliveryResponse:
+        if asset.state != "ready":
+            raise V2Conflict("asset is not ready")
+        locations = list(
+            session.scalars(
+                select(AssetLocation)
+                .where(
+                    AssetLocation.asset_id == asset.id,
+                    AssetLocation.state == "available",
+                )
+                .order_by(AssetLocation.provider)
+            )
+        )
+        if not locations:
+            raise V2NotFound("asset has no available content")
+        cos_location = next((item for item in locations if item.provider == "cos"), None)
+        if cos_location is not None and self.settings.cos_secret_id:
+            bucket, _, key = cos_location.storage_key.partition("/")
+            if not bucket or not key:
+                raise V2Conflict("COS location has an invalid storage key")
+            url, expires_at = presign_cos_get(
+                bucket=bucket,
+                region=self.settings.cos_region,
+                key=key,
+                secret_id=self.settings.cos_secret_id,
+                secret_key=self.settings.cos_secret_key,
+                expires_seconds=self.settings.cos_presign_expires_seconds,
+            )
+            return AssetDeliveryResponse(
+                asset_id=asset.id,
+                media_type=asset.detected_media_type,
+                byte_size=asset.byte_size,
+                sha256=asset.sha256,
+                delivery="signed_url",
+                url=url,
+                cache_key=f"rhythm:asset:{asset.id}:{asset.sha256}",
+                etag=f'"sha256:{asset.sha256}"',
+                supports_range=True,
+                expires_at=expires_at,
+            )
+        local_location = next((item for item in locations if item.provider == "local"), None)
+        if local_location is None:
+            raise V2Conflict("configured storage provider cannot issue a delivery URL yet")
+        return AssetDeliveryResponse(
+            asset_id=asset.id,
+            media_type=asset.detected_media_type,
+            byte_size=asset.byte_size,
+            sha256=asset.sha256,
+            delivery="authenticated_url",
+            url=f"/v2/assets/{asset.id}/content",
+            cache_key=f"rhythm:asset:{asset.id}:{asset.sha256}",
+            etag=f'"sha256:{asset.sha256}"',
+            supports_range=True,
+        )
+
+    @staticmethod
+    def _library_song_statement():
+        return (
+            select(ReleaseItem, Release, Rendition, Arrangement, Work)
+            .join(Release, Release.id == ReleaseItem.release_id)
+            .join(Rendition, Rendition.id == ReleaseItem.rendition_id)
+            .join(Arrangement, Arrangement.id == Rendition.arrangement_id)
+            .join(Work, Work.id == Arrangement.work_id)
+            .where(
+                Release.deleted_at.is_(None),
+                Rendition.deleted_at.is_(None),
+                Arrangement.deleted_at.is_(None),
+                Work.deleted_at.is_(None),
+                select(RenditionAsset.id)
+                .join(Asset, Asset.id == RenditionAsset.asset_id)
+                .where(
+                    RenditionAsset.rendition_id == Rendition.id,
+                    RenditionAsset.role.in_(PLAYBACK_AUDIO_ROLES),
+                    Asset.state == "ready",
+                    Asset.deleted_at.is_(None),
+                    Asset.detected_media_type.in_(PLAYABLE_AUDIO_MEDIA_TYPES),
+                )
+                .exists(),
+            )
+        )
+
+    def _library_song_response(
+        self,
+        session: Session,
+        item: ReleaseItem,
+        release: Release,
+        rendition: Rendition,
+        arrangement: Arrangement,
+        work: Work,
+    ) -> LibrarySongResponse:
+        artist = session.scalar(
+            select(Contributor.display_name)
+            .join(RenditionCredit, RenditionCredit.contributor_id == Contributor.id)
+            .where(RenditionCredit.rendition_id == rendition.id)
+            .order_by(RenditionCredit.position, RenditionCredit.id)
+            .limit(1)
+        )
+        if artist is None:
+            artist = session.scalar(
+                select(Contributor.display_name)
+                .join(WorkCredit, WorkCredit.contributor_id == Contributor.id)
+                .where(WorkCredit.work_id == work.id)
+                .order_by(WorkCredit.position, WorkCredit.id)
+                .limit(1)
+            )
+        cover_asset_id = rendition.cover_asset_id or release.cover_asset_id or work.cover_asset_id
+        cover_url = self._local_cover_url(session, cover_asset_id)
+        return LibrarySongResponse(
+            work_id=work.id,
+            arrangement_id=arrangement.id,
+            rendition_id=rendition.id,
+            album_id=release.id,
+            title=rendition.label,
+            artist=artist or release.album_artist,
+            album_title=release.title,
+            duration_ms=rendition.duration_ms,
+            track_no=item.track_no,
+            cover_url=cover_url,
+            lyrics=rendition.lyrics or work.lyrics,
+        )
+
+    def _library_album_response(
+        self, session: Session, release: Release
+    ) -> LibraryAlbumResponse:
+        song_count = session.scalar(
+            select(func.count(ReleaseItem.id))
+            .join(Rendition, Rendition.id == ReleaseItem.rendition_id)
+            .where(
+                ReleaseItem.release_id == release.id,
+                Rendition.deleted_at.is_(None),
+                select(RenditionAsset.id)
+                .join(Asset, Asset.id == RenditionAsset.asset_id)
+                .where(
+                    RenditionAsset.rendition_id == Rendition.id,
+                    RenditionAsset.role.in_(PLAYBACK_AUDIO_ROLES),
+                    Asset.state == "ready",
+                    Asset.deleted_at.is_(None),
+                    Asset.detected_media_type.in_(PLAYABLE_AUDIO_MEDIA_TYPES),
+                )
+                .exists(),
+            )
+        )
+        cover_url = self._local_cover_url(session, release.cover_asset_id)
+        return LibraryAlbumResponse(
+            id=release.id,
+            key=release.key,
+            title=release.title,
+            artist=release.album_artist,
+            cover_url=cover_url,
+            song_count=song_count or 0,
+        )
+
+    @staticmethod
+    def _local_cover_url(session: Session, asset_id: str | None) -> str | None:
+        if asset_id is None:
+            return None
+        location = session.scalar(
+            select(AssetLocation).where(
+                AssetLocation.asset_id == asset_id,
+                AssetLocation.provider == "local",
+                AssetLocation.state == "available",
+            )
+        )
+        return f"/v2/assets/{asset_id}/content" if location is not None else None
+
     def _upload_response(self, session: Session, upload: UploadSession) -> UploadStatusResponse:
         asset = session.get(Asset, upload.completed_asset_id) if upload.completed_asset_id else None
         return UploadStatusResponse(
@@ -1498,6 +1697,28 @@ class CatalogService:
 
 def etag(revision: int) -> str:
     return f'"rev-{revision}"'
+
+
+def encode_song_cursor(release_key: str, display_order: int, item_id: str) -> str:
+    payload = json.dumps([release_key, display_order, item_id], separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def decode_song_cursor(cursor: str) -> tuple[str, int, str]:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        value = json.loads(base64.urlsafe_b64decode(padded).decode())
+        if (
+            not isinstance(value, list)
+            or len(value) != 3
+            or not isinstance(value[0], str)
+            or not isinstance(value[1], int)
+            or not isinstance(value[2], str)
+        ):
+            raise ValueError
+        return value[0], value[1], value[2]
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise V2DomainError("invalid song cursor") from error
 
 
 def bundle_etag(work_id: str, version: int) -> str:

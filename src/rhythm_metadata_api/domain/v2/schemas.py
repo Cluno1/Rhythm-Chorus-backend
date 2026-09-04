@@ -309,6 +309,47 @@ class PlaybackResponse(ApiModel):
     expires_at: datetime | None = None
 
 
+class AssetDeliveryResponse(ApiModel):
+    asset_id: str
+    media_type: str
+    byte_size: int
+    sha256: str
+    delivery: Literal["authenticated_url", "signed_url"]
+    url: str
+    cache_key: str
+    etag: str
+    supports_range: bool
+    expires_at: datetime | None = None
+
+
+class LibrarySongResponse(ApiModel):
+    work_id: str
+    arrangement_id: str
+    rendition_id: str
+    album_id: str
+    title: str
+    artist: str | None = None
+    album_title: str
+    duration_ms: int | None = None
+    track_no: int | None = None
+    cover_url: str | None = None
+    lyrics: str | None = None
+
+
+class LibraryAlbumResponse(ApiModel):
+    id: str
+    key: str
+    title: str
+    artist: str | None = None
+    cover_url: str | None = None
+    song_count: int
+
+
+class LibraryAlbumDetailResponse(ApiModel):
+    album: LibraryAlbumResponse
+    songs: list[LibrarySongResponse]
+
+
 class ArrangementBundle(ArrangementResponse):
     scores: list[ScoreResponse]
     renditions: list[RenditionResponse]

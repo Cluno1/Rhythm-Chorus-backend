@@ -5,8 +5,20 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
 
 from rhythm_metadata_api.core.config import Settings
+from rhythm_metadata_api.infrastructure.db.models import (
+    Arrangement,
+    Asset,
+    AssetLocation,
+    Release,
+    ReleaseItem,
+    Rendition,
+    RenditionAsset,
+    Work,
+    utc_now,
+)
 from rhythm_metadata_api.main import create_app
 
 TOKEN = "test-private-catalog-token"
@@ -64,6 +76,231 @@ def upload_asset(
     completed = post(client, f"/v2/uploads/{upload_id}/complete", f"{key}-complete", {})
     assert completed.status_code == 200, completed.text
     return completed.json()["asset"]
+
+
+def test_asset_delivery_and_native_library_projection(client: TestClient) -> None:
+    musicxml = b"<?xml version='1.0'?><score-partwise/>"
+    musicxml_asset = upload_asset(
+        client,
+        key="delivery-musicxml",
+        content=musicxml,
+        media_type="application/vnd.recordare.musicxml+xml",
+        filename="score.musicxml",
+    )
+    delivery = client.get(f"/v2/assets/{musicxml_asset['id']}/delivery", headers=AUTH)
+    assert delivery.status_code == 200
+    assert delivery.json()["delivery"] == "authenticated_url"
+    assert delivery.json()["sha256"] == musicxml_asset["sha256"]
+
+    container = client.app.state.v2_container
+    with Session(container.engine) as session, session.begin():
+        work = Work(canonical_title="Your Faithfulness", lyrics="work lyrics")
+        session.add(work)
+        session.flush()
+        arrangement = Arrangement(work_id=work.id, name="Imported")
+        session.add(arrangement)
+        session.flush()
+        rendition = Rendition(
+            arrangement_id=arrangement.id,
+            label="Your Faithfulness",
+            kind="performance",
+            duration_ms=123000,
+        )
+        session.add(rendition)
+        session.flush()
+        audio = Asset(
+            sha256="a" * 64,
+            byte_size=321,
+            detected_media_type="audio/mpeg",
+            state="ready",
+        )
+        session.add(audio)
+        session.flush()
+        session.add_all(
+            [
+                AssetLocation(
+                    asset_id=audio.id,
+                    provider="cos",
+                    storage_key="bible-1328751369/music/example.mp3",
+                ),
+                RenditionAsset(rendition_id=rendition.id, asset_id=audio.id, role="stream"),
+            ]
+        )
+        release = Release(key="ihope", title="ihope")
+        session.add(release)
+        session.flush()
+        session.add(
+            ReleaseItem(
+                release_id=release.id,
+                rendition_id=rendition.id,
+                track_no=109,
+                display_order=1,
+            )
+        )
+        second_audio = Asset(
+            sha256="b" * 64,
+            byte_size=654,
+            detected_media_type="audio/mpeg",
+            state="ready",
+        )
+        second_rendition = Rendition(
+            arrangement_id=arrangement.id,
+            label="Second Song",
+            kind="performance",
+        )
+        session.add_all([second_audio, second_rendition])
+        session.flush()
+        session.add_all(
+            [
+                RenditionAsset(
+                    rendition_id=second_rendition.id,
+                    asset_id=second_audio.id,
+                    role="stream",
+                ),
+                ReleaseItem(
+                    release_id=release.id,
+                    rendition_id=second_rendition.id,
+                    track_no=110,
+                    display_order=2,
+                ),
+            ]
+        )
+        midi_asset = Asset(
+            sha256="c" * 64,
+            byte_size=42,
+            detected_media_type="audio/midi",
+            state="ready",
+        )
+        midi_rendition = Rendition(
+            arrangement_id=arrangement.id,
+            label="Not a Song",
+            kind="reference_midi",
+        )
+        session.add_all([midi_asset, midi_rendition])
+        session.flush()
+        session.add_all(
+            [
+                RenditionAsset(
+                    rendition_id=midi_rendition.id,
+                    asset_id=midi_asset.id,
+                    role="midi",
+                ),
+                ReleaseItem(
+                    release_id=release.id,
+                    rendition_id=midi_rendition.id,
+                    display_order=3,
+                ),
+            ]
+        )
+        deleted_audio = Asset(
+            sha256="e" * 64,
+            byte_size=99,
+            detected_media_type="audio/mpeg",
+            state="ready",
+        )
+        deleted_rendition = Rendition(
+            arrangement_id=arrangement.id,
+            label="Deleted Song",
+            kind="performance",
+            deleted_at=utc_now(),
+        )
+        session.add_all([deleted_audio, deleted_rendition])
+        session.flush()
+        session.add_all(
+            [
+                RenditionAsset(
+                    rendition_id=deleted_rendition.id,
+                    asset_id=deleted_audio.id,
+                    role="stream",
+                ),
+                ReleaseItem(
+                    release_id=release.id,
+                    rendition_id=deleted_rendition.id,
+                    display_order=4,
+                ),
+            ]
+        )
+        work_id = work.id
+        arrangement_id = arrangement.id
+        rendition_id = rendition.id
+        release_id = release.id
+
+    first_page = client.get("/v2/library/songs?limit=1", headers=AUTH)
+    assert first_page.status_code == 200
+    assert first_page.json()["next_cursor"] is not None
+    assert first_page.json()["items"] == [
+        {
+            "work_id": work_id,
+            "arrangement_id": arrangement_id,
+            "rendition_id": rendition_id,
+            "album_id": release_id,
+            "title": "Your Faithfulness",
+            "artist": None,
+            "album_title": "ihope",
+            "duration_ms": 123000,
+            "track_no": 109,
+            "cover_url": None,
+            "lyrics": "work lyrics",
+        }
+    ]
+    second_page = client.get(
+        "/v2/library/songs",
+        headers=AUTH,
+        params={"limit": 1, "cursor": first_page.json()["next_cursor"]},
+    )
+    assert second_page.status_code == 200
+    assert second_page.json()["next_cursor"] is None
+    assert second_page.json()["items"][0]["title"] == "Second Song"
+    assert client.get("/v2/library/songs?cursor=invalid!", headers=AUTH).status_code == 422
+    albums = client.get("/v2/library/albums", headers=AUTH)
+    assert albums.status_code == 200
+    assert albums.json()["items"][0]["key"] == "ihope"
+    assert albums.json()["items"][0]["song_count"] == 2
+    detail = client.get(f"/v2/library/albums/{release_id}", headers=AUTH)
+    assert detail.status_code == 200
+    assert detail.json()["album"]["id"] == release_id
+    assert [item["title"] for item in detail.json()["songs"]] == [
+        "Your Faithfulness",
+        "Second Song",
+    ]
+
+
+def test_asset_delivery_returns_signed_cos_url_without_auth_in_url(tmp_path: Path) -> None:
+    settings = Settings(
+        bootstrap_token=TOKEN,
+        database_path=":memory:",
+        v2_database_path=str(tmp_path / "catalog.sqlite3"),
+        local_object_root=str(tmp_path / "objects"),
+        cos_secret_id="AKID-test",
+        cos_secret_key="secret-test",
+    )
+    with TestClient(create_app(settings)) as cos_client:
+        with Session(cos_client.app.state.v2_container.engine) as session, session.begin():
+            asset = Asset(
+                sha256="d" * 64,
+                byte_size=456,
+                detected_media_type="application/vnd.recordare.musicxml+xml",
+                state="ready",
+            )
+            session.add(asset)
+            session.flush()
+            session.add(
+                AssetLocation(
+                    asset_id=asset.id,
+                    provider="cos",
+                    storage_key="musicxml-1328751369/gmusic/343/rev1.musicxml",
+                )
+            )
+            asset_id = asset.id
+
+        response = cos_client.get(f"/v2/assets/{asset_id}/delivery", headers=AUTH)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["delivery"] == "signed_url"
+        assert body["url"].startswith("https://musicxml-1328751369.cos.")
+        assert "Authorization" not in body["url"]
+        assert body["expires_at"] is not None
+        assert body["sha256"] == "d" * 64
 
 
 def test_v2_requires_auth_and_problem_details(client: TestClient) -> None:
