@@ -242,6 +242,31 @@ def test_private_catalog_end_to_end(client: TestClient) -> None:
     assert ranged.content == audio[3:9]
     assert ranged.headers["content-range"] == f"bytes 3-8/{len(audio)}"
 
+    midi_asset = upload_asset(
+        client,
+        key="midi-source-file",
+        content=b"MThd\x00\x00\x00\x06\x00\x01\x00\x01\x01\xe0",
+        media_type="audio/midi",
+        filename="source.mid",
+    )
+    midi_rendition = post(
+        client,
+        f"/v2/arrangements/{arrangement_id}/renditions",
+        "midi-rendition",
+        {
+            "label": "Source MIDI",
+            "kind": "reference_midi",
+            "assets": [{"asset_id": midi_asset["id"], "role": "midi"}],
+        },
+    )
+    assert midi_rendition.status_code == 201, midi_rendition.text
+    midi_playback = client.get(
+        f"/v2/renditions/{midi_rendition.json()['id']}/playback?prefer=midi",
+        headers=AUTH,
+    )
+    assert midi_playback.status_code == 404
+    assert midi_playback.json()["detail"] == "rendition has no playable real-audio assets"
+
     bundle = client.get(f"/v2/works/{work_id}/bundle", headers=AUTH)
     assert bundle.status_code == 200
     assert bundle.json()["arrangements"][0]["scores"][0]["head_revision_id"] == revision_id
@@ -261,6 +286,7 @@ def test_private_catalog_end_to_end(client: TestClient) -> None:
         "score.created",
         "score.revision_created",
         "arrangement.updated",
+        "rendition.created",
         "rendition.created",
     ]
 

@@ -911,13 +911,22 @@ class CatalogService:
                 )
             )
             if not links:
-                raise V2NotFound("rendition has no playable assets")
+                raise V2NotFound("rendition has no playable real-audio assets")
             priority = playback_role_priority(prefer)
             links.sort(key=lambda link: priority.index(link.role) if link.role in priority else 99)
-            selected = next((link for link in links if link.role != "stem"), None)
+            selected = next(
+                (
+                    (link, asset)
+                    for link in links
+                    if link.role in PLAYBACK_AUDIO_ROLES
+                    for asset in [self._require_asset(uow.session, link.asset_id)]
+                    if is_playable_audio_media_type(asset.detected_media_type)
+                ),
+                None,
+            )
             if selected is None:
-                raise V2NotFound("rendition has no full-mix playable asset")
-            asset = self._require_asset(uow.session, selected.asset_id)
+                raise V2NotFound("rendition has no playable real-audio assets")
+            _, asset = selected
             if asset.state != "ready":
                 raise V2Conflict("selected asset is not ready")
             location = uow.session.scalar(
@@ -1484,5 +1493,34 @@ def is_expired(value: datetime) -> bool:
 
 
 def playback_role_priority(prefer: str | None) -> list[str]:
-    requested = prefer if prefer in {"master", "stream", "mix", "midi"} else "stream"
-    return [requested] + [role for role in ["stream", "mix", "master", "midi"] if role != requested]
+    requested = prefer if prefer in PLAYBACK_AUDIO_ROLES else "stream"
+    return [requested] + [role for role in PLAYBACK_AUDIO_ROLES if role != requested]
+
+
+PLAYBACK_AUDIO_ROLES = ("stream", "mix", "master")
+PLAYABLE_AUDIO_MEDIA_TYPES = frozenset(
+    {
+        "audio/mpeg",
+        "audio/mp3",
+        "audio/mp4",
+        "audio/m4a",
+        "audio/x-m4a",
+        "audio/aac",
+        "audio/flac",
+        "audio/x-flac",
+        "audio/ogg",
+        "application/ogg",
+        "audio/opus",
+        "audio/wav",
+        "audio/wave",
+        "audio/x-wav",
+        "audio/vnd.wave",
+    }
+)
+
+
+def is_playable_audio_media_type(media_type: str | None) -> bool:
+    return bool(
+        media_type
+        and media_type.split(";", 1)[0].strip().lower() in PLAYABLE_AUDIO_MEDIA_TYPES
+    )
