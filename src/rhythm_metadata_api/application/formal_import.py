@@ -192,6 +192,8 @@ class FormalCatalogImporter:
             raise FormalImportError("every score object must be hash-verified before import")
         if any(not row.verified for row in song_rows):
             raise FormalImportError("every MP3 object must be hash-verified before import")
+        if any(row.byte_size <= 0 or not row.duration_ms or row.duration_ms <= 0 for row in song_rows):
+            raise FormalImportError("every MP3 must have a positive size and duration")
         if any(row.album_key != "ihope" for row in song_rows):
             raise FormalImportError("all issue 12 songs must use album_key=ihope")
         if len({row.mp3_cos_key for row in song_rows}) != len(song_rows):

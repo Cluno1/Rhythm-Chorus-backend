@@ -96,7 +96,7 @@ def song_rows() -> list[SongMappingRow]:
             evidence="no score",
             mp3_sha256="b" * 64,
             byte_size=2000,
-            duration_ms=None,
+            duration_ms=120000,
             cos_bucket="bible-1328751369",
             verified=True,
         ),
@@ -164,6 +164,8 @@ def test_formal_import_rejects_unverified_or_wrong_album() -> None:
             importer.validate([replace(score_rows()[0], verified=False)], song_rows())
         with pytest.raises(FormalImportError, match="album_key=ihope"):
             importer.validate(score_rows(), [replace(song_rows()[0], album_key="other")])
+        with pytest.raises(FormalImportError, match="positive size and duration"):
+            importer.validate(score_rows(), [replace(song_rows()[0], duration_ms=None)])
         with pytest.raises(FormalImportError, match="low-confidence"):
             importer.validate(score_rows(), [replace(song_rows()[0], confidence="low")])
         with pytest.raises(FormalImportError, match="invalid canonical mapping"):
