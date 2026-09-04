@@ -48,6 +48,11 @@ class Work(RevisionedMixin, Base):
     canonical_title: Mapped[str] = mapped_column(String(500), nullable=False)
     language: Mapped[str | None] = mapped_column(String(35), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    # issue 9: 封面/歌词回退链的末级来源（封面 song→album→work；歌词 song→乐谱→work）
+    cover_asset_id: Mapped[str | None] = mapped_column(
+        ForeignKey("v2_assets.id", ondelete="SET NULL"), nullable=True
+    )
+    lyrics: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         CheckConstraint("status IN ('draft', 'active', 'archived')", name="work_status"),
@@ -114,6 +119,10 @@ class Arrangement(RevisionedMixin, Base):
     preferred_score_id: Mapped[str | None] = mapped_column(
         ForeignKey("v2_scores.id", ondelete="SET NULL"), nullable=True
     )
+    # issue 9: Arrangement 充当"专辑"，封面回退链的中级来源（song→album→work）
+    cover_asset_id: Mapped[str | None] = mapped_column(
+        ForeignKey("v2_assets.id", ondelete="SET NULL"), nullable=True
+    )
 
     __table_args__ = (Index("v2_arrangements_work_idx", "work_id"),)
 
@@ -162,6 +171,8 @@ class Score(RevisionedMixin, Base):
     published_revision_id: Mapped[str | None] = mapped_column(
         ForeignKey("v2_score_revisions.id", ondelete="SET NULL"), nullable=True
     )
+    # issue 9: 乐谱天生带词，是歌词回退链的中级来源（song→乐谱→work）
+    lyrics: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         CheckConstraint(
@@ -284,6 +295,11 @@ class Rendition(RevisionedMixin, Base):
     recorded_at: Mapped[str | None] = mapped_column(String(10), nullable=True)
     location: Mapped[str | None] = mapped_column(String(500), nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # issue 9: Rendition 即"歌曲(MP3)"，封面/歌词回退链的首选来源
+    cover_asset_id: Mapped[str | None] = mapped_column(
+        ForeignKey("v2_assets.id", ondelete="SET NULL"), nullable=True
+    )
+    lyrics: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (Index("v2_renditions_arrangement_idx", "arrangement_id"),)
 
