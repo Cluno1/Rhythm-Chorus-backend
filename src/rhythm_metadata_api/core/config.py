@@ -20,6 +20,13 @@ class Settings(BaseSettings):
     max_musicxml_bytes: int = 50 * 1024 * 1024
     max_midi_bytes: int = 100 * 1024 * 1024
 
+    # COS 直连（issue 11）：为 provider='cos' 的 asset 签发 presigned GET URL，
+    # 让客户端绕开后端代理直接从对象存储下载音频。凭据从 env 注入（0600，不入库、不打印）。
+    cos_secret_id: str = ""
+    cos_secret_key: str = ""
+    cos_region: str = "ap-guangzhou"
+    cos_presign_expires_seconds: int = 900
+
     @model_validator(mode="after")
     def reject_default_production_token(self) -> "Settings":
         if self.environment == "production" and self.bootstrap_token == "change-me-in-development":

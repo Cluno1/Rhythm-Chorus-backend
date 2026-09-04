@@ -82,6 +82,7 @@ from rhythm_metadata_api.infrastructure.db.models import (
     utc_now,
 )
 from rhythm_metadata_api.infrastructure.storage.base import AssetStorage, UploadValidationError
+from rhythm_metadata_api.infrastructure.storage.cos_presign import presign_cos_get
 
 T = TypeVar("T")
 
@@ -929,14 +930,47 @@ class CatalogService:
             _, asset = selected
             if asset.state != "ready":
                 raise V2Conflict("selected asset is not ready")
-            location = uow.session.scalar(
-                select(AssetLocation)
-                .where(AssetLocation.asset_id == asset.id, AssetLocation.state == "available")
-                .order_by(AssetLocation.provider)
+            locations = list(
+                uow.session.scalars(
+                    select(AssetLocation)
+                    .where(
+                        AssetLocation.asset_id == asset.id,
+                        AssetLocation.state == "available",
+                    )
+                    .order_by(AssetLocation.provider)
+                )
             )
-            if location is None:
+            if not locations:
                 raise V2NotFound("selected asset has no available content")
-            if location.provider != "local":
+            # issue 11：优先为 COS 位置签发 presigned 直连 URL（配了凭据时），
+            # 让客户端绕过后端代理直接从对象存储下载音频；否则回退到本地代理。
+            cos_location = next((loc for loc in locations if loc.provider == "cos"), None)
+            if cos_location is not None and self.settings.cos_secret_id:
+                bucket, _, key = cos_location.storage_key.partition("/")
+                if not bucket or not key:
+                    raise V2Conflict("COS location has an invalid storage key")
+                url, expires_at = presign_cos_get(
+                    bucket=bucket,
+                    region=self.settings.cos_region,
+                    key=key,
+                    secret_id=self.settings.cos_secret_id,
+                    secret_key=self.settings.cos_secret_key,
+                    expires_seconds=self.settings.cos_presign_expires_seconds,
+                )
+                return PlaybackResponse(
+                    rendition_id=rendition.id,
+                    asset_id=asset.id,
+                    media_type=asset.detected_media_type,
+                    byte_size=asset.byte_size,
+                    delivery="signed_url",
+                    url=url,
+                    cache_key=f"rhythm:asset:{asset.id}:{asset.sha256}",
+                    etag=f'"sha256:{asset.sha256}"',
+                    supports_range=True,
+                    expires_at=expires_at,
+                )
+            local_location = next((loc for loc in locations if loc.provider == "local"), None)
+            if local_location is None:
                 raise V2Conflict("configured storage provider cannot issue a playback URL yet")
             return PlaybackResponse(
                 rendition_id=rendition.id,
