@@ -470,3 +470,108 @@ class IdempotencyKey(Base):
     )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class AuthUser(Base):
+    __tablename__ = "auth_users"
+
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    display_name: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'disabled')", name="auth_user_status"),
+    )
+
+
+class DeviceInvite(Base):
+    __tablename__ = "auth_device_invites"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    code_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("auth_users.id", ondelete="CASCADE"), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    consumed_by_device_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    issued_by: Mapped[str] = mapped_column(String(100), nullable=False)
+    replace_existing_device: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    __table_args__ = (Index("auth_device_invites_user_idx", "user_id", "created_at"),)
+
+
+class RegisteredDevice(Base):
+    __tablename__ = "auth_devices"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("auth_users.id", ondelete="CASCADE"), nullable=False
+    )
+    public_key_spki: Mapped[str] = mapped_column(Text, nullable=False)
+    public_key_thumbprint: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    key_algorithm: Mapped[str] = mapped_column(String(20), nullable=False, default="ES256")
+    display_name: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'revoked')", name="auth_device_status"),
+        Index("auth_devices_user_idx", "user_id"),
+        Index(
+            "uq_auth_devices_active_user",
+            "user_id",
+            unique=True,
+            sqlite_where=text("status = 'active'"),
+        ),
+    )
+
+
+class DeviceSession(Base):
+    __tablename__ = "auth_device_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    device_id: Mapped[str] = mapped_column(
+        ForeignKey("auth_devices.id", ondelete="CASCADE"), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    __table_args__ = (Index("auth_device_sessions_device_idx", "device_id"),)
+
+
+class AuthNonce(Base):
+    __tablename__ = "auth_nonces"
+
+    nonce_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    purpose: Mapped[str] = mapped_column(String(30), nullable=False)
+    device_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    __table_args__ = (Index("auth_nonces_expiry_idx", "expires_at"),)
+
+
+class AuthAuditEvent(Base):
+    __tablename__ = "auth_audit_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    actor_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    actor_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    source_ip: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    result: Mapped[str] = mapped_column(String(30), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    __table_args__ = (
+        Index("auth_audit_event_lookup_idx", "event_type", "source_ip", "created_at"),
+    )

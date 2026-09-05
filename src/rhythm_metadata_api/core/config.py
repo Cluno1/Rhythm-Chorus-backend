@@ -27,6 +27,17 @@ class Settings(BaseSettings):
     cos_region: str = "ap-guangzhou"
     cos_presign_expires_seconds: int = 900
 
+    # Public device gateway (issue 14). These remain optional for the private app;
+    # create_public_app validates them before exposing a public listener.
+    public_token_secret: str = ""
+    public_admin_username: str = "admin"
+    public_admin_password_hash: str = ""
+    public_access_token_ttl_seconds: int = 10 * 60
+    public_admin_token_ttl_seconds: int = 5 * 60
+    public_device_session_ttl_days: int = 90
+    public_invite_ttl_seconds: int = 10 * 60
+    public_nonce_ttl_seconds: int = 60
+
     @model_validator(mode="after")
     def reject_default_production_token(self) -> "Settings":
         if self.environment == "production" and self.bootstrap_token == "change-me-in-development":
@@ -35,6 +46,16 @@ class Settings(BaseSettings):
             raise ValueError("RHYTHM_COS_SECRET_ID and RHYTHM_COS_SECRET_KEY must be set together")
         if not 60 <= self.cos_presign_expires_seconds <= 3600:
             raise ValueError("RHYTHM_COS_PRESIGN_EXPIRES_SECONDS must be between 60 and 3600")
+        if not 60 <= self.public_access_token_ttl_seconds <= 3600:
+            raise ValueError("public access token TTL must be between 60 and 3600 seconds")
+        if not 60 <= self.public_admin_token_ttl_seconds <= 900:
+            raise ValueError("public admin token TTL must be between 60 and 900 seconds")
+        if not 1 <= self.public_device_session_ttl_days <= 365:
+            raise ValueError("public device session TTL must be between 1 and 365 days")
+        if not 60 <= self.public_invite_ttl_seconds <= 86400:
+            raise ValueError("public invite TTL must be between 60 seconds and one day")
+        if not 15 <= self.public_nonce_ttl_seconds <= 300:
+            raise ValueError("public nonce TTL must be between 15 and 300 seconds")
         return self
 
 

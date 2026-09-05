@@ -90,6 +90,22 @@ curl http://10.88.0.1:8010/healthz
 
 当前 `0.3.0` 已于 `2026-09-03` 部署到该中心机，v1 数据保留在 `rhythm.sqlite3`，v2 独立使用 `rhythm-v2.sqlite3`。旧 v1 业务数据尚未迁移；v2 已导入下述 COS 典型测试样本。
 
+### 公网只读 Catalog 网关
+
+Issue 14 增加独立进程 `public-api`。它与内网管理 API 共用 Catalog 数据，但只允许 Android 当前需要的 GET/HEAD 路由；上传、修改、发布等 handler 在进入路由前统一返回 404。公网进程关闭 OpenAPI 与文档页面。
+
+启动前在 `.env` 设置至少 32 字节的 `RHYTHM_PUBLIC_TOKEN_SECRET`，并设置 scrypt 格式的管理员密码哈希：
+
+```bash
+python -c 'from rhythm_metadata_api.application.device_auth import hash_admin_password; print(hash_admin_password(input("Admin password: ")))'
+docker compose up -d api
+docker compose --profile public up -d --build public-api
+```
+
+管理员密码只在获取 5 分钟管理令牌时提交，不保存到 Android。管理员签发一次性邀请码后，客户端用 Android Keystore 内不可导出的 P-256 私钥登记；后续每个 Catalog 请求都需要短期 token、服务端一次性 nonce、时间戳和请求签名。一个用户在数据库层最多只有一个 active 设备。
+
+`public-api` 固定监听腾讯云内网地址 `10.1.0.16:8010`（公网映射为 `175.178.242.232:8010`），而原有管理 API 继续只监听 WireGuard 地址 `10.88.0.1:8010`。确认容器健康并完成签名联调之前，不要开放安全组 8010。
+
 ## COS 典型样本导入
 
 `scripts/import_cos_samples.py` 从 GMUSIC Mongo 索引和 COS 导入一组固定的小样本，用来验证多谱、修订、扫描附件、MIDI Rendition、Asset 去重和 Range 播放。当前样本为 `321`、`348`、`528`、`test1`、`110`。
