@@ -332,6 +332,7 @@ class LibrarySongResponse(ApiModel):
     album_title: str
     duration_ms: int | None = None
     track_no: int | None = None
+    cover_asset_id: str | None = None
     cover_url: str | None = None
     lyrics: str | None = None
 
@@ -341,6 +342,7 @@ class LibraryAlbumResponse(ApiModel):
     key: str
     title: str
     artist: str | None = None
+    cover_asset_id: str | None = None
     cover_url: str | None = None
     song_count: int
 
