@@ -1545,7 +1545,7 @@ class CatalogService:
             or arrangement.cover_asset_id
             or work.cover_asset_id
         )
-        cover_url = self._local_cover_url(session, cover_asset_id)
+        cover_delivery = self._cover_delivery(session, cover_asset_id)
         score_lyrics = None
         if arrangement.preferred_score_id:
             score_lyrics = session.scalar(
@@ -1565,7 +1565,8 @@ class CatalogService:
             album_title=release.title,
             duration_ms=rendition.duration_ms,
             track_no=item.track_no,
-            cover_url=cover_url,
+            cover_asset_id=cover_delivery.asset_id if cover_delivery else None,
+            cover_url=cover_delivery.url if cover_delivery else None,
             lyrics=rendition.lyrics or score_lyrics or work.lyrics,
         )
 
@@ -1604,32 +1605,34 @@ class CatalogService:
                 .exists(),
             )
         )
-        cover_url = self._local_cover_url(session, release.cover_asset_id)
+        cover_delivery = self._cover_delivery(session, release.cover_asset_id)
         return LibraryAlbumResponse(
             id=release.id,
             key=release.key,
             title=release.title,
             artist=release.album_artist,
-            cover_url=cover_url,
+            cover_asset_id=cover_delivery.asset_id if cover_delivery else None,
+            cover_url=cover_delivery.url if cover_delivery else None,
             song_count=song_count or 0,
         )
 
-    @staticmethod
-    def _local_cover_url(session: Session, asset_id: str | None) -> str | None:
+    def _cover_delivery(
+        self, session: Session, asset_id: str | None
+    ) -> AssetDeliveryResponse | None:
         if asset_id is None:
             return None
-        location = session.scalar(
-            select(AssetLocation)
-            .join(Asset, Asset.id == AssetLocation.asset_id)
-            .where(
-                AssetLocation.asset_id == asset_id,
-                AssetLocation.provider == "local",
-                AssetLocation.state == "available",
-                Asset.state == "ready",
-                Asset.deleted_at.is_(None),
-            )
-        )
-        return f"/v2/assets/{asset_id}/content" if location is not None else None
+        asset = session.get(Asset, asset_id)
+        if (
+            asset is None
+            or asset.state != "ready"
+            or asset.deleted_at is not None
+            or not asset.detected_media_type.startswith("image/")
+        ):
+            return None
+        try:
+            return self._asset_delivery_response(session, asset)
+        except (V2Conflict, V2NotFound):
+            return None
 
     def _upload_response(self, session: Session, upload: UploadSession) -> UploadStatusResponse:
         asset = session.get(Asset, upload.completed_asset_id) if upload.completed_asset_id else None

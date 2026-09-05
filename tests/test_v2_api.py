@@ -298,6 +298,7 @@ def test_asset_delivery_and_native_library_projection(client: TestClient) -> Non
             "album_title": "ihope",
             "duration_ms": 123000,
             "track_no": 109,
+            "cover_asset_id": None,
             "cover_url": None,
             "lyrics": "score lyrics",
         }
@@ -360,6 +361,46 @@ def test_asset_delivery_returns_signed_cos_url_without_auth_in_url(tmp_path: Pat
         assert "Authorization" not in body["url"]
         assert body["expires_at"] is not None
         assert body["sha256"] == "d" * 64
+
+
+def test_library_album_returns_signed_cos_cover_url(tmp_path: Path) -> None:
+    settings = Settings(
+        bootstrap_token=TOKEN,
+        database_path=":memory:",
+        v2_database_path=str(tmp_path / "catalog.sqlite3"),
+        local_object_root=str(tmp_path / "objects"),
+        cos_secret_id="AKID-test",
+        cos_secret_key="secret-test",
+    )
+    with TestClient(create_app(settings)) as cos_client:
+        with Session(cos_client.app.state.v2_container.engine) as session, session.begin():
+            cover = Asset(
+                sha256="e" * 64,
+                byte_size=1234,
+                detected_media_type="image/png",
+                state="ready",
+            )
+            session.add(cover)
+            session.flush()
+            cover_id = cover.id
+            session.add_all(
+                [
+                    AssetLocation(
+                        asset_id=cover.id,
+                        provider="cos",
+                        storage_key="bible-1328751369/artwork/albums/ihope/cover.png",
+                    ),
+                    Release(key="ihope", title="ihope", cover_asset_id=cover.id),
+                ]
+            )
+
+        response = cos_client.get("/v2/library/albums", headers=AUTH)
+        assert response.status_code == 200
+        assert response.json()["items"][0]["cover_asset_id"] == cover_id
+        cover_url = response.json()["items"][0]["cover_url"]
+        assert cover_url.startswith("https://bible-1328751369.cos.")
+        assert "/artwork/albums/ihope/cover.png?" in cover_url
+        assert "q-signature=" in cover_url
 
 
 def test_v2_requires_auth_and_problem_details(client: TestClient) -> None:
