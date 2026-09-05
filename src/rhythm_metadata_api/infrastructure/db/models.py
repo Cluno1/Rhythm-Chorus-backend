@@ -513,6 +513,8 @@ class RegisteredDevice(Base):
     user_id: Mapped[str] = mapped_column(
         ForeignKey("auth_users.id", ondelete="CASCADE"), nullable=False
     )
+    application_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    signing_certificate_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     public_key_spki: Mapped[str] = mapped_column(Text, nullable=False)
     public_key_thumbprint: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     key_algorithm: Mapped[str] = mapped_column(String(20), nullable=False, default="ES256")
@@ -526,8 +528,9 @@ class RegisteredDevice(Base):
         CheckConstraint("status IN ('active', 'revoked')", name="auth_device_status"),
         Index("auth_devices_user_idx", "user_id"),
         Index(
-            "uq_auth_devices_active_user",
+            "uq_auth_devices_active_user_app",
             "user_id",
+            "application_id",
             unique=True,
             sqlite_where=text("status = 'active'"),
         ),

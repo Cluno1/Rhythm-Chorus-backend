@@ -42,6 +42,8 @@ class DevicePrincipal:
     device_id: str
     session_id: str
     key_thumbprint: str
+    application_id: str
+    signing_certificate_sha256: str
 
 
 @dataclass(frozen=True)
@@ -93,8 +95,18 @@ def verify_admin_password(password: str, encoded: str) -> bool:
         return False
 
 
-def enrollment_canonical(nonce: str, invite_code: str, key_thumbprint: str) -> bytes:
-    return f"RHYTHM-ENROLL-V1\n{nonce}\n{invite_code}\n{key_thumbprint}".encode()
+def enrollment_canonical(
+    nonce: str,
+    invite_code: str,
+    key_thumbprint: str,
+    application_id: str,
+    signing_certificate_sha256: str,
+) -> bytes:
+    certificate = signing_certificate_sha256.replace(":", "").lower()
+    return (
+        f"RHYTHM-ENROLL-V2\n{nonce}\n{invite_code}\n{key_thumbprint}\n"
+        f"{application_id}\n{certificate}"
+    ).encode()
 
 
 def refresh_canonical(
@@ -343,6 +355,8 @@ class DeviceAuthService:
                 "session_id": principal.session_id,
                 "scope": "catalog:read",
                 "cnf": {"jkt": principal.key_thumbprint},
+                "application_id": principal.application_id,
+                "signing_certificate_sha256": principal.signing_certificate_sha256,
                 "iat": now,
                 "exp": now + self.settings.public_access_token_ttl_seconds,
                 "jti": new_id(),
@@ -356,20 +370,37 @@ class DeviceAuthService:
         public_key_spki: str,
         signature: str,
         display_name: str | None,
+        application_id: str,
+        signing_certificate_sha256: str,
         source_ip: str | None,
     ) -> EnrollmentResult:
         public_key, thumbprint = self._load_public_key(public_key_spki)
         self._verify_signature(
-            public_key, signature, enrollment_canonical(nonce, invite_code, thumbprint)
+            public_key,
+            signature,
+            enrollment_canonical(
+                nonce,
+                invite_code,
+                thumbprint,
+                application_id,
+                signing_certificate_sha256,
+            ),
         )
         now = utc_now()
         session_expires = now + timedelta(days=self.settings.public_device_session_ttl_days)
         with Session(self.engine) as session:
             invite = self._active_invite(session, invite_code)
             self._consume_nonce(session, nonce, "enroll")
+            certificate = signing_certificate_sha256.replace(":", "").lower()
+            if application_id not in {
+                "io.github.cluno1.sonorus",
+                "io.github.cluno1.sonorus.debug",
+            } or len(certificate) != 64 or any(c not in "0123456789abcdef" for c in certificate):
+                raise DeviceAuthError(422, "invalid Sonorus application identity")
             active = session.scalar(
                 select(RegisteredDevice).where(
                     RegisteredDevice.user_id == invite.user_id,
+                    RegisteredDevice.application_id == application_id,
                     RegisteredDevice.status == "active",
                 )
             )
@@ -389,6 +420,8 @@ class DeviceAuthService:
             device = RegisteredDevice(
                 id=new_id(),
                 user_id=invite.user_id,
+                application_id=application_id,
+                signing_certificate_sha256=certificate,
                 public_key_spki=public_key_spki,
                 public_key_thumbprint=thumbprint,
                 display_name=display_name,
@@ -416,7 +449,12 @@ class DeviceAuthService:
                 source_ip=source_ip,
             )
             principal = DevicePrincipal(
-                invite.user_id, device.id, device_session.id, device.public_key_thumbprint
+                invite.user_id,
+                device.id,
+                device_session.id,
+                device.public_key_thumbprint,
+                device.application_id,
+                device.signing_certificate_sha256,
             )
             try:
                 session.commit()
@@ -432,6 +470,8 @@ class DeviceAuthService:
             device_id=str(claims["device_id"]),
             session_id=str(claims["session_id"]),
             key_thumbprint=str(claims["cnf"]["jkt"]),
+            application_id=str(claims["application_id"]),
+            signing_certificate_sha256=str(claims["signing_certificate_sha256"]),
         )
         if expected_device_id is not None and not secrets.compare_digest(
             principal.device_id, expected_device_id
@@ -450,6 +490,11 @@ class DeviceAuthService:
             or device.user_id != principal.user_id
             or not secrets.compare_digest(
                 device.public_key_thumbprint, principal.key_thumbprint
+            )
+            or device.application_id != principal.application_id
+            or not secrets.compare_digest(
+                device.signing_certificate_sha256,
+                principal.signing_certificate_sha256,
             )
             or device.status != "active"
             or user is None
@@ -487,7 +532,12 @@ class DeviceAuthService:
             if device is None:
                 raise DeviceAuthError(401, "unknown device")
             principal = DevicePrincipal(
-                device.user_id, device_id, session_id, device.public_key_thumbprint
+                device.user_id,
+                device_id,
+                session_id,
+                device.public_key_thumbprint,
+                device.application_id,
+                device.signing_certificate_sha256,
             )
             self._active_device_and_session(session, principal)
             session.add(
@@ -515,7 +565,12 @@ class DeviceAuthService:
             if device is None:
                 raise DeviceAuthError(401, "unknown device")
             principal = DevicePrincipal(
-                device.user_id, device_id, session_id, device.public_key_thumbprint
+                device.user_id,
+                device_id,
+                session_id,
+                device.public_key_thumbprint,
+                device.application_id,
+                device.signing_certificate_sha256,
             )
             _, device_session = self._active_device_and_session(session, principal)
             key, _ = self._load_public_key(device.public_key_spki)

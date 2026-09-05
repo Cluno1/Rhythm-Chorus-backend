@@ -48,6 +48,8 @@ class DeviceEnrollRequest(CamelModel):
     public_key_spki: str = Field(min_length=80, max_length=2000)
     signature: str = Field(min_length=40, max_length=1000)
     display_name: str | None = Field(default=None, max_length=300)
+    application_id: str = Field(pattern=r"^io\.github\.cluno1\.sonorus(?:\.debug)?$")
+    signing_certificate_sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
 
 
 class DeviceSessionResponse(CamelModel):

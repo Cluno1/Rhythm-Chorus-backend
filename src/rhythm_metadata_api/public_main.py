@@ -10,12 +10,18 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 
 from rhythm_metadata_api.api.public_auth import router as public_auth_router
+from rhythm_metadata_api.api.public_updates import UpdateRepository
+from rhythm_metadata_api.api.public_updates import router as public_updates_router
 from rhythm_metadata_api.api.routes import health
 from rhythm_metadata_api.api.v2.routes import actor_context
 from rhythm_metadata_api.api.v2.routes import router as v2_router
 from rhythm_metadata_api.application.catalog_service import ActorContext
 from rhythm_metadata_api.application.container import V2Container
-from rhythm_metadata_api.application.device_auth import DeviceAuthError, DeviceAuthService
+from rhythm_metadata_api.application.device_auth import (
+    DeviceAuthError,
+    DeviceAuthService,
+    DevicePrincipal,
+)
 from rhythm_metadata_api.core.config import Settings, get_settings
 from rhythm_metadata_api.domain.v2.errors import V2DomainError
 from rhythm_metadata_api.main import problem_response
@@ -33,6 +39,9 @@ _PUBLIC_READ_ROUTES = (
     ("GET", re.compile(r"^/v2/assets/[^/]+/content$")),
     ("HEAD", re.compile(r"^/v2/assets/[^/]+/content$")),
     ("GET", re.compile(r"^/v2/sync/changes$")),
+    ("GET", re.compile(r"^/v2/app-updates/latest$")),
+    ("GET", re.compile(r"^/v2/app-updates/files/\d+/[A-Za-z0-9._-]+\.apk$")),
+    ("HEAD", re.compile(r"^/v2/app-updates/files/\d+/[A-Za-z0-9._-]+\.apk$")),
 )
 
 
@@ -45,6 +54,33 @@ def _device_token(authorization: str | None) -> str:
     if scheme.lower() != "device" or not token:
         raise HTTPException(401, "Device authorization is required")
     return token
+
+
+def _authenticate_update_request(request: Request) -> DevicePrincipal:
+    headers = request.headers
+    try:
+        timestamp = int(headers.get("X-Rhythm-Timestamp", ""))
+        query = request.scope.get("query_string", b"").decode("ascii")
+        content_sha256 = headers.get("X-Rhythm-Content-SHA256", "")
+        if content_sha256.lower() != _EMPTY_SHA256:
+            raise HTTPException(401, "GET and HEAD requests must use the empty content hash")
+        return request.app.state.device_auth.authenticate_request(
+            _device_token(headers.get("Authorization")),
+            headers.get("X-Rhythm-Device-ID", ""),
+            timestamp,
+            headers.get("X-Rhythm-Nonce", ""),
+            content_sha256,
+            headers.get("X-Rhythm-Signature", ""),
+            request.method,
+            request.url.path,
+            query,
+        )
+    except ValueError:
+        raise HTTPException(401, "device proof headers are required") from None
+    except UnicodeDecodeError:
+        raise HTTPException(400, "query string must be ASCII percent-encoded") from None
+    except DeviceAuthError as error:
+        raise HTTPException(error.status_code, error.detail) from error
 
 
 def public_actor_context(
@@ -94,6 +130,8 @@ def create_public_app(settings: Settings | None = None) -> FastAPI:
         container = V2Container.build(resolved)
         lifespan_app.state.v2_container = container
         lifespan_app.state.device_auth = DeviceAuthService(container.engine, resolved)
+        lifespan_app.state.update_settings = resolved
+        lifespan_app.state.update_repository = UpdateRepository(resolved.sonorus_updates_root)
         try:
             yield
         finally:
@@ -101,7 +139,7 @@ def create_public_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="Rhythm Public Catalog Gateway",
-        version="0.4.0",
+        version="0.5.0",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -121,6 +159,11 @@ def create_public_app(settings: Settings | None = None) -> FastAPI:
             and not _public_read_allowed(request.method, path)
         ):
             return JSONResponse({"detail": "not found"}, status_code=404)
+        if path.startswith("/v2/app-updates/"):
+            try:
+                request.state.device_principal = _authenticate_update_request(request)
+            except HTTPException as error:
+                return JSONResponse({"detail": error.detail}, status_code=error.status_code)
         return await call_next(request)
 
     @app.exception_handler(V2DomainError)
@@ -147,5 +190,6 @@ def create_public_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(health.router)
     app.include_router(public_auth_router)
+    app.include_router(public_updates_router)
     app.include_router(v2_router)
     return app

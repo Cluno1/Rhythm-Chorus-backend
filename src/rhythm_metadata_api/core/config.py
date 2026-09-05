@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     public_device_session_ttl_days: int = 90
     public_invite_ttl_seconds: int = 10 * 60
     public_nonce_ttl_seconds: int = 60
+    sonorus_updates_root: str = ""
+    sonorus_debug_certificate_sha256: str = ""
+    sonorus_stable_certificate_sha256: str = ""
 
     @model_validator(mode="after")
     def reject_default_production_token(self) -> "Settings":
@@ -56,6 +59,13 @@ class Settings(BaseSettings):
             raise ValueError("public invite TTL must be between 60 seconds and one day")
         if not 15 <= self.public_nonce_ttl_seconds <= 300:
             raise ValueError("public nonce TTL must be between 15 and 300 seconds")
+        for name, digest in (
+            ("RHYTHM_SONORUS_DEBUG_CERTIFICATE_SHA256", self.sonorus_debug_certificate_sha256),
+            ("RHYTHM_SONORUS_STABLE_CERTIFICATE_SHA256", self.sonorus_stable_certificate_sha256),
+        ):
+            normalized = digest.replace(":", "").lower()
+            if digest and (len(normalized) != 64 or any(c not in "0123456789abcdef" for c in normalized)):
+                raise ValueError(f"{name} must be a SHA-256 fingerprint")
         return self
 
 

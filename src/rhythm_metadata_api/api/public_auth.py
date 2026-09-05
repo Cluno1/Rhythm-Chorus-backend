@@ -138,6 +138,8 @@ def enroll_device(body: DeviceEnrollRequest, request: Request) -> DeviceSessionR
             body.public_key_spki,
             body.signature,
             body.display_name,
+            body.application_id,
+            body.signing_certificate_sha256,
             _source_ip(request),
         )
     except DeviceAuthError as error:

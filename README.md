@@ -102,7 +102,15 @@ docker compose up -d api
 docker compose --profile public up -d --build public-api
 ```
 
-管理员密码只在获取 5 分钟管理令牌时提交，不保存到 Android。管理员签发一次性邀请码后，客户端用 Android Keystore 内不可导出的 P-256 私钥登记；后续每个 Catalog 请求都需要短期 token、服务端一次性 nonce、时间戳和请求签名。一个用户在数据库层最多只有一个 active 设备。
+管理员密码只在获取 5 分钟管理令牌时提交，不保存到 Android。管理员签发一次性邀请码后，客户端用 Android Keystore 内不可导出的 P-256 私钥登记；后续每个 Catalog 请求都需要短期 token、服务端一次性 nonce、时间戳和请求签名。设备登记绑定 Sonorus applicationId 与 APK 签名证书；一个用户可为 Debug 和 Release 各保留一台 active 设备，但同一 applicationId 仍只能有一台。
+
+`issue15updateidentity` 迁移会把旧登记标为 legacy 身份；升级网关后，既有 Android 客户端需要由管理员重新签发邀请码并登记一次。新的 enrollment V2 签名同时覆盖 applicationId 和证书指纹，避免这两个字段在 HTTP 传输中被替换。
+
+### Sonorus 自托管更新
+
+`public-api` 只读挂载 `./updates:/updates:ro`，开放设备认证的 `GET /v2/app-updates/latest` 以及 `GET/HEAD /v2/app-updates/files/{versionCode}/{fileName}`。服务器根据登记的 applicationId 与冻结证书映射 Debug/Stable，不信任客户端单独提交的 channel。更新目录之外的路径、未列入版本 manifest 的 APK 和公网写请求全部拒绝。
+
+部署前必须配置 `RHYTHM_SONORUS_DEBUG_CERTIFICATE_SHA256` 与 `RHYTHM_SONORUS_STABLE_CERTIFICATE_SHA256`。发布流程通过管理通道把不可变版本目录写入主机 `updates/`，最后原子替换对应的 `latest.json`；公网容器对该目录没有写权限。
 
 `public-api` 固定监听腾讯云内网地址 `10.1.0.16:8010`（公网映射为 `175.178.242.232:8010`），而原有管理 API 继续只监听 WireGuard 地址 `10.88.0.1:8010`。确认容器健康并完成签名联调之前，不要开放安全组 8010。
 
@@ -130,6 +138,6 @@ ruff check src tests
 
 ## 尚未实现
 
-- Release、Lyrics、Artwork 与 metadata suggestions。
+- Lyrics 与 metadata suggestions。
 - 删除墓碑、对象 GC、转码/预览 worker、COS adapter。
 - 旧 v1 Demo 数据一次性导入与 Android v2 端到端联调。
