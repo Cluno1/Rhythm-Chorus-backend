@@ -36,6 +36,8 @@ from rhythm_metadata_api.domain.v2.schemas import (
     ContributorResponse,
     LibraryAlbumDetailResponse,
     LibraryAlbumResponse,
+    LibraryScoreOptionResponse,
+    LibraryScoreWorkResponse,
     LibrarySongResponse,
     PartInput,
     PartResponse,
@@ -998,6 +1000,152 @@ class CatalogService:
             return [self._library_album_response(uow.session, row) for row in rows], (
                 rows[-1].id if has_more and rows else None
             )
+
+    def list_library_score_works(
+        self, cursor: str | None, limit: int
+    ) -> tuple[list[LibraryScoreWorkResponse], str | None]:
+        deliverable_providers = ["local"]
+        if self.settings.cos_secret_id and self.settings.cos_secret_key:
+            deliverable_providers.append("cos")
+        musicxml_types = {
+            "application/vnd.recordare.musicxml+xml",
+            "application/vnd.recordare.musicxml",
+            "application/xml",
+            "text/xml",
+        }
+        with self.uow_factory() as uow:
+            eligible_asset = (
+                select(ScoreRevisionAsset.asset_id)
+                .join(Asset, Asset.id == ScoreRevisionAsset.asset_id)
+                .where(
+                    ScoreRevisionAsset.score_revision_id == Score.published_revision_id,
+                    ScoreRevisionAsset.role == "primary_musicxml",
+                    Asset.state == "ready",
+                    Asset.deleted_at.is_(None),
+                    Asset.detected_media_type.in_(musicxml_types),
+                    select(AssetLocation.id)
+                    .where(
+                        AssetLocation.asset_id == Asset.id,
+                        AssetLocation.state == "available",
+                        AssetLocation.provider.in_(deliverable_providers),
+                    )
+                    .exists(),
+                )
+                .exists()
+            )
+            work_statement = (
+                select(Work)
+                .where(
+                    Work.deleted_at.is_(None),
+                    Work.status == "active",
+                    select(Score.id)
+                    .join(Arrangement, Arrangement.id == Score.arrangement_id)
+                    .where(
+                        Arrangement.work_id == Work.id,
+                        Arrangement.deleted_at.is_(None),
+                        Score.deleted_at.is_(None),
+                        Score.published_revision_id.is_not(None),
+                        eligible_asset,
+                    )
+                    .exists(),
+                )
+                .order_by(Work.id)
+                .limit(limit + 1)
+            )
+            if cursor:
+                work_statement = work_statement.where(Work.id > cursor)
+            works = list(uow.session.scalars(work_statement))
+            has_more = len(works) > limit
+            works = works[:limit]
+            responses = [
+                self._library_score_work_response(
+                    uow.session, work, deliverable_providers, musicxml_types
+                )
+                for work in works
+            ]
+            return responses, works[-1].id if has_more and works else None
+
+    def _library_score_work_response(
+        self,
+        session: Session,
+        work: Work,
+        deliverable_providers: list[str],
+        musicxml_types: set[str],
+    ) -> LibraryScoreWorkResponse:
+        rows = session.execute(
+            select(Score, Arrangement, ScoreRevision, func.count(Part.id))
+            .join(Arrangement, Arrangement.id == Score.arrangement_id)
+            .join(ScoreRevision, ScoreRevision.id == Score.published_revision_id)
+            .outerjoin(
+                Part,
+                and_(Part.arrangement_id == Arrangement.id, Part.deleted_at.is_(None)),
+            )
+            .where(
+                Arrangement.work_id == work.id,
+                Arrangement.deleted_at.is_(None),
+                Score.deleted_at.is_(None),
+                select(ScoreRevisionAsset.asset_id)
+                .join(Asset, Asset.id == ScoreRevisionAsset.asset_id)
+                .where(
+                    ScoreRevisionAsset.score_revision_id == ScoreRevision.id,
+                    ScoreRevisionAsset.role == "primary_musicxml",
+                    Asset.state == "ready",
+                    Asset.deleted_at.is_(None),
+                    Asset.detected_media_type.in_(musicxml_types),
+                    select(AssetLocation.id)
+                    .where(
+                        AssetLocation.asset_id == Asset.id,
+                        AssetLocation.state == "available",
+                        AssetLocation.provider.in_(deliverable_providers),
+                    )
+                    .exists(),
+                )
+                .exists(),
+            )
+            .group_by(Score.id, Arrangement.id, ScoreRevision.id)
+            .order_by(ScoreRevision.created_at.desc(), ScoreRevision.revision_no.desc(), Score.id)
+        ).all()
+        options = [
+            LibraryScoreOptionResponse(
+                arrangement_id=arrangement.id,
+                arrangement_name=arrangement.name,
+                score_id=score.id,
+                revision_id=revision.id,
+                score_label=score.label,
+                origin=score.origin,
+                part_count=part_count,
+                revision_no=revision.revision_no,
+                published_at=revision.created_at,
+                preferred=arrangement.preferred_score_id == score.id,
+            )
+            for score, arrangement, revision, part_count in rows
+        ]
+        preferred = [option for option in options if option.preferred]
+        default = preferred[0] if preferred else options[0]
+        artist = session.scalar(
+            select(Contributor.display_name)
+            .join(WorkCredit, WorkCredit.contributor_id == Contributor.id)
+            .where(WorkCredit.work_id == work.id)
+            .order_by(
+                case((WorkCredit.role == "composer", 0), else_=1),
+                WorkCredit.position,
+                WorkCredit.id,
+            )
+            .limit(1)
+        )
+        cover_delivery = self._cover_delivery(session, work.cover_asset_id)
+        return LibraryScoreWorkResponse(
+            work_id=work.id,
+            title=work.canonical_title,
+            artist=artist,
+            cover_asset_id=cover_delivery.asset_id if cover_delivery else None,
+            cover_url=cover_delivery.url if cover_delivery else None,
+            default_score_id=default.score_id,
+            latest_published_at=max(option.published_at for option in options),
+            score_count=len(options),
+            origins=sorted({option.origin for option in options}),
+            score_options=options,
+        )
 
     def get_library_album(self, album_id: str) -> LibraryAlbumDetailResponse:
         with self.uow_factory() as uow:

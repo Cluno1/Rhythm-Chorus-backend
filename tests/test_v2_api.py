@@ -19,6 +19,7 @@ from rhythm_metadata_api.infrastructure.db.models import (
     RenditionAsset,
     Score,
     ScoreRevision,
+    ScoreRevisionAsset,
     Work,
     WorkCredit,
     utc_now,
@@ -119,13 +120,20 @@ def test_asset_delivery_and_native_library_projection(client: TestClient) -> Non
         score.head_revision_id = revision.id
         score.published_revision_id = revision.id
         arrangement.preferred_score_id = score.id
-        session.add(
-            WorkCredit(
+        session.add_all(
+            [
+                ScoreRevisionAsset(
+                    score_revision_id=revision.id,
+                    asset_id=musicxml_asset["id"],
+                    role="primary_musicxml",
+                ),
+                WorkCredit(
                 work_id=work.id,
                 contributor_id=contributor.id,
                 role="composer",
                 position=1,
-            )
+                ),
+            ]
         )
         rendition = Rendition(
             arrangement_id=arrangement.id,
@@ -323,6 +331,16 @@ def test_asset_delivery_and_native_library_projection(client: TestClient) -> Non
         "Your Faithfulness",
         "Second Song",
     ]
+    score_works = client.get("/v2/library/score-works", headers=AUTH)
+    assert score_works.status_code == 200, score_works.text
+    assert score_works.json()["next_cursor"] is None
+    score_work = score_works.json()["items"][0]
+    assert score_work["work_id"] == work_id
+    assert score_work["artist"] == "Composer"
+    assert score_work["default_score_id"] == score_work["score_options"][0]["score_id"]
+    assert score_work["score_count"] == 1
+    assert score_work["origins"] == ["ocr"]
+    assert score_work["score_options"][0]["preferred"] is True
 
 
 def test_asset_delivery_returns_signed_cos_url_without_auth_in_url(tmp_path: Path) -> None:

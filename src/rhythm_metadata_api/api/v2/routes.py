@@ -435,6 +435,20 @@ def list_library_albums(
     }
 
 
+@router.get("/library/score-works")
+def list_library_score_works(
+    service: Catalog,
+    _: Actor,
+    cursor: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 200,
+) -> dict[str, Any]:
+    items, next_cursor = service.list_library_score_works(cursor, limit)
+    return {
+        "items": [item.model_dump(mode="json") for item in items],
+        "next_cursor": next_cursor,
+    }
+
+
 @router.get("/library/albums/{album_id}")
 def get_library_album(album_id: str, service: Catalog, _: Actor) -> Response:
     return model_response(service.get_library_album(album_id))

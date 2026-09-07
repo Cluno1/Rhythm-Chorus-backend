@@ -352,6 +352,32 @@ class LibraryAlbumDetailResponse(ApiModel):
     songs: list[LibrarySongResponse]
 
 
+class LibraryScoreOptionResponse(ApiModel):
+    arrangement_id: str
+    arrangement_name: str
+    score_id: str
+    revision_id: str
+    score_label: str
+    origin: str
+    part_count: int
+    revision_no: int
+    published_at: datetime
+    preferred: bool
+
+
+class LibraryScoreWorkResponse(ApiModel):
+    work_id: str
+    title: str
+    artist: str | None = None
+    cover_asset_id: str | None = None
+    cover_url: str | None = None
+    default_score_id: str
+    latest_published_at: datetime
+    score_count: int
+    origins: list[str]
+    score_options: list[LibraryScoreOptionResponse]
+
+
 class ArrangementBundle(ArrangementResponse):
     scores: list[ScoreResponse]
     renditions: list[RenditionResponse]
