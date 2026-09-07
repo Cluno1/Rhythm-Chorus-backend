@@ -78,7 +78,7 @@ services:
       RHYTHM_SONORUS_STABLE_CERTIFICATE_SHA256: ${RHYTHM_SONORUS_STABLE_CERTIFICATE_SHA256:?set RHYTHM_SONORUS_STABLE_CERTIFICATE_SHA256}
     volumes:
       - ./data:/data
-      - ./updates:/updates:ro
+      - /srv/sonorus-updates:/updates:ro
     init: true
     mem_limit: 256m
     pids_limit: 128
