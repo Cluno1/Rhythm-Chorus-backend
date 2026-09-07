@@ -1141,7 +1141,10 @@ class CatalogService:
             cover_asset_id=cover_delivery.asset_id if cover_delivery else None,
             cover_url=cover_delivery.url if cover_delivery else None,
             default_score_id=default.score_id,
-            latest_published_at=max(option.published_at for option in options),
+            latest_published_at=max(
+                options,
+                key=lambda option: _aware_datetime(option.published_at),
+            ).published_at,
             score_count=len(options),
             origins=sorted({option.origin for option in options}),
             score_options=options,
@@ -1941,6 +1944,10 @@ def is_expired(value: datetime) -> bool:
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
     return value <= utc_now()
+
+
+def _aware_datetime(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 def playback_role_priority(prefer: str | None) -> list[str]:
