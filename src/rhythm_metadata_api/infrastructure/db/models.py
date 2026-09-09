@@ -53,6 +53,13 @@ class Work(RevisionedMixin, Base):
         ForeignKey("v2_assets.id", ondelete="SET NULL"), nullable=True
     )
     lyrics: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # issue 32: lyrics 保持为默认语言文本，其他语言以结构化 JSON 数组保存。
+    lyrics_language: Mapped[str] = mapped_column(
+        String(35), nullable=False, default="und", server_default="und"
+    )
+    lyrics_translations: Mapped[list[dict[str, str]]] = mapped_column(
+        JSON, nullable=False, default=list, server_default=text("'[]'")
+    )
 
     __table_args__ = (
         CheckConstraint("status IN ('draft', 'active', 'archived')", name="work_status"),
@@ -173,6 +180,12 @@ class Score(RevisionedMixin, Base):
     )
     # issue 9: 乐谱天生带词，是歌词回退链的中级来源（song→乐谱→work）
     lyrics: Mapped[str | None] = mapped_column(Text, nullable=True)
+    lyrics_language: Mapped[str] = mapped_column(
+        String(35), nullable=False, default="und", server_default="und"
+    )
+    lyrics_translations: Mapped[list[dict[str, str]]] = mapped_column(
+        JSON, nullable=False, default=list, server_default=text("'[]'")
+    )
 
     __table_args__ = (
         CheckConstraint(
@@ -300,6 +313,12 @@ class Rendition(RevisionedMixin, Base):
         ForeignKey("v2_assets.id", ondelete="SET NULL"), nullable=True
     )
     lyrics: Mapped[str | None] = mapped_column(Text, nullable=True)
+    lyrics_language: Mapped[str] = mapped_column(
+        String(35), nullable=False, default="und", server_default="und"
+    )
+    lyrics_translations: Mapped[list[dict[str, str]]] = mapped_column(
+        JSON, nullable=False, default=list, server_default=text("'[]'")
+    )
 
     __table_args__ = (Index("v2_renditions_arrangement_idx", "arrangement_id"),)
 

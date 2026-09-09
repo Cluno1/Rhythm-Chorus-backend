@@ -356,8 +356,15 @@ class FormalCatalogImporter:
             work = self.session.get(Work, alias.work_id)
             if work is None:
                 raise FormalImportError(f"dangling work alias {work_key}")
-            expected = (title, language, lyrics, "active")
-            actual = (work.canonical_title, work.language, work.lyrics, work.status)
+            expected = (title, language, lyrics, language or "und", [], "active")
+            actual = (
+                work.canonical_title,
+                work.language,
+                work.lyrics,
+                work.lyrics_language,
+                work.lyrics_translations,
+                work.status,
+            )
             if actual != expected:
                 raise FormalImportError(f"work manifest drift for {work_key}")
             return work
@@ -366,6 +373,8 @@ class FormalCatalogImporter:
             canonical_title=title,
             language=language,
             lyrics=lyrics,
+            lyrics_language=language or "und",
+            lyrics_translations=[],
             status="active",
         )
         self.session.add(work)
@@ -430,6 +439,8 @@ class FormalCatalogImporter:
                 label="GMUSIC OCR",
                 origin="ocr",
                 lyrics=canonical.lyrics,
+                lyrics_language=canonical.language or "und",
+                lyrics_translations=[],
             )
             self.session.add(score)
             self.session.flush()
@@ -438,6 +449,8 @@ class FormalCatalogImporter:
             or score.label != "GMUSIC OCR"
             or score.origin != "ocr"
             or score.lyrics != canonical.lyrics
+            or score.lyrics_language != (canonical.language or "und")
+            or score.lyrics_translations != []
         ):
             raise FormalImportError(f"score manifest drift for {work_key}")
         revisions: dict[int, ScoreRevision] = {}
@@ -583,12 +596,19 @@ class FormalCatalogImporter:
             label = f"{label} ({row.language_variant})"
         rendition = self.session.get(Rendition, rendition_id)
         if rendition is None:
+            work_language = self.session.scalar(
+                select(Work.language).where(Work.id == arrangement.work_id)
+            )
             rendition = Rendition(
                 id=rendition_id,
                 arrangement_id=arrangement.id,
                 label=label,
                 kind="performance",
                 duration_ms=row.duration_ms,
+                lyrics_language=_normalize_language(row.language_variant)
+                or work_language
+                or "und",
+                lyrics_translations=[],
             )
             self.session.add(rendition)
             self.session.flush()

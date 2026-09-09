@@ -45,6 +45,12 @@ The service is a modular monolith. SQLite is appropriate for the current single-
 
 Asset content, source provenance and physical location are separate tables. Local storage uses `sha256/<prefix>/<hash>`. `GET /v2/renditions/{id}/playback` chooses stream/mix/master/midi and returns the authenticated Asset URL, immutable cache key, hash ETag and Range capability. The content endpoint remains bearer-protected.
 
+## Multilingual lyrics
+
+Work, Score and Rendition each own an independent localized lyric set. The existing `lyrics` text remains the default-language value so old clients remain compatible. `lyrics_language` identifies that value with a BCP 47-style tag, and `lyrics_translations` stores the other variants as an ordered JSON array of `{language, lyrics}` objects.
+
+The library projection resolves lyrics per language in Rendition → preferred Score → Work order. A higher-priority entity replaces only languages it supplies; it does not hide lower-priority translations in other languages. Duplicate language tags and a translation that repeats the default language are rejected at the domain boundary.
+
 ## Deferred modules
 
-Release/Lyrics/Artwork, metadata suggestions, deletes/GC, derived jobs and COS are intentionally outside the implemented P0–P3 core.
+Metadata suggestions, deletes/GC, derived jobs and a writable runtime COS adapter are intentionally outside the implemented core.

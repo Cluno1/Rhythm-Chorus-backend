@@ -7,6 +7,7 @@ Rhythm 私有作品库后端。v2 以 `Work → Arrangement → Score/Rendition 
 - Work、alias、Contributor/Credit、Arrangement 与 Part。
 - 不可变 ScoreRevision；每个修订恰好一个主 MusicXML，可附 MIDI/扫描件/PDF。
 - Rendition 与 master/stream/mix/stem/midi 文件关系；只有 Rendition 是可播放业务身份。
+- Work、Score、Rendition 的多语言歌词；默认语言正文兼容旧客户端，其他语言以结构化数组保存。
 - Asset 内容、来源与存储位置分离；SHA-256 去重、两阶段流式上传、MusicXML/MXL/MIDI/图片/音频格式检查。
 - Bearer 鉴权、`Idempotency-Key`、`If-Match`/ETag、RFC 7807 风格错误、Bundle 条件缓存和 changes 游标。
 - 本机内容寻址对象存储及支持 `Range` 的受保护 Asset 下载。
@@ -75,6 +76,29 @@ GET   /v2/sync/changes?after=<sequence>
 
 典型文件流程：客户端先计算 hash 和大小，`POST /v2/uploads`；若不是 `reused`，流式 `PUT` 字节并 `POST complete`；最后把返回的 Asset ID 关联到 ScoreRevision 或 Rendition。
 
+### 多语言歌词
+
+Work、Score 和 Rendition 共用以下向后兼容的字段结构：
+
+```json
+{
+  "lyrics": "Amazing grace...",
+  "lyrics_language": "en",
+  "lyrics_translations": [
+    {
+      "language": "zh-Hans",
+      "lyrics": "奇异恩典……"
+    }
+  ]
+}
+```
+
+- `lyrics` 是默认主语言歌词，旧客户端可继续只读取此字符串。
+- `lyrics_language` 是默认歌词的 BCP 47 风格语言标签；支持 `en`、`en-US`、`zh-Hans`、`zh-Hant` 等形式。
+- `lyrics_translations` 是其他语言数组；语言不可重复，也不可再次出现默认语言。
+- 新建 Score/Rendition 时如省略 `lyrics_language`，默认继承所属 Work 的 `language`；仍无法确定时使用 `und`。
+- `/v2/library/songs` 按语言执行 Rendition → preferred Score → Work 回退：高优先级来源只覆盖它实际提供的语言，其他语言继续从下级来源补齐。
+
 ## Docker
 
 `compose.yaml` 默认只绑定 WireGuard 中心机 `10.88.0.1:8010`，数据库和对象目录持久化在 `./data`：
@@ -134,10 +158,10 @@ pytest -q
 ruff check src tests
 ```
 
-当前自动化覆盖 v1 回归，以及 v2 鉴权、幂等重放/冲突、精确解析、文件校验与复用、不可变谱面修订、过期 ETag、Rendition 播放选择、Range、Bundle 304 和增量事件。
+当前自动化覆盖 v1 回归，以及 v2 鉴权、幂等重放/冲突、精确解析、多语言歌词与旧数据迁移、文件校验与复用、不可变谱面修订、过期 ETag、Rendition 播放选择、Range、Bundle 304 和增量事件。
 
 ## 尚未实现
 
-- Lyrics 与 metadata suggestions。
+- Metadata suggestions。
 - 删除墓碑、对象 GC、转码/预览 worker、COS adapter。
 - 旧 v1 Demo 数据一次性导入与 Android v2 端到端联调。

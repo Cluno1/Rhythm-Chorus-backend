@@ -99,7 +99,12 @@ def test_asset_delivery_and_native_library_projection(client: TestClient) -> Non
 
     container = client.app.state.v2_container
     with Session(container.engine) as session, session.begin():
-        work = Work(canonical_title="Your Faithfulness", lyrics="work lyrics")
+        work = Work(
+            canonical_title="Your Faithfulness",
+            lyrics="work lyrics",
+            lyrics_language="en",
+            lyrics_translations=[{"language": "zh-Hans", "lyrics": "作品简体歌词"}],
+        )
         session.add(work)
         session.flush()
         arrangement = Arrangement(work_id=work.id, name="Imported")
@@ -110,6 +115,8 @@ def test_asset_delivery_and_native_library_projection(client: TestClient) -> Non
             label="Published score",
             origin="ocr",
             lyrics="score lyrics",
+            lyrics_language="en",
+            lyrics_translations=[{"language": "zh-Hant", "lyrics": "樂譜繁體歌詞"}],
         )
         contributor = Contributor(display_name="Composer")
         session.add_all([score, contributor])
@@ -140,6 +147,9 @@ def test_asset_delivery_and_native_library_projection(client: TestClient) -> Non
             label="Your Faithfulness",
             kind="performance",
             duration_ms=123000,
+            lyrics="rendition lyrics",
+            lyrics_language="en",
+            lyrics_translations=[{"language": "zh-Hans", "lyrics": "演唱简体歌词"}],
         )
         session.add(rendition)
         session.flush()
@@ -307,10 +317,15 @@ def test_asset_delivery_and_native_library_projection(client: TestClient) -> Non
             "duration_ms": 123000,
             "track_no": 109,
             "cover_asset_id": None,
-            "cover_url": None,
-            "lyrics": "score lyrics",
-        }
-    ]
+                "cover_url": None,
+                "lyrics": "rendition lyrics",
+                "lyrics_language": "en",
+                "lyrics_translations": [
+                    {"language": "zh-Hans", "lyrics": "演唱简体歌词"},
+                    {"language": "zh-Hant", "lyrics": "樂譜繁體歌詞"},
+                ],
+            }
+        ]
     second_page = client.get(
         "/v2/library/songs",
         headers=AUTH,
@@ -319,6 +334,11 @@ def test_asset_delivery_and_native_library_projection(client: TestClient) -> Non
     assert second_page.status_code == 200
     assert second_page.json()["next_cursor"] is None
     assert second_page.json()["items"][0]["title"] == "Second Song"
+    assert second_page.json()["items"][0]["lyrics"] == "score lyrics"
+    assert second_page.json()["items"][0]["lyrics_translations"] == [
+        {"language": "zh-Hans", "lyrics": "作品简体歌词"},
+        {"language": "zh-Hant", "lyrics": "樂譜繁體歌詞"},
+    ]
     assert client.get("/v2/library/songs?cursor=invalid!", headers=AUTH).status_code == 422
     albums = client.get("/v2/library/albums", headers=AUTH)
     assert albums.status_code == 200
@@ -644,6 +664,116 @@ def test_private_catalog_end_to_end(client: TestClient) -> None:
         "rendition.created",
         "rendition.created",
     ]
+
+
+def test_multilingual_lyrics_crud_and_validation(client: TestClient) -> None:
+    work = post(
+        client,
+        "/v2/works",
+        "multilingual-work",
+        {
+            "canonical_title": "Multilingual Work",
+            "language": "zh-hans",
+            "lyrics": "默认歌词",
+            "lyrics_translations": [
+                {"language": "en_us", "lyrics": "English lyrics"},
+            ],
+        },
+    )
+    assert work.status_code == 201, work.text
+    assert work.json()["lyrics"] == "默认歌词"
+    assert work.json()["lyrics_language"] == "zh-Hans"
+    assert work.json()["lyrics_translations"] == [
+        {"language": "en-US", "lyrics": "English lyrics"}
+    ]
+    work_id = work.json()["id"]
+
+    arrangement = post(
+        client,
+        f"/v2/works/{work_id}/arrangements",
+        "multilingual-arrangement",
+        {"name": "Default"},
+    )
+    assert arrangement.status_code == 201, arrangement.text
+    arrangement_id = arrangement.json()["id"]
+
+    score = post(
+        client,
+        f"/v2/arrangements/{arrangement_id}/scores",
+        "multilingual-score",
+        {
+            "label": "Localized score",
+            "origin": "manual",
+            "lyrics": "乐谱歌词",
+            "lyrics_translations": [
+                {"language": "en", "lyrics": "Score lyrics"},
+            ],
+        },
+    )
+    assert score.status_code == 201, score.text
+    assert score.json()["lyrics_language"] == "zh-Hans"
+    score_id = score.json()["id"]
+
+    patched_score = client.patch(
+        f"/v2/scores/{score_id}",
+        headers={**AUTH, "If-Match": '"rev-1"'},
+        json={
+            "lyrics_translations": [
+                {"language": "en", "lyrics": "Updated score lyrics"},
+                {"language": "zh-Hant", "lyrics": "樂譜歌詞"},
+            ]
+        },
+    )
+    assert patched_score.status_code == 200, patched_score.text
+    assert patched_score.json()["lyrics_translations"] == [
+        {"language": "en", "lyrics": "Updated score lyrics"},
+        {"language": "zh-Hant", "lyrics": "樂譜歌詞"},
+    ]
+
+    rendition = post(
+        client,
+        f"/v2/arrangements/{arrangement_id}/renditions",
+        "multilingual-rendition",
+        {
+            "label": "English performance",
+            "kind": "performance",
+            "lyrics": "Performance lyrics",
+            "lyrics_language": "en",
+            "lyrics_translations": [
+                {"language": "zh-Hans", "lyrics": "演唱歌词"},
+            ],
+        },
+    )
+    assert rendition.status_code == 201, rendition.text
+    assert rendition.json()["lyrics_language"] == "en"
+    assert rendition.json()["lyrics_translations"] == [
+        {"language": "zh-Hans", "lyrics": "演唱歌词"}
+    ]
+
+    invalid_default_duplicate = post(
+        client,
+        "/v2/works",
+        "invalid-default-duplicate",
+        {
+            "canonical_title": "Invalid duplicate",
+            "lyrics": "Primary",
+            "lyrics_language": "en",
+            "lyrics_translations": [{"language": "EN", "lyrics": "Duplicate"}],
+        },
+    )
+    assert invalid_default_duplicate.status_code == 422
+
+    invalid_translation_without_primary = post(
+        client,
+        "/v2/works",
+        "invalid-without-primary",
+        {
+            "canonical_title": "Missing primary",
+            "lyrics_language": "en",
+            "lyrics_translations": [{"language": "zh", "lyrics": "翻译"}],
+        },
+    )
+    assert invalid_translation_without_primary.status_code == 422
 
 
 def test_rejects_invalid_musicxml_at_completion(client: TestClient) -> None:

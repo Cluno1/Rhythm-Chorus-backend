@@ -23,6 +23,7 @@ from rhythm_metadata_api.domain.v2.errors import (
     V2DomainError,
     V2NotFound,
 )
+from rhythm_metadata_api.domain.v2.lyrics import merge_lyrics_sources, normalize_lyrics_bundle
 from rhythm_metadata_api.domain.v2.schemas import (
     ArrangementBundle,
     ArrangementCreate,
@@ -39,6 +40,7 @@ from rhythm_metadata_api.domain.v2.schemas import (
     LibraryScoreOptionResponse,
     LibraryScoreWorkResponse,
     LibrarySongResponse,
+    LyricsTranslation,
     PartInput,
     PartResponse,
     PlaybackResponse,
@@ -112,6 +114,52 @@ class StoredResponse:
     replayed: bool = False
 
 
+_LYRICS_FIELDS = frozenset({"lyrics", "lyrics_language", "lyrics_translations"})
+
+
+def _translation_dicts(items: list[LyricsTranslation] | list[dict[str, str]]) -> list[dict[str, str]]:
+    return [item.model_dump() if isinstance(item, LyricsTranslation) else dict(item) for item in items]
+
+
+def _normalize_lyrics_or_error(
+    lyrics: str | None,
+    lyrics_language: str | None,
+    lyrics_translations: list[LyricsTranslation] | list[dict[str, str]],
+    *,
+    fallback_language: str | None,
+) -> tuple[str | None, str, list[dict[str, str]]]:
+    try:
+        return normalize_lyrics_bundle(
+            lyrics,
+            lyrics_language,
+            _translation_dicts(lyrics_translations),
+            fallback_language=fallback_language,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise V2DomainError(str(error)) from error
+
+
+def _merge_lyrics_patch(
+    entity: Work | Score | Rendition,
+    changes: dict[str, Any],
+    *,
+    fallback_language: str | None,
+) -> None:
+    if not _LYRICS_FIELDS.intersection(changes):
+        return
+    lyrics, language, translations = _normalize_lyrics_or_error(
+        changes.get("lyrics", entity.lyrics),
+        changes.get("lyrics_language", entity.lyrics_language),
+        changes.get("lyrics_translations", entity.lyrics_translations) or [],
+        fallback_language=fallback_language,
+    )
+    changes.update(
+        lyrics=lyrics,
+        lyrics_language=language,
+        lyrics_translations=translations,
+    )
+
+
 class CatalogService:
     def __init__(
         self,
@@ -172,10 +220,19 @@ class CatalogService:
             self._require_contributors(
                 session, [credit.contributor_id for credit in request.credits]
             )
+            lyrics, lyrics_language, lyrics_translations = _normalize_lyrics_or_error(
+                request.lyrics,
+                request.lyrics_language,
+                request.lyrics_translations,
+                fallback_language=request.language,
+            )
             work = Work(
                 canonical_title=request.canonical_title.strip(),
                 language=request.language,
                 status=request.status,
+                lyrics=lyrics,
+                lyrics_language=lyrics_language,
+                lyrics_translations=lyrics_translations,
             )
             session.add(work)
             session.flush()
@@ -236,6 +293,11 @@ class CatalogService:
             changes = request.model_dump(exclude_unset=True)
             if not changes:
                 return self._work_response(uow.session, work)
+            _merge_lyrics_patch(
+                work,
+                changes,
+                fallback_language=changes.get("language", work.language),
+            )
             for key, value in changes.items():
                 setattr(work, key, value.strip() if isinstance(value, str) else value)
             work.revision += 1
@@ -636,11 +698,23 @@ class CatalogService:
                 source_score = self._require_score(session, source_revision.score_id)
                 if source_score.arrangement_id != arrangement.id:
                     raise V2DomainError("derived revision must belong to the same arrangement")
+            work_language = session.scalar(
+                select(Work.language).where(Work.id == arrangement.work_id)
+            )
+            lyrics, lyrics_language, lyrics_translations = _normalize_lyrics_or_error(
+                request.lyrics,
+                request.lyrics_language,
+                request.lyrics_translations,
+                fallback_language=work_language,
+            )
             score = Score(
                 arrangement_id=arrangement.id,
                 label=request.label.strip(),
                 origin=request.origin,
                 derived_from_revision_id=request.derived_from_revision_id,
+                lyrics=lyrics,
+                lyrics_language=lyrics_language,
+                lyrics_translations=lyrics_translations,
             )
             session.add(score)
             session.flush()
@@ -688,6 +762,12 @@ class CatalogService:
                     raise V2DomainError("published revision must belong to this score")
             if not changes:
                 return self._score_response(score)
+            work_language = uow.session.scalar(
+                select(Work.language)
+                .join(Arrangement, Arrangement.work_id == Work.id)
+                .where(Arrangement.id == score.arrangement_id)
+            )
+            _merge_lyrics_patch(score, changes, fallback_language=work_language)
             for key, value in changes.items():
                 setattr(score, key, value.strip() if isinstance(value, str) else value)
             score.revision += 1
@@ -798,6 +878,15 @@ class CatalogService:
     ) -> StoredResponse:
         def operation(session: Session) -> tuple[RenditionResponse, int, dict[str, str]]:
             arrangement = self._require_arrangement(session, arrangement_id)
+            work_language = session.scalar(
+                select(Work.language).where(Work.id == arrangement.work_id)
+            )
+            lyrics, lyrics_language, lyrics_translations = _normalize_lyrics_or_error(
+                request.lyrics,
+                request.lyrics_language,
+                request.lyrics_translations,
+                fallback_language=work_language,
+            )
             rendition = Rendition(
                 arrangement_id=arrangement.id,
                 label=request.label.strip(),
@@ -806,6 +895,9 @@ class CatalogService:
                 recorded_at=request.recorded_at,
                 location=request.location,
                 duration_ms=request.duration_ms,
+                lyrics=lyrics,
+                lyrics_language=lyrics_language,
+                lyrics_translations=lyrics_translations,
             )
             session.add(rendition)
             session.flush()
@@ -857,6 +949,12 @@ class CatalogService:
             changes = request.model_dump(exclude_unset=True)
             if not changes:
                 return self._rendition_response(uow.session, rendition)
+            work_language = uow.session.scalar(
+                select(Work.language)
+                .join(Arrangement, Arrangement.work_id == Work.id)
+                .where(Arrangement.id == rendition.arrangement_id)
+            )
+            _merge_lyrics_patch(rendition, changes, fallback_language=work_language)
             for key, value in changes.items():
                 setattr(rendition, key, value.strip() if isinstance(value, str) else value)
             rendition.revision += 1
@@ -1446,6 +1544,9 @@ class CatalogService:
             canonical_title=work.canonical_title,
             language=work.language,
             status=work.status,
+            lyrics=work.lyrics,
+            lyrics_language=work.lyrics_language,
+            lyrics_translations=work.lyrics_translations,
             revision=work.revision,
             aliases=[
                 WorkAliasInput(namespace=item.namespace, external_id=item.external_id)
@@ -1507,6 +1608,9 @@ class CatalogService:
             derived_from_revision_id=score.derived_from_revision_id,
             head_revision_id=score.head_revision_id,
             published_revision_id=score.published_revision_id,
+            lyrics=score.lyrics,
+            lyrics_language=score.lyrics_language,
+            lyrics_translations=score.lyrics_translations,
             revision=score.revision,
         )
 
@@ -1554,6 +1658,9 @@ class CatalogService:
             recorded_at=rendition.recorded_at,
             location=rendition.location,
             duration_ms=rendition.duration_ms,
+            lyrics=rendition.lyrics,
+            lyrics_language=rendition.lyrics_language,
+            lyrics_translations=rendition.lyrics_translations,
             revision=rendition.revision,
             assets=[
                 RenditionAssetResponse(
@@ -1697,15 +1804,36 @@ class CatalogService:
             or work.cover_asset_id
         )
         cover_delivery = self._cover_delivery(session, cover_asset_id)
-        score_lyrics = None
+        score: Score | None = None
         if arrangement.preferred_score_id:
-            score_lyrics = session.scalar(
-                select(Score.lyrics).where(
+            score = session.scalar(
+                select(Score).where(
                     Score.id == arrangement.preferred_score_id,
                     Score.published_revision_id.is_not(None),
                     Score.deleted_at.is_(None),
                 )
             )
+        lyrics, lyrics_language, lyrics_translations = merge_lyrics_sources(
+            [
+                (
+                    rendition.lyrics,
+                    rendition.lyrics_language,
+                    rendition.lyrics_translations,
+                ),
+                *(
+                    [
+                        (
+                            score.lyrics,
+                            score.lyrics_language,
+                            score.lyrics_translations,
+                        )
+                    ]
+                    if score is not None
+                    else []
+                ),
+                (work.lyrics, work.lyrics_language, work.lyrics_translations),
+            ]
+        )
         return LibrarySongResponse(
             work_id=work.id,
             arrangement_id=arrangement.id,
@@ -1718,7 +1846,9 @@ class CatalogService:
             track_no=item.track_no,
             cover_asset_id=cover_delivery.asset_id if cover_delivery else None,
             cover_url=cover_delivery.url if cover_delivery else None,
-            lyrics=rendition.lyrics or score_lyrics or work.lyrics,
+            lyrics=lyrics,
+            lyrics_language=lyrics_language or "und",
+            lyrics_translations=lyrics_translations,
         )
 
     def _library_album_response(

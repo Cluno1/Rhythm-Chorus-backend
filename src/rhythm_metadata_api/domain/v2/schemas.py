@@ -5,9 +5,59 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from rhythm_metadata_api.domain.v2.lyrics import normalize_language_tag
+
 
 class ApiModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class LyricsTranslation(ApiModel):
+    language: str = Field(min_length=2, max_length=35)
+    lyrics: str = Field(min_length=1, max_length=2 * 1024 * 1024)
+
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: str) -> str:
+        return normalize_language_tag(value)
+
+    @field_validator("lyrics")
+    @classmethod
+    def validate_lyrics(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("lyrics must not be blank")
+        return normalized
+
+
+class LocalizedLyricsCreate(ApiModel):
+    lyrics: str | None = Field(default=None, max_length=2 * 1024 * 1024)
+    lyrics_language: str | None = Field(default=None, min_length=2, max_length=35)
+    lyrics_translations: list[LyricsTranslation] = Field(default_factory=list, max_length=100)
+
+    @field_validator("lyrics_language")
+    @classmethod
+    def validate_lyrics_language(cls, value: str | None) -> str | None:
+        return normalize_language_tag(value) if value is not None else None
+
+
+class LocalizedLyricsPatch(ApiModel):
+    lyrics: str | None = Field(default=None, max_length=2 * 1024 * 1024)
+    lyrics_language: str | None = Field(default=None, min_length=2, max_length=35)
+    lyrics_translations: list[LyricsTranslation] | None = Field(
+        default=None, max_length=100
+    )
+
+    @field_validator("lyrics_language")
+    @classmethod
+    def validate_lyrics_language(cls, value: str | None) -> str | None:
+        return normalize_language_tag(value) if value is not None else None
+
+
+class LocalizedLyricsResponse(ApiModel):
+    lyrics: str | None
+    lyrics_language: str
+    lyrics_translations: list[LyricsTranslation]
 
 
 class WorkAliasInput(ApiModel):
@@ -31,7 +81,7 @@ class ContributorResponse(ContributorCreate):
     revision: int
 
 
-class WorkCreate(ApiModel):
+class WorkCreate(LocalizedLyricsCreate):
     canonical_title: str = Field(min_length=1, max_length=500)
     language: str | None = Field(default=None, max_length=35)
     status: Literal["draft", "active", "archived"] = "active"
@@ -39,7 +89,7 @@ class WorkCreate(ApiModel):
     credits: list[CreditInput] = Field(default_factory=list)
 
 
-class WorkPatch(ApiModel):
+class WorkPatch(LocalizedLyricsPatch):
     canonical_title: str | None = Field(default=None, min_length=1, max_length=500)
     language: str | None = Field(default=None, max_length=35)
     status: Literal["draft", "active", "archived"] | None = None
@@ -53,7 +103,7 @@ class WorkCreditResponse(ApiModel):
     position: int
 
 
-class WorkResponse(ApiModel):
+class WorkResponse(LocalizedLyricsResponse):
     id: str
     canonical_title: str
     language: str | None
@@ -187,13 +237,13 @@ class UploadStatusResponse(ApiModel):
     asset: AssetResponse | None = None
 
 
-class ScoreCreate(ApiModel):
+class ScoreCreate(LocalizedLyricsCreate):
     label: str = Field(min_length=1, max_length=500)
     origin: Literal["ocr", "midi_transcription", "manual", "external_import"]
     derived_from_revision_id: str | None = None
 
 
-class ScorePatch(ApiModel):
+class ScorePatch(LocalizedLyricsPatch):
     label: str | None = Field(default=None, min_length=1, max_length=500)
     published_revision_id: str | None = None
 
@@ -231,7 +281,7 @@ class ScoreRevisionResponse(ApiModel):
     created_at: datetime
 
 
-class ScoreResponse(ApiModel):
+class ScoreResponse(LocalizedLyricsResponse):
     id: str
     arrangement_id: str
     label: str
@@ -264,7 +314,7 @@ class RenditionAssetResponse(RenditionAssetInput):
     media_type: str
 
 
-class RenditionCreate(ApiModel):
+class RenditionCreate(LocalizedLyricsCreate):
     label: str = Field(min_length=1, max_length=500)
     kind: str = Field(min_length=1, max_length=50)
     ensemble: str | None = Field(default=None, max_length=500)
@@ -274,7 +324,7 @@ class RenditionCreate(ApiModel):
     assets: list[RenditionAssetInput] = Field(default_factory=list)
 
 
-class RenditionPatch(ApiModel):
+class RenditionPatch(LocalizedLyricsPatch):
     label: str | None = Field(default=None, min_length=1, max_length=500)
     kind: str | None = Field(default=None, min_length=1, max_length=50)
     ensemble: str | None = Field(default=None, max_length=500)
@@ -283,7 +333,7 @@ class RenditionPatch(ApiModel):
     duration_ms: int | None = Field(default=None, ge=0)
 
 
-class RenditionResponse(ApiModel):
+class RenditionResponse(LocalizedLyricsResponse):
     id: str
     arrangement_id: str
     label: str
@@ -322,7 +372,7 @@ class AssetDeliveryResponse(ApiModel):
     expires_at: datetime | None = None
 
 
-class LibrarySongResponse(ApiModel):
+class LibrarySongResponse(LocalizedLyricsResponse):
     work_id: str
     arrangement_id: str
     rendition_id: str
@@ -334,7 +384,6 @@ class LibrarySongResponse(ApiModel):
     track_no: int | None = None
     cover_asset_id: str | None = None
     cover_url: str | None = None
-    lyrics: str | None = None
 
 
 class LibraryAlbumResponse(ApiModel):
