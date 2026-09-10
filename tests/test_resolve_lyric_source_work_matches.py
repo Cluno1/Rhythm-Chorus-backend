@@ -15,9 +15,11 @@ sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 WorkMatchError = MODULE.WorkMatchError
+ReviewedCatalogLink = MODULE.ReviewedCatalogLink
 build_matches = MODULE.build_matches
 load_catalog = MODULE.load_catalog
 normalize_title = MODULE.normalize_title
+resolve_reviewed_catalog_links = MODULE.resolve_reviewed_catalog_links
 
 
 def catalog() -> sqlite3.Connection:
@@ -40,6 +42,12 @@ def catalog() -> sqlite3.Connection:
         CREATE TABLE v2_release_items (
             id TEXT PRIMARY KEY, release_id TEXT NOT NULL,
             rendition_id TEXT NOT NULL, track_no INTEGER
+        );
+        CREATE TABLE v2_assets (
+            id TEXT PRIMARY KEY, sha256 TEXT NOT NULL, state TEXT NOT NULL
+        );
+        CREATE TABLE v2_rendition_assets (
+            id TEXT PRIMARY KEY, rendition_id TEXT NOT NULL, asset_id TEXT NOT NULL
         );
         """
     )
@@ -84,6 +92,23 @@ def song(number: int, title: str) -> dict[str, object]:
         "title_zh_hans": title,
         "title_en": "",
     }
+
+
+def add_mp3(
+    connection: sqlite3.Connection,
+    *,
+    sha256: str,
+    asset_id: str,
+    rendition_id: str,
+) -> None:
+    connection.execute(
+        "INSERT INTO v2_assets VALUES (?, ?, 'ready')",
+        (asset_id, sha256),
+    )
+    connection.execute(
+        "INSERT INTO v2_rendition_assets VALUES (?, ?, ?)",
+        (f"rendition-asset-{asset_id}", rendition_id, asset_id),
+    )
 
 
 def test_simplified_rendition_title_resolves_traditional_work() -> None:
@@ -182,6 +207,102 @@ def test_reviewed_work_id_is_preserved_and_validated() -> None:
             tracks,
             {1: {"work_id": "missing-work"}},
         )
+
+
+def test_reviewed_mp3_relationship_overrides_incorrect_title_match() -> None:
+    connection = catalog()
+    add_version(
+        connection,
+        work_id="wrong-title-work",
+        canonical_title="Source title",
+        rendition_id="wrong-rendition",
+        label="Source title",
+        track_no=122,
+    )
+    add_version(
+        connection,
+        work_id="catalog-work",
+        canonical_title="Catalog Work",
+        rendition_id="catalog-rendition",
+        label="Different Catalog title",
+        track_no=999,
+    )
+    sha256 = "a" * 64
+    add_mp3(
+        connection,
+        sha256=sha256,
+        asset_id="catalog-mp3",
+        rendition_id="catalog-rendition",
+    )
+    works, titles, tracks = load_catalog(connection, "ihope")
+    overrides = resolve_reviewed_catalog_links(
+        connection,
+        [ReviewedCatalogLink(122, sha256, "link_existing_work", "reviewed")],
+    )
+
+    rows = build_matches(
+        [song(122, "Source title")],
+        works,
+        titles,
+        tracks,
+        {122: {"work_id": "wrong-title-work", "status": "updated"}},
+        overrides,
+    )
+
+    assert rows[0]["work_id"] == "catalog-work"
+    assert rows[0]["status"] == "resolved_reviewed_catalog_relation"
+
+
+def test_reviewed_catalog_versions_must_resolve_to_one_work() -> None:
+    connection = catalog()
+    for suffix in ("a", "b"):
+        add_version(
+            connection,
+            work_id=f"work-{suffix}",
+            canonical_title=f"Work {suffix}",
+            rendition_id=f"rendition-{suffix}",
+            label=f"Version {suffix}",
+            track_no=1,
+        )
+        add_mp3(
+            connection,
+            sha256=suffix * 64,
+            asset_id=f"asset-{suffix}",
+            rendition_id=f"rendition-{suffix}",
+        )
+
+    with pytest.raises(WorkMatchError, match="multiple Works"):
+        resolve_reviewed_catalog_links(
+            connection,
+            [
+                ReviewedCatalogLink(123, "a" * 64, "link_existing_work", ""),
+                ReviewedCatalogLink(123, "b" * 64, "link_existing_work", ""),
+            ],
+        )
+
+
+def test_different_composition_review_does_not_override_source_work() -> None:
+    connection = catalog()
+    add_version(
+        connection,
+        work_id="source-work",
+        canonical_title="Same visible title",
+        rendition_id="source-rendition",
+        label="Same visible title",
+        track_no=123,
+    )
+    works, titles, tracks = load_catalog(connection, "ihope")
+    overrides = resolve_reviewed_catalog_links(
+        connection,
+        [ReviewedCatalogLink(123, "c" * 64, "different_composition", "lyrics differ")],
+    )
+
+    rows = build_matches(
+        [song(123, "Same visible title")], works, titles, tracks, {}, overrides
+    )
+
+    assert overrides == {}
+    assert rows[0]["work_id"] == "source-work"
 
 
 def test_normalization_is_strict_but_ignores_case_and_whitespace() -> None:

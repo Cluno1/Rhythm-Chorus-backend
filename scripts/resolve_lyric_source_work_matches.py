@@ -1,10 +1,11 @@
 """Resolve extracted lyric-source songs to existing catalog Works.
 
 The resolver deliberately follows catalog relationships instead of requiring an
-extracted title to equal ``Work.canonical_title``. An exact normalized match to a
-Rendition label is followed through ``Rendition -> Arrangement -> Work`` and all
-matching versions are collapsed by Work ID. Existing reviewed Work IDs may be
-supplied and are preserved after validation.
+extracted title to equal ``Work.canonical_title``. A reviewed PDF-to-Catalog bridge
+uses the MP3's content SHA-256 to follow ``Asset -> Rendition -> Arrangement ->
+Work``. This authoritative relationship takes precedence over historical title
+matches. For sources without a reviewed bridge, an exact normalized match to a
+Rendition label may still be used as a fallback.
 
 No fuzzy, punctuation, or track-number-only matching is performed. When the same
 title reaches multiple Works, a release track may disambiguate it only if the
@@ -35,6 +36,17 @@ class CatalogTitle:
     source: str
     title: str
     rendition_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ReviewedCatalogLink:
+    songbook_number: int
+    mp3_sha256: str
+    decision: str
+    detail: str
+
+
+REVIEW_DECISIONS = {"link_existing_work", "different_composition"}
 
 
 OUTPUT_FIELDS = (
@@ -87,6 +99,106 @@ def read_existing_matches(path: Path | None) -> dict[int, dict[str, str]]:
             raise WorkMatchError(f"duplicate existing match for songbook number {number}")
         result[number] = row
     return result
+
+
+def read_reviewed_catalog_links(path: Path | None) -> list[ReviewedCatalogLink]:
+    if path is None:
+        return []
+    with path.open(encoding="utf-8", newline="") as source:
+        rows = list(csv.DictReader(source, delimiter="\t"))
+    result = []
+    identities = set()
+    for line_number, row in enumerate(rows, 2):
+        number = int(row.get("songbook_number") or 0)
+        sha256 = (row.get("mp3_sha256") or "").strip().lower()
+        decision = (row.get("decision") or "").strip()
+        if number < 1:
+            raise WorkMatchError(f"invalid reviewed songbook number on line {line_number}")
+        if len(sha256) != 64 or any(character not in "0123456789abcdef" for character in sha256):
+            raise WorkMatchError(f"invalid reviewed MP3 SHA-256 on line {line_number}")
+        if decision not in REVIEW_DECISIONS:
+            raise WorkMatchError(f"invalid reviewed decision on line {line_number}: {decision}")
+        identity = (number, sha256)
+        if identity in identities:
+            raise WorkMatchError(
+                f"duplicate reviewed Catalog link for song {number} and MP3 {sha256}"
+            )
+        identities.add(identity)
+        result.append(
+            ReviewedCatalogLink(
+                songbook_number=number,
+                mp3_sha256=sha256,
+                decision=decision,
+                detail=(row.get("detail") or "").strip(),
+            )
+        )
+    return result
+
+
+def resolve_reviewed_catalog_links(
+    connection: sqlite3.Connection,
+    reviewed: list[ReviewedCatalogLink],
+) -> dict[int, tuple[str, str, str]]:
+    """Resolve approved MP3 identities to Works without comparing any title."""
+    grouped: dict[int, list[ReviewedCatalogLink]] = defaultdict(list)
+    for row in reviewed:
+        grouped[row.songbook_number].append(row)
+
+    overrides = {}
+    for number, rows in grouped.items():
+        decisions = {row.decision for row in rows}
+        if len(decisions) != 1:
+            raise WorkMatchError(
+                f"reviewed Catalog links for song {number} contain conflicting decisions"
+            )
+        if decisions == {"different_composition"}:
+            continue
+
+        resolved_work_ids = set()
+        canonical_titles = {}
+        for row in rows:
+            matches = list(
+                connection.execute(
+                    """
+                    SELECT DISTINCT w.id, w.canonical_title
+                    FROM v2_assets asset
+                    JOIN v2_rendition_assets rendition_asset
+                      ON rendition_asset.asset_id = asset.id
+                    JOIN v2_renditions rendition
+                      ON rendition.id = rendition_asset.rendition_id
+                    JOIN v2_arrangements arrangement
+                      ON arrangement.id = rendition.arrangement_id
+                    JOIN v2_works w ON w.id = arrangement.work_id
+                    WHERE lower(asset.sha256) = ?
+                      AND asset.state = 'ready'
+                      AND rendition.deleted_at IS NULL
+                      AND arrangement.deleted_at IS NULL
+                      AND w.deleted_at IS NULL
+                    """,
+                    (row.mp3_sha256,),
+                )
+            )
+            work_ids = {str(match[0]) for match in matches}
+            if len(work_ids) != 1:
+                raise WorkMatchError(
+                    f"reviewed MP3 {row.mp3_sha256} for song {number} resolves to "
+                    f"{len(work_ids)} Works"
+                )
+            work_id = work_ids.pop()
+            resolved_work_ids.add(work_id)
+            canonical_titles[work_id] = str(matches[0][1])
+        if len(resolved_work_ids) != 1:
+            raise WorkMatchError(
+                f"reviewed Catalog versions for song {number} resolve to multiple Works: "
+                + ", ".join(sorted(resolved_work_ids))
+            )
+        work_id = resolved_work_ids.pop()
+        overrides[number] = (
+            work_id,
+            canonical_titles[work_id],
+            f"reviewed MP3 SHA-256 -> Rendition -> Work ({len(rows)} version(s))",
+        )
+    return overrides
 
 
 def load_catalog(
@@ -216,13 +328,23 @@ def build_matches(
     titles: dict[str, list[CatalogTitle]],
     release_tracks: dict[tuple[str, int], set[str]],
     existing: dict[int, dict[str, str]],
+    reviewed_catalog_overrides: dict[int, tuple[str, str, str]] | None = None,
 ) -> list[dict[str, str]]:
+    reviewed_catalog_overrides = reviewed_catalog_overrides or {}
     output = []
     for song in songs:
         number = int(song["songbook_number"])
         previous = existing.get(number, {})
         previous_work_id = previous.get("work_id", "").strip()
-        if previous_work_id:
+        reviewed_override = reviewed_catalog_overrides.get(number)
+        if reviewed_override is not None:
+            work_id, canonical_title, detail = reviewed_override
+            if work_id not in works:
+                raise WorkMatchError(
+                    f"reviewed Catalog relation for song {number} refers to missing Work {work_id}"
+                )
+            status = "resolved_reviewed_catalog_relation"
+        elif previous_work_id:
             canonical_title = works.get(previous_work_id)
             if canonical_title is None:
                 raise WorkMatchError(
@@ -263,6 +385,7 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--database", type=Path, required=True)
     parser.add_argument("--existing-matches", type=Path)
+    parser.add_argument("--reviewed-catalog-links", type=Path)
     parser.add_argument("--release-key")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -278,21 +401,48 @@ def main() -> None:
     )
     if existing_path is not None and not existing_path.is_file():
         parser.error("--existing-matches must be an existing TSV file")
+    reviewed_path = (
+        args.reviewed_catalog_links.expanduser().resolve()
+        if args.reviewed_catalog_links
+        else None
+    )
+    if reviewed_path is not None and not reviewed_path.is_file():
+        parser.error("--reviewed-catalog-links must be an existing TSV file")
 
     songs = read_jsonl(manifest)
     existing = read_existing_matches(existing_path)
+    reviewed = read_reviewed_catalog_links(reviewed_path)
     connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
     try:
         works, titles, release_tracks = load_catalog(connection, args.release_key)
+        reviewed_catalog_overrides = resolve_reviewed_catalog_links(connection, reviewed)
     finally:
         connection.close()
-    rows = build_matches(songs, works, titles, release_tracks, existing)
+    song_numbers = {int(song["songbook_number"]) for song in songs}
+    unknown_reviewed_numbers = sorted(
+        {row.songbook_number for row in reviewed} - song_numbers
+    )
+    if unknown_reviewed_numbers:
+        raise WorkMatchError(
+            f"reviewed Catalog links contain unknown songbook numbers: {unknown_reviewed_numbers}"
+        )
+    rows = build_matches(
+        songs,
+        works,
+        titles,
+        release_tracks,
+        existing,
+        reviewed_catalog_overrides,
+    )
     write_tsv(args.output.expanduser().resolve(), rows)
     summary = {
         "songs": len(rows),
         "matched": sum(bool(row["work_id"]) for row in rows),
         "resolved_via_existing_rendition": sum(
             row["status"] == "resolved_existing_rendition" for row in rows
+        ),
+        "resolved_via_reviewed_catalog_relation": sum(
+            row["status"] == "resolved_reviewed_catalog_relation" for row in rows
         ),
         "ambiguous": sum(row["status"] == "ambiguous_skipped" for row in rows),
         "unmatched": sum(row["status"] == "unmatched_skipped" for row in rows),
