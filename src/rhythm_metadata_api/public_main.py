@@ -36,6 +36,7 @@ _PUBLIC_READ_ROUTES = (
     ("GET", re.compile(r"^/v2/works/[^/]+/bundle$")),
     ("GET", re.compile(r"^/v2/score-revisions/[^/]+$")),
     ("GET", re.compile(r"^/v2/renditions/[^/]+/playback$")),
+    ("GET", re.compile(r"^/v2/renditions/[^/]+/effective-lyric-sources$")),
     ("GET", re.compile(r"^/v2/assets/[^/]+/delivery$")),
     ("GET", re.compile(r"^/v2/assets/[^/]+/content$")),
     ("HEAD", re.compile(r"^/v2/assets/[^/]+/content$")),

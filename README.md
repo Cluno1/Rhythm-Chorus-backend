@@ -60,7 +60,15 @@ POST  /v2/uploads
 PUT   /v2/uploads/{id}/content
 POST  /v2/uploads/{id}/complete
 GET   /v2/assets/{id}
+GET   /v2/assets/{id}/delivery
 GET   /v2/assets/{id}/content
+
+POST  /v2/lyric-source-documents
+GET   /v2/lyric-source-documents/{id}
+POST  /v2/lyric-source-documents/{id}/pages
+POST  /v2/works/{id}/lyric-source-pages
+POST  /v2/scores/{id}/lyric-source-pages
+POST  /v2/renditions/{id}/lyric-source-pages
 
 POST  /v2/arrangements/{id}/scores
 PATCH /v2/scores/{id}
@@ -70,6 +78,7 @@ POST  /v2/arrangements/{id}/renditions
 PATCH /v2/renditions/{id}
 POST  /v2/renditions/{id}/assets
 GET   /v2/renditions/{id}/playback
+GET   /v2/renditions/{id}/effective-lyric-sources
 
 GET   /v2/sync/changes?after=<sequence>
 ```
@@ -98,6 +107,33 @@ Work、Score 和 Rendition 共用以下向后兼容的字段结构：
 - `lyrics_translations` 是其他语言数组；语言不可重复，也不可再次出现默认语言。
 - 新建 Score/Rendition 时如省略 `lyrics_language`，默认继承所属 Work 的 `language`；仍无法确定时使用 `und`。
 - `/v2/library/songs` 按语言执行 Rendition → preferred Score → Work 回退：高优先级来源只覆盖它实际提供的语言，其他语言继续从下级来源补齐。
+
+### 歌词来源整页图
+
+Issue 52 使用 `v2_lyric_source_documents`、`v2_lyric_source_pages` 和
+`v2_lyric_source_links` 保存来源文档、完整物理页与 Work/Score/Rendition 关联。
+同一 PDF 页只有一个图片 Asset；页面含多首歌时多个 Work 共享它，不裁剪也不复制
+COS 对象。业务响应通过 `lyrics_source_images` 返回稳定 Asset ID，客户端显示时再调用
+Asset delivery，不能持久化短期 COS 签名 URL。
+
+IHOP Songbook 导入分为可审计的两步，均默认不修改生产环境：
+
+```bash
+python scripts/build_lyric_source_plan.py \
+  --pdf 2024-IHOP-Songbook.pdf \
+  --manifest extracted-songs/manifest.jsonl \
+  --work-matches Work歌词导入匹配结果.tsv
+
+# 审核 metadata-only 结果后，再传 --render-dir 和 --output 生成完整原页及锁定 hash 的计划。
+# 正式执行还要求已迁移数据库、COS 凭据和双重显式确认：
+python scripts/import_lyric_source_plan.py \
+  --plan reviewed-plan.json --database rhythm-v2.sqlite3 \
+  --bucket '<bucket-appid>' --apply --confirm APPLY_LYRIC_SOURCES
+```
+
+执行器先校验所有本地字节/hash 和 Work ID，再上传并用 COS 对象大小与
+`x-cos-meta-sha256` 回验，最后以确定性 ID 在单个数据库事务内登记 Asset、页面、关联和
+change event；重复运行不会新增重复记录。
 
 ## Docker
 
@@ -155,7 +191,7 @@ python scripts/import_cos_samples.py
 
 ```bash
 pytest -q
-ruff check src tests
+ruff check src tests scripts/build_lyric_source_plan.py scripts/import_lyric_source_plan.py
 ```
 
 当前自动化覆盖 v1 回归，以及 v2 鉴权、幂等重放/冲突、精确解析、多语言歌词与旧数据迁移、文件校验与复用、不可变谱面修订、过期 ETag、Rendition 播放选择、Range、Bundle 304 和增量事件。

@@ -18,6 +18,9 @@ from rhythm_metadata_api.domain.v2.schemas import (
     ArrangementCreate,
     ArrangementPatch,
     ContributorCreate,
+    LyricSourceDocumentCreate,
+    LyricSourceLinkCreate,
+    LyricSourcePageCreate,
     PartInput,
     RenditionAssetInput,
     RenditionCreate,
@@ -290,6 +293,58 @@ def head_asset_content(asset_id: str, service: Catalog, _: Actor) -> Response:
     return get_asset_content(asset_id, service, _)
 
 
+@router.post("/lyric-source-documents")
+def create_lyric_source_document(
+    body: LyricSourceDocumentCreate,
+    service: Catalog,
+    actor: Actor,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> Response:
+    return stored_response(
+        service.create_lyric_source_document(body, require_idempotency(idempotency_key), actor)
+    )
+
+
+@router.get("/lyric-source-documents/{document_id}")
+def get_lyric_source_document(document_id: str, service: Catalog, _: Actor) -> Response:
+    return model_response(service.get_lyric_source_document(document_id))
+
+
+@router.post("/lyric-source-documents/{document_id}/pages")
+def add_lyric_source_page(
+    document_id: str,
+    body: LyricSourcePageCreate,
+    service: Catalog,
+    actor: Actor,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> Response:
+    return stored_response(
+        service.add_lyric_source_page(
+            document_id, body, require_idempotency(idempotency_key), actor
+        )
+    )
+
+
+@router.post("/works/{work_id}/lyric-source-pages")
+def attach_work_lyric_source_page(
+    work_id: str,
+    body: LyricSourceLinkCreate,
+    service: Catalog,
+    actor: Actor,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> Response:
+    return stored_response(
+        service.attach_work_lyric_source_page(
+            work_id,
+            body,
+            require_if_match(if_match),
+            require_idempotency(idempotency_key),
+            actor,
+        )
+    )
+
+
 @router.post("/arrangements/{arrangement_id}/scores")
 def create_score(
     arrangement_id: str,
@@ -319,6 +374,26 @@ def patch_score(
 ) -> Response:
     item = service.patch_score(score_id, body, require_if_match(if_match), actor)
     return model_response(item, headers={"ETag": etag(item.revision)})
+
+
+@router.post("/scores/{score_id}/lyric-source-pages")
+def attach_score_lyric_source_page(
+    score_id: str,
+    body: LyricSourceLinkCreate,
+    service: Catalog,
+    actor: Actor,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> Response:
+    return stored_response(
+        service.attach_score_lyric_source_page(
+            score_id,
+            body,
+            require_if_match(if_match),
+            require_idempotency(idempotency_key),
+            actor,
+        )
+    )
 
 
 @router.post("/scores/{score_id}/revisions")
@@ -377,6 +452,26 @@ def patch_rendition(
     return model_response(item, headers={"ETag": etag(item.revision)})
 
 
+@router.post("/renditions/{rendition_id}/lyric-source-pages")
+def attach_rendition_lyric_source_page(
+    rendition_id: str,
+    body: LyricSourceLinkCreate,
+    service: Catalog,
+    actor: Actor,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> Response:
+    return stored_response(
+        service.attach_rendition_lyric_source_page(
+            rendition_id,
+            body,
+            require_if_match(if_match),
+            require_idempotency(idempotency_key),
+            actor,
+        )
+    )
+
+
 @router.post("/renditions/{rendition_id}/assets")
 def add_rendition_asset(
     rendition_id: str,
@@ -405,6 +500,15 @@ def get_playback(
     prefer: str | None = None,
 ) -> Response:
     return model_response(service.playback(rendition_id, prefer))
+
+
+@router.get("/renditions/{rendition_id}/effective-lyric-sources")
+def get_effective_lyric_sources(
+    rendition_id: str,
+    service: Catalog,
+    _: Actor,
+) -> Response:
+    return model_response(service.effective_lyric_sources(rendition_id))
 
 
 @router.get("/library/songs")

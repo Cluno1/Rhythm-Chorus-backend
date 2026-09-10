@@ -270,6 +270,121 @@ class AssetSource(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
+class LyricSourceDocument(Base):
+    __tablename__ = "v2_lyric_source_documents"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    source_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    edition: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    publisher: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    published_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    document_asset_id: Mapped[str | None] = mapped_column(
+        ForeignKey("v2_assets.id", ondelete="SET NULL"), nullable=True
+    )
+    source_ref: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    rights_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "source_kind IN ('pdf', 'scan', 'photo', 'booklet', 'web')",
+            name="lyric_source_document_kind",
+        ),
+    )
+
+
+class LyricSourcePage(Base):
+    __tablename__ = "v2_lyric_source_pages"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    document_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_lyric_source_documents.id", ondelete="CASCADE"), nullable=False
+    )
+    physical_page_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    image_asset_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_assets.id", ondelete="RESTRICT"), nullable=False
+    )
+    width_px: Mapped[int] = mapped_column(Integer, nullable=False)
+    height_px: Mapped[int] = mapped_column(Integer, nullable=False)
+    render_dpi: Mapped[int] = mapped_column(Integer, nullable=False)
+    display_label: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "document_id", "physical_page_number", name="uq_v2_lyric_source_page_number"
+        ),
+        CheckConstraint("physical_page_number >= 1", name="lyric_source_page_number"),
+        CheckConstraint(
+            "width_px > 0 AND height_px > 0 AND render_dpi > 0",
+            name="lyric_source_page_dimensions",
+        ),
+        Index("v2_lyric_source_pages_document_idx", "document_id"),
+    )
+
+
+class LyricSourceLink(Base):
+    __tablename__ = "v2_lyric_source_links"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    work_id: Mapped[str | None] = mapped_column(
+        ForeignKey("v2_works.id", ondelete="CASCADE"), nullable=True
+    )
+    score_id: Mapped[str | None] = mapped_column(
+        ForeignKey("v2_scores.id", ondelete="CASCADE"), nullable=True
+    )
+    rendition_id: Mapped[str | None] = mapped_column(
+        ForeignKey("v2_renditions.id", ondelete="CASCADE"), nullable=True
+    )
+    source_page_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_lyric_source_pages.id", ondelete="CASCADE"), nullable=False
+    )
+    display_order: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    language_relations: Mapped[list[dict[str, str]]] = mapped_column(
+        JSON, nullable=False, default=list, server_default=text("'[]'")
+    )
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    __table_args__ = (
+        CheckConstraint(
+            "(CASE WHEN work_id IS NOT NULL THEN 1 ELSE 0 END + "
+            "CASE WHEN score_id IS NOT NULL THEN 1 ELSE 0 END + "
+            "CASE WHEN rendition_id IS NOT NULL THEN 1 ELSE 0 END) = 1",
+            name="lyric_source_link_one_owner",
+        ),
+        CheckConstraint("display_order >= 1", name="lyric_source_link_display_order"),
+        Index(
+            "uq_v2_lyric_source_link_work_page",
+            "work_id",
+            "source_page_id",
+            unique=True,
+            sqlite_where=text("work_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_v2_lyric_source_link_score_page",
+            "score_id",
+            "source_page_id",
+            unique=True,
+            sqlite_where=text("score_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_v2_lyric_source_link_rendition_page",
+            "rendition_id",
+            "source_page_id",
+            unique=True,
+            sqlite_where=text("rendition_id IS NOT NULL"),
+        ),
+        Index("v2_lyric_source_links_work_idx", "work_id", "display_order"),
+        Index("v2_lyric_source_links_score_idx", "score_id", "display_order"),
+        Index("v2_lyric_source_links_rendition_idx", "rendition_id", "display_order"),
+    )
+
+
 class ScoreRevisionAsset(Base):
     __tablename__ = "v2_score_revision_assets"
 
@@ -502,9 +617,7 @@ class AuthUser(Base):
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
     )
 
-    __table_args__ = (
-        CheckConstraint("status IN ('active', 'disabled')", name="auth_user_status"),
-    )
+    __table_args__ = (CheckConstraint("status IN ('active', 'disabled')", name="auth_user_status"),)
 
 
 class DeviceInvite(Base):

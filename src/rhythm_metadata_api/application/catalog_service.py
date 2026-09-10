@@ -35,11 +35,18 @@ from rhythm_metadata_api.domain.v2.schemas import (
     ChangesResponse,
     ContributorCreate,
     ContributorResponse,
+    EffectiveLyricSourcesResponse,
     LibraryAlbumDetailResponse,
     LibraryAlbumResponse,
     LibraryScoreOptionResponse,
     LibraryScoreWorkResponse,
     LibrarySongResponse,
+    LyricSourceDocumentCreate,
+    LyricSourceDocumentResponse,
+    LyricSourceImageResponse,
+    LyricSourceLinkCreate,
+    LyricSourcePageCreate,
+    LyricSourcePageResponse,
     LyricsTranslation,
     PartInput,
     PartResponse,
@@ -78,6 +85,9 @@ from rhythm_metadata_api.infrastructure.db.models import (
     ChangeEventWork,
     Contributor,
     IdempotencyKey,
+    LyricSourceDocument,
+    LyricSourceLink,
+    LyricSourcePage,
     Part,
     Release,
     ReleaseItem,
@@ -117,8 +127,12 @@ class StoredResponse:
 _LYRICS_FIELDS = frozenset({"lyrics", "lyrics_language", "lyrics_translations"})
 
 
-def _translation_dicts(items: list[LyricsTranslation] | list[dict[str, str]]) -> list[dict[str, str]]:
-    return [item.model_dump() if isinstance(item, LyricsTranslation) else dict(item) for item in items]
+def _translation_dicts(
+    items: list[LyricsTranslation] | list[dict[str, str]],
+) -> list[dict[str, str]]:
+    return [
+        item.model_dump() if isinstance(item, LyricsTranslation) else dict(item) for item in items
+    ]
 
 
 def _normalize_lyrics_or_error(
@@ -682,6 +696,157 @@ class CatalogService:
             uow.session.expunge(asset)
             return path, asset
 
+    def create_lyric_source_document(
+        self,
+        request: LyricSourceDocumentCreate,
+        idempotency_key: str,
+        actor: ActorContext,
+    ) -> StoredResponse:
+        def operation(
+            session: Session,
+        ) -> tuple[LyricSourceDocumentResponse, int, dict[str, str]]:
+            if request.document_asset_id is not None:
+                asset = self._require_asset(session, request.document_asset_id)
+                if asset.state != "ready":
+                    raise V2Conflict("lyric source document asset is not ready")
+                if request.source_kind == "pdf" and asset.detected_media_type != "application/pdf":
+                    raise V2DomainError(
+                        "PDF lyric source documents require an application/pdf asset"
+                    )
+            document = LyricSourceDocument(
+                title=request.title.strip(),
+                source_kind=request.source_kind,
+                edition=request.edition.strip() if request.edition else None,
+                publisher=request.publisher.strip() if request.publisher else None,
+                published_year=request.published_year,
+                document_asset_id=request.document_asset_id,
+                source_ref=request.source_ref.strip() if request.source_ref else None,
+                rights_note=request.rights_note.strip() if request.rights_note else None,
+            )
+            session.add(document)
+            session.flush()
+            return (
+                self._lyric_source_document_response(session, document),
+                201,
+                {"Location": f"/v2/lyric-source-documents/{document.id}"},
+            )
+
+        return self._idempotent(
+            "POST:/v2/lyric-source-documents",
+            idempotency_key,
+            request,
+            actor,
+            operation,
+        )
+
+    def get_lyric_source_document(self, document_id: str) -> LyricSourceDocumentResponse:
+        with self.uow_factory() as uow:
+            document = self._require_lyric_source_document(uow.session, document_id)
+            return self._lyric_source_document_response(uow.session, document)
+
+    def add_lyric_source_page(
+        self,
+        document_id: str,
+        request: LyricSourcePageCreate,
+        idempotency_key: str,
+        actor: ActorContext,
+    ) -> StoredResponse:
+        def operation(session: Session) -> tuple[LyricSourcePageResponse, int, dict[str, str]]:
+            document = self._require_lyric_source_document(session, document_id)
+            asset = self._require_asset(session, request.image_asset_id)
+            if asset.state != "ready":
+                raise V2Conflict("lyric source page image asset is not ready")
+            if not asset.detected_media_type.startswith("image/"):
+                raise V2DomainError("lyric source pages require an image asset")
+            existing = session.scalar(
+                select(LyricSourcePage).where(
+                    LyricSourcePage.document_id == document.id,
+                    LyricSourcePage.physical_page_number == request.physical_page_number,
+                )
+            )
+            if existing is not None:
+                raise V2Conflict("the document already has this physical page")
+            page = LyricSourcePage(
+                document_id=document.id,
+                physical_page_number=request.physical_page_number,
+                image_asset_id=asset.id,
+                width_px=request.width_px,
+                height_px=request.height_px,
+                render_dpi=request.render_dpi,
+                display_label=request.display_label.strip() if request.display_label else None,
+            )
+            session.add(page)
+            session.flush()
+            return (
+                self._lyric_source_page_response(page),
+                201,
+                {"Location": f"/v2/lyric-source-documents/{document.id}/pages/{page.id}"},
+            )
+
+        return self._idempotent(
+            f"POST:/v2/lyric-source-documents/{document_id}/pages",
+            idempotency_key,
+            request,
+            actor,
+            operation,
+        )
+
+    def attach_work_lyric_source_page(
+        self,
+        work_id: str,
+        request: LyricSourceLinkCreate,
+        expected_revision: int,
+        idempotency_key: str,
+        actor: ActorContext,
+    ) -> StoredResponse:
+        return self._attach_lyric_source_page(
+            "work", work_id, request, expected_revision, idempotency_key, actor
+        )
+
+    def attach_score_lyric_source_page(
+        self,
+        score_id: str,
+        request: LyricSourceLinkCreate,
+        expected_revision: int,
+        idempotency_key: str,
+        actor: ActorContext,
+    ) -> StoredResponse:
+        return self._attach_lyric_source_page(
+            "score", score_id, request, expected_revision, idempotency_key, actor
+        )
+
+    def attach_rendition_lyric_source_page(
+        self,
+        rendition_id: str,
+        request: LyricSourceLinkCreate,
+        expected_revision: int,
+        idempotency_key: str,
+        actor: ActorContext,
+    ) -> StoredResponse:
+        return self._attach_lyric_source_page(
+            "rendition", rendition_id, request, expected_revision, idempotency_key, actor
+        )
+
+    def effective_lyric_sources(self, rendition_id: str) -> EffectiveLyricSourcesResponse:
+        with self.uow_factory() as uow:
+            rendition = self._require_rendition(uow.session, rendition_id)
+            arrangement = self._require_arrangement(uow.session, rendition.arrangement_id)
+            self._require_work(uow.session, arrangement.work_id)
+            owners: list[tuple[str, str]] = [("rendition", rendition.id)]
+            if arrangement.preferred_score_id is not None:
+                score = uow.session.get(Score, arrangement.preferred_score_id)
+                if score is not None and score.deleted_at is None:
+                    owners.append(("score", score.id))
+            owners.append(("work", arrangement.work_id))
+            items: list[LyricSourceImageResponse] = []
+            seen_pages: set[str] = set()
+            for owner_type, owner_id in owners:
+                for item in self._lyric_source_images_for_owner(uow.session, owner_type, owner_id):
+                    if item.source_page_id not in seen_pages:
+                        seen_pages.add(item.source_page_id)
+                        items.append(item)
+            return EffectiveLyricSourcesResponse(rendition_id=rendition.id, items=items)
+
     def create_score(
         self,
         arrangement_id: str,
@@ -728,7 +893,7 @@ class CatalogService:
                 actor,
             )
             return (
-                self._score_response(score),
+                self._score_response(session, score),
                 201,
                 {
                     "Location": f"/v2/scores/{score.id}",
@@ -746,7 +911,7 @@ class CatalogService:
 
     def get_score(self, score_id: str) -> ScoreResponse:
         with self.uow_factory() as uow:
-            return self._score_response(self._require_score(uow.session, score_id))
+            return self._score_response(uow.session, self._require_score(uow.session, score_id))
 
     def patch_score(
         self, score_id: str, request: ScorePatch, expected_revision: int, actor: ActorContext
@@ -761,7 +926,7 @@ class CatalogService:
                 if revision.score_id != score.id:
                     raise V2DomainError("published revision must belong to this score")
             if not changes:
-                return self._score_response(score)
+                return self._score_response(uow.session, score)
             work_language = uow.session.scalar(
                 select(Work.language)
                 .join(Arrangement, Arrangement.work_id == Work.id)
@@ -783,7 +948,7 @@ class CatalogService:
                 actor,
                 {"fields": sorted(changes)},
             )
-            return self._score_response(score)
+            return self._score_response(uow.session, score)
 
     def create_score_revision(
         self,
@@ -1296,7 +1461,7 @@ class CatalogService:
                 bundles.append(
                     ArrangementBundle(
                         **arrangement_data.model_dump(),
-                        scores=[self._score_response(item) for item in scores],
+                        scores=[self._score_response(uow.session, item) for item in scores],
                         renditions=[
                             self._rendition_response(uow.session, item) for item in renditions
                         ],
@@ -1485,6 +1650,20 @@ class CatalogService:
         return item
 
     @staticmethod
+    def _require_lyric_source_document(session: Session, document_id: str) -> LyricSourceDocument:
+        item = session.get(LyricSourceDocument, document_id)
+        if item is None:
+            raise V2NotFound("lyric source document not found")
+        return item
+
+    @staticmethod
+    def _require_lyric_source_page(session: Session, page_id: str) -> LyricSourcePage:
+        item = session.get(LyricSourcePage, page_id)
+        if item is None:
+            raise V2NotFound("lyric source page not found")
+        return item
+
+    @staticmethod
     def _require_upload(session: Session, upload_id: str) -> UploadSession:
         item = session.get(UploadSession, upload_id)
         if item is None:
@@ -1506,6 +1685,168 @@ class CatalogService:
         if work_id is None:
             raise V2NotFound("arrangement not found")
         return work_id
+
+    def _attach_lyric_source_page(
+        self,
+        owner_type: str,
+        owner_id: str,
+        request: LyricSourceLinkCreate,
+        expected_revision: int,
+        idempotency_key: str,
+        actor: ActorContext,
+    ) -> StoredResponse:
+        request_payload = {
+            "body": request.model_dump(mode="json"),
+            "expected_revision": expected_revision,
+        }
+
+        def operation(session: Session) -> tuple[LyricSourceImageResponse, int, dict[str, str]]:
+            if owner_type == "work":
+                owner: Work | Score | Rendition = self._require_work(session, owner_id)
+                owner_column = LyricSourceLink.work_id
+                work_id = owner.id
+            elif owner_type == "score":
+                owner = self._require_score(session, owner_id)
+                owner_column = LyricSourceLink.score_id
+                work_id = self._work_id_for_arrangement(session, owner.arrangement_id)
+            else:
+                owner = self._require_rendition(session, owner_id)
+                owner_column = LyricSourceLink.rendition_id
+                work_id = self._work_id_for_arrangement(session, owner.arrangement_id)
+            require_revision(owner.revision, expected_revision)
+            self._require_lyric_source_page(session, request.source_page_id)
+            if (
+                session.scalar(
+                    select(LyricSourceLink.id).where(
+                        owner_column == owner_id,
+                        LyricSourceLink.source_page_id == request.source_page_id,
+                    )
+                )
+                is not None
+            ):
+                raise V2Conflict("this lyric source page is already linked to the owner")
+            link = LyricSourceLink(
+                source_page_id=request.source_page_id,
+                display_order=request.display_order,
+                language_relations=[
+                    relation.model_dump(mode="json") for relation in request.language_relations
+                ],
+                note=request.note.strip() if request.note else None,
+                **{f"{owner_type}_id": owner_id},
+            )
+            session.add(link)
+            owner.revision += 1
+            owner.updated_at = utc_now()
+            self._append_event(
+                session,
+                work_id,
+                owner_type,
+                owner.id,
+                owner.revision,
+                f"{owner_type}.lyric_source_page_added",
+                actor,
+                {"source_page_id": request.source_page_id},
+            )
+            session.flush()
+            item = next(
+                item
+                for item in self._lyric_source_images_for_owner(session, owner_type, owner_id)
+                if item.link_id == link.id
+            )
+            return item, 201, {"ETag": etag(owner.revision)}
+
+        return self._idempotent(
+            f"POST:/v2/{owner_type}s/{owner_id}/lyric-source-pages",
+            idempotency_key,
+            request_payload,
+            actor,
+            operation,
+        )
+
+    @staticmethod
+    def _lyric_source_page_response(page: LyricSourcePage) -> LyricSourcePageResponse:
+        return LyricSourcePageResponse(
+            id=page.id,
+            document_id=page.document_id,
+            physical_page_number=page.physical_page_number,
+            image_asset_id=page.image_asset_id,
+            width_px=page.width_px,
+            height_px=page.height_px,
+            render_dpi=page.render_dpi,
+            display_label=page.display_label,
+            created_at=page.created_at,
+        )
+
+    def _lyric_source_document_response(
+        self, session: Session, document: LyricSourceDocument
+    ) -> LyricSourceDocumentResponse:
+        pages = list(
+            session.scalars(
+                select(LyricSourcePage)
+                .where(LyricSourcePage.document_id == document.id)
+                .order_by(LyricSourcePage.physical_page_number, LyricSourcePage.id)
+            )
+        )
+        return LyricSourceDocumentResponse(
+            id=document.id,
+            title=document.title,
+            source_kind=document.source_kind,
+            edition=document.edition,
+            publisher=document.publisher,
+            published_year=document.published_year,
+            document_asset_id=document.document_asset_id,
+            source_ref=document.source_ref,
+            rights_note=document.rights_note,
+            pages=[self._lyric_source_page_response(page) for page in pages],
+            created_at=document.created_at,
+            updated_at=document.updated_at,
+        )
+
+    @staticmethod
+    def _lyric_source_images_for_owner(
+        session: Session, owner_type: str, owner_id: str
+    ) -> list[LyricSourceImageResponse]:
+        owner_column = {
+            "work": LyricSourceLink.work_id,
+            "score": LyricSourceLink.score_id,
+            "rendition": LyricSourceLink.rendition_id,
+        }[owner_type]
+        rows = session.execute(
+            select(LyricSourceLink, LyricSourcePage, LyricSourceDocument)
+            .join(LyricSourcePage, LyricSourcePage.id == LyricSourceLink.source_page_id)
+            .join(
+                LyricSourceDocument,
+                LyricSourceDocument.id == LyricSourcePage.document_id,
+            )
+            .where(owner_column == owner_id)
+            .order_by(
+                LyricSourceLink.display_order,
+                LyricSourcePage.physical_page_number,
+                LyricSourceLink.id,
+            )
+        ).all()
+        return [
+            LyricSourceImageResponse(
+                link_id=link.id,
+                source_page_id=page.id,
+                image_asset_id=page.image_asset_id,
+                document_id=document.id,
+                document_title=document.title,
+                source_kind=document.source_kind,
+                source_ref=document.source_ref,
+                physical_page_number=page.physical_page_number,
+                display_label=page.display_label,
+                display_order=link.display_order,
+                width_px=page.width_px,
+                height_px=page.height_px,
+                render_dpi=page.render_dpi,
+                owner_type=owner_type,
+                owner_id=owner_id,
+                language_relations=link.language_relations,
+                note=link.note,
+            )
+            for link, page, document in rows
+        ]
 
     @staticmethod
     def _new_part(arrangement_id: str, request: PartInput, code: str) -> Part:
@@ -1547,6 +1888,7 @@ class CatalogService:
             lyrics=work.lyrics,
             lyrics_language=work.lyrics_language,
             lyrics_translations=work.lyrics_translations,
+            lyrics_source_images=self._lyric_source_images_for_owner(session, "work", work.id),
             revision=work.revision,
             aliases=[
                 WorkAliasInput(namespace=item.namespace, external_id=item.external_id)
@@ -1598,8 +1940,7 @@ class CatalogService:
             state=asset.state,
         )
 
-    @staticmethod
-    def _score_response(score: Score) -> ScoreResponse:
+    def _score_response(self, session: Session, score: Score) -> ScoreResponse:
         return ScoreResponse(
             id=score.id,
             arrangement_id=score.arrangement_id,
@@ -1611,6 +1952,7 @@ class CatalogService:
             lyrics=score.lyrics,
             lyrics_language=score.lyrics_language,
             lyrics_translations=score.lyrics_translations,
+            lyrics_source_images=self._lyric_source_images_for_owner(session, "score", score.id),
             revision=score.revision,
         )
 
@@ -1661,6 +2003,9 @@ class CatalogService:
             lyrics=rendition.lyrics,
             lyrics_language=rendition.lyrics_language,
             lyrics_translations=rendition.lyrics_translations,
+            lyrics_source_images=self._lyric_source_images_for_owner(
+                session, "rendition", rendition.id
+            ),
             revision=rendition.revision,
             assets=[
                 RenditionAssetResponse(
@@ -1677,9 +2022,7 @@ class CatalogService:
             ],
         )
 
-    def _asset_delivery_response(
-        self, session: Session, asset: Asset
-    ) -> AssetDeliveryResponse:
+    def _asset_delivery_response(self, session: Session, asset: Asset) -> AssetDeliveryResponse:
         if asset.state != "ready":
             raise V2Conflict("asset is not ready")
         locations = list(
@@ -1834,6 +2177,17 @@ class CatalogService:
                 (work.lyrics, work.lyrics_language, work.lyrics_translations),
             ]
         )
+        source_images: list[LyricSourceImageResponse] = []
+        seen_source_pages: set[str] = set()
+        source_owners = [("rendition", rendition.id)]
+        if score is not None:
+            source_owners.append(("score", score.id))
+        source_owners.append(("work", work.id))
+        for owner_type, owner_id in source_owners:
+            for source_image in self._lyric_source_images_for_owner(session, owner_type, owner_id):
+                if source_image.source_page_id not in seen_source_pages:
+                    seen_source_pages.add(source_image.source_page_id)
+                    source_images.append(source_image)
         return LibrarySongResponse(
             work_id=work.id,
             arrangement_id=arrangement.id,
@@ -1849,11 +2203,11 @@ class CatalogService:
             lyrics=lyrics,
             lyrics_language=lyrics_language or "und",
             lyrics_translations=lyrics_translations,
+            lyrics_source_images=source_images,
+            lyric_source_count=len(source_images),
         )
 
-    def _library_album_response(
-        self, session: Session, release: Release
-    ) -> LibraryAlbumResponse:
+    def _library_album_response(self, session: Session, release: Release) -> LibraryAlbumResponse:
         deliverable_providers = ["local"]
         if self.settings.cos_secret_id and self.settings.cos_secret_key:
             deliverable_providers.append("cos")
@@ -2013,6 +2367,8 @@ class CatalogService:
         suffix = Path(filename or "").suffix.lower()
         if normalized.startswith("image/"):
             return self.settings.max_artwork_bytes
+        if normalized == "application/pdf" or suffix == ".pdf":
+            return self.settings.max_source_document_bytes
         if normalized.startswith("text/") or suffix in {".lrc", ".txt", ".srt"}:
             return self.settings.max_lyrics_bytes
         if "musicxml" in normalized or suffix in {".musicxml", ".mxl", ".xml"}:
@@ -2109,6 +2465,5 @@ PLAYABLE_AUDIO_MEDIA_TYPES = frozenset(
 
 def is_playable_audio_media_type(media_type: str | None) -> bool:
     return bool(
-        media_type
-        and media_type.split(";", 1)[0].strip().lower() in PLAYABLE_AUDIO_MEDIA_TYPES
+        media_type and media_type.split(";", 1)[0].strip().lower() in PLAYABLE_AUDIO_MEDIA_TYPES
     )

@@ -44,9 +44,7 @@ class LocalizedLyricsCreate(ApiModel):
 class LocalizedLyricsPatch(ApiModel):
     lyrics: str | None = Field(default=None, max_length=2 * 1024 * 1024)
     lyrics_language: str | None = Field(default=None, min_length=2, max_length=35)
-    lyrics_translations: list[LyricsTranslation] | None = Field(
-        default=None, max_length=100
-    )
+    lyrics_translations: list[LyricsTranslation] | None = Field(default=None, max_length=100)
 
     @field_validator("lyrics_language")
     @classmethod
@@ -54,10 +52,95 @@ class LocalizedLyricsPatch(ApiModel):
         return normalize_language_tag(value) if value is not None else None
 
 
+class LyricSourceLanguageRelation(ApiModel):
+    language: str = Field(min_length=2, max_length=35)
+    relation: Literal["printed", "transcribed", "translated", "transliterated", "converted"]
+    derived_from_language: str | None = Field(default=None, min_length=2, max_length=35)
+
+    @field_validator("language", "derived_from_language")
+    @classmethod
+    def validate_language(cls, value: str | None) -> str | None:
+        return normalize_language_tag(value) if value is not None else None
+
+
+class LyricSourceDocumentCreate(ApiModel):
+    title: str = Field(min_length=1, max_length=500)
+    source_kind: Literal["pdf", "scan", "photo", "booklet", "web"] = "pdf"
+    edition: str | None = Field(default=None, max_length=500)
+    publisher: str | None = Field(default=None, max_length=500)
+    published_year: int | None = Field(default=None, ge=1, le=9999)
+    document_asset_id: str | None = None
+    source_ref: str | None = Field(default=None, max_length=1000)
+    rights_note: str | None = Field(default=None, max_length=10_000)
+
+
+class LyricSourcePageCreate(ApiModel):
+    physical_page_number: int = Field(ge=1)
+    image_asset_id: str
+    width_px: int = Field(gt=0)
+    height_px: int = Field(gt=0)
+    render_dpi: int = Field(gt=0, le=1200)
+    display_label: str | None = Field(default=None, max_length=200)
+
+
+class LyricSourceLinkCreate(ApiModel):
+    source_page_id: str
+    display_order: int = Field(ge=1)
+    language_relations: list[LyricSourceLanguageRelation] = Field(
+        default_factory=list, max_length=100
+    )
+    note: str | None = Field(default=None, max_length=10_000)
+
+
+class LyricSourcePageResponse(ApiModel):
+    id: str
+    document_id: str
+    physical_page_number: int
+    image_asset_id: str
+    width_px: int
+    height_px: int
+    render_dpi: int
+    display_label: str | None
+    created_at: datetime
+
+
+class LyricSourceDocumentResponse(LyricSourceDocumentCreate):
+    id: str
+    pages: list[LyricSourcePageResponse] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+
+
+class LyricSourceImageResponse(ApiModel):
+    link_id: str
+    source_page_id: str
+    image_asset_id: str
+    document_id: str
+    document_title: str
+    source_kind: str
+    source_ref: str | None
+    physical_page_number: int
+    display_label: str | None
+    display_order: int
+    width_px: int
+    height_px: int
+    render_dpi: int
+    owner_type: Literal["work", "score", "rendition"]
+    owner_id: str
+    language_relations: list[LyricSourceLanguageRelation]
+    note: str | None
+
+
+class EffectiveLyricSourcesResponse(ApiModel):
+    rendition_id: str
+    items: list[LyricSourceImageResponse]
+
+
 class LocalizedLyricsResponse(ApiModel):
     lyrics: str | None
     lyrics_language: str
     lyrics_translations: list[LyricsTranslation]
+    lyrics_source_images: list[LyricSourceImageResponse] = Field(default_factory=list)
 
 
 class WorkAliasInput(ApiModel):
@@ -384,6 +467,7 @@ class LibrarySongResponse(LocalizedLyricsResponse):
     track_no: int | None = None
     cover_asset_id: str | None = None
     cover_url: str | None = None
+    lyric_source_count: int = 0
 
 
 class LibraryAlbumResponse(ApiModel):

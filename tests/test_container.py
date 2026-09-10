@@ -152,9 +152,21 @@ def test_multilingual_lyrics_migration_backfills_existing_rows(tmp_path: Path) -
         """
     ).fetchone()
     version = connection.execute("SELECT version_num FROM alembic_version").fetchone()[0]
+    lyric_source_tables = {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name LIKE 'v2_lyric_source_%'"
+        ).fetchall()
+    }
     connection.close()
 
-    assert version == "issue32multilyrics"
+    assert version == "issue52lyricsources"
+    assert lyric_source_tables == {
+        "v2_lyric_source_documents",
+        "v2_lyric_source_pages",
+        "v2_lyric_source_links",
+    }
     assert [(row[0], row[1], json.loads(row[2])) for row in work_rows] == [
         ("work-und", "und", []),
         ("work-zh", "zh-Hans", []),

@@ -18,11 +18,17 @@ from rhythm_metadata_api.application.device_auth import (
     request_canonical,
 )
 from rhythm_metadata_api.core.config import Settings
-from rhythm_metadata_api.public_main import create_public_app
+from rhythm_metadata_api.public_main import _public_read_allowed, create_public_app
 
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 DEBUG_CERTIFICATE_SHA256 = "ab" * 32
 STABLE_CERTIFICATE_SHA256 = "cd" * 32
+
+
+def test_effective_lyric_sources_is_public_read_only() -> None:
+    path = "/v2/renditions/33333333-3333-4333-8333-333333333333/effective-lyric-sources"
+    assert _public_read_allowed("GET", path)
+    assert not _public_read_allowed("POST", path)
 
 
 def b64url(value: bytes) -> str:

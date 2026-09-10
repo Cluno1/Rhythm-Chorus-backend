@@ -75,6 +75,9 @@ class LocalAssetStorage:
             return "audio/midi"
         if media_type.startswith("image/"):
             return self._validate_image(path)
+        if media_type == "application/pdf" or extension == ".pdf":
+            self._validate_pdf(path)
+            return "application/pdf"
         if media_type.startswith("audio/") or extension in AUDIO_EXTENSIONS:
             return self._validate_audio(path, media_type, extension)
         if media_type.startswith("text/") or extension in {".lrc", ".txt", ".srt"}:
@@ -192,6 +195,15 @@ class LocalAssetStorage:
         if width <= 0 or height <= 0 or width * height > 100_000_000:
             raise UploadValidationError("image dimensions exceed the safety limit")
         return media_type
+
+    @staticmethod
+    def _validate_pdf(path: Path) -> None:
+        with path.open("rb") as source:
+            header = source.read(8)
+            source.seek(max(0, path.stat().st_size - 1024))
+            trailer = source.read()
+        if not header.startswith(b"%PDF-") or b"%%EOF" not in trailer:
+            raise UploadValidationError("PDF signature or trailer is invalid")
 
     @staticmethod
     def _validate_audio(path: Path, media_type: str, extension: str) -> str:

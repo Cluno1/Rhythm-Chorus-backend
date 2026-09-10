@@ -135,10 +135,10 @@ def test_asset_delivery_and_native_library_projection(client: TestClient) -> Non
                     role="primary_musicxml",
                 ),
                 WorkCredit(
-                work_id=work.id,
-                contributor_id=contributor.id,
-                role="composer",
-                position=1,
+                    work_id=work.id,
+                    contributor_id=contributor.id,
+                    role="composer",
+                    position=1,
                 ),
             ]
         )
@@ -317,15 +317,17 @@ def test_asset_delivery_and_native_library_projection(client: TestClient) -> Non
             "duration_ms": 123000,
             "track_no": 109,
             "cover_asset_id": None,
-                "cover_url": None,
-                "lyrics": "rendition lyrics",
-                "lyrics_language": "en",
-                "lyrics_translations": [
-                    {"language": "zh-Hans", "lyrics": "演唱简体歌词"},
-                    {"language": "zh-Hant", "lyrics": "樂譜繁體歌詞"},
-                ],
-            }
-        ]
+            "cover_url": None,
+            "lyrics": "rendition lyrics",
+            "lyrics_language": "en",
+            "lyrics_translations": [
+                {"language": "zh-Hans", "lyrics": "演唱简体歌词"},
+                {"language": "zh-Hant", "lyrics": "樂譜繁體歌詞"},
+            ],
+            "lyrics_source_images": [],
+            "lyric_source_count": 0,
+        }
+    ]
     second_page = client.get(
         "/v2/library/songs",
         headers=AUTH,
@@ -683,9 +685,7 @@ def test_multilingual_lyrics_crud_and_validation(client: TestClient) -> None:
     assert work.status_code == 201, work.text
     assert work.json()["lyrics"] == "默认歌词"
     assert work.json()["lyrics_language"] == "zh-Hans"
-    assert work.json()["lyrics_translations"] == [
-        {"language": "en-US", "lyrics": "English lyrics"}
-    ]
+    assert work.json()["lyrics_translations"] == [{"language": "en-US", "lyrics": "English lyrics"}]
     work_id = work.json()["id"]
 
     arrangement = post(
@@ -802,3 +802,181 @@ def test_rejects_invalid_musicxml_at_completion(client: TestClient) -> None:
     completed = post(client, f"/v2/uploads/{upload_id}/complete", "bad-xml-complete", {})
     assert completed.status_code == 422
     assert completed.json()["type"].endswith("/invalid-upload")
+
+
+def test_shared_lyric_source_pages_and_effective_precedence(client: TestClient) -> None:
+    pdf_asset = upload_asset(
+        client,
+        key="lyric-source-pdf",
+        content=b"%PDF-1.4\n1 0 obj<<>>endobj\n%%EOF\n",
+        media_type="application/pdf",
+        filename="songbook.pdf",
+    )
+    png_header = (
+        b"\x89PNG\r\n\x1a\n"
+        + b"\x00" * 8
+        + (1200).to_bytes(4, "big")
+        + (1800).to_bytes(4, "big")
+        + b"\x00" * 8
+    )
+    first_image = upload_asset(
+        client,
+        key="lyric-source-page-1",
+        content=png_header + b"page-one",
+        media_type="image/png",
+        filename="page-001.png",
+    )
+    second_image = upload_asset(
+        client,
+        key="lyric-source-page-2",
+        content=png_header + b"page-two",
+        media_type="image/png",
+        filename="page-002.png",
+    )
+    document = post(
+        client,
+        "/v2/lyric-source-documents",
+        "create-lyric-source-document",
+        {
+            "title": "IHOP Songbook 2024",
+            "source_kind": "pdf",
+            "document_asset_id": pdf_asset["id"],
+            "source_ref": "2024-IHOP-Songbook.pdf",
+        },
+    )
+    assert document.status_code == 201, document.text
+    document_id = document.json()["id"]
+
+    pages = []
+    for number, asset in ((1, first_image), (2, second_image)):
+        page = post(
+            client,
+            f"/v2/lyric-source-documents/{document_id}/pages",
+            f"create-lyric-source-page-{number}",
+            {
+                "physical_page_number": number,
+                "image_asset_id": asset["id"],
+                "width_px": 1200,
+                "height_px": 1800,
+                "render_dpi": 144,
+                "display_label": f"PDF page {number}",
+            },
+        )
+        assert page.status_code == 201, page.text
+        pages.append(page.json())
+
+    work_ids = []
+    for index in (1, 2):
+        work = post(
+            client,
+            "/v2/works",
+            f"create-source-work-{index}",
+            {"canonical_title": f"Shared page song {index}"},
+        )
+        assert work.status_code == 201, work.text
+        work_ids.append(work.json()["id"])
+
+    shared_link_body = {
+        "source_page_id": pages[0]["id"],
+        "display_order": 2,
+        "language_relations": [
+            {"language": "zh-Hans", "relation": "printed"},
+            {
+                "language": "zh-Hant",
+                "relation": "converted",
+                "derived_from_language": "zh-Hans",
+            },
+        ],
+    }
+    for index, work_id in enumerate(work_ids, 1):
+        headers = {
+            **AUTH,
+            "If-Match": '"rev-1"',
+            "Idempotency-Key": f"link-shared-{index}",
+        }
+        linked = client.post(
+            f"/v2/works/{work_id}/lyric-source-pages",
+            headers=headers,
+            json=shared_link_body,
+        )
+        assert linked.status_code == 201, linked.text
+        assert linked.json()["image_asset_id"] == first_image["id"]
+        replay = client.post(
+            f"/v2/works/{work_id}/lyric-source-pages",
+            headers=headers,
+            json=shared_link_body,
+        )
+        assert replay.status_code == 201, replay.text
+        assert replay.headers["Idempotency-Replayed"] == "true"
+
+    second_work_page = client.post(
+        f"/v2/works/{work_ids[0]}/lyric-source-pages",
+        headers={**AUTH, "If-Match": '"rev-2"', "Idempotency-Key": "link-work-page-2"},
+        json={"source_page_id": pages[1]["id"], "display_order": 1},
+    )
+    assert second_work_page.status_code == 201, second_work_page.text
+    work_response = client.get(f"/v2/works/{work_ids[0]}", headers=AUTH).json()
+    assert [item["physical_page_number"] for item in work_response["lyrics_source_images"]] == [
+        2,
+        1,
+    ]
+
+    arrangement = post(
+        client,
+        f"/v2/works/{work_ids[0]}/arrangements",
+        "create-source-arrangement",
+        {"name": "Default"},
+    ).json()
+    score = post(
+        client,
+        f"/v2/arrangements/{arrangement['id']}/scores",
+        "create-source-score",
+        {"label": "Source score", "origin": "external_import"},
+    ).json()
+    rendition = post(
+        client,
+        f"/v2/arrangements/{arrangement['id']}/renditions",
+        "create-source-rendition",
+        {"label": "Source rendition", "kind": "performance"},
+    ).json()
+    patched_arrangement = client.patch(
+        f"/v2/arrangements/{arrangement['id']}",
+        headers={**AUTH, "If-Match": '"rev-1"'},
+        json={"preferred_score_id": score["id"]},
+    )
+    assert patched_arrangement.status_code == 200, patched_arrangement.text
+    score_link = client.post(
+        f"/v2/scores/{score['id']}/lyric-source-pages",
+        headers={**AUTH, "If-Match": '"rev-1"', "Idempotency-Key": "link-score-page-2"},
+        json={"source_page_id": pages[1]["id"], "display_order": 1},
+    )
+    assert score_link.status_code == 201, score_link.text
+    rendition_link = client.post(
+        f"/v2/renditions/{rendition['id']}/lyric-source-pages",
+        headers={
+            **AUTH,
+            "If-Match": '"rev-1"',
+            "Idempotency-Key": "link-rendition-page-1",
+        },
+        json={"source_page_id": pages[0]["id"], "display_order": 1},
+    )
+    assert rendition_link.status_code == 201, rendition_link.text
+
+    effective = client.get(
+        f"/v2/renditions/{rendition['id']}/effective-lyric-sources", headers=AUTH
+    )
+    assert effective.status_code == 200, effective.text
+    assert [item["owner_type"] for item in effective.json()["items"]] == [
+        "rendition",
+        "score",
+    ]
+    assert [item["source_page_id"] for item in effective.json()["items"]] == [
+        pages[0]["id"],
+        pages[1]["id"],
+    ]
+    assert (
+        client.get(f"/v2/works/{work_ids[1]}", headers=AUTH).json()["lyrics_source_images"][0][
+            "source_page_id"
+        ]
+        == pages[0]["id"]
+    )
