@@ -434,6 +434,9 @@ class Rendition(RevisionedMixin, Base):
     lyrics_translations: Mapped[list[dict[str, str]]] = mapped_column(
         JSON, nullable=False, default=list, server_default=text("'[]'")
     )
+    lyrics_formats: Mapped[dict[str, str]] = mapped_column(
+        JSON, nullable=False, default=dict, server_default=text("'{}'")
+    )
 
     __table_args__ = (Index("v2_renditions_arrangement_idx", "arrangement_id"),)
 

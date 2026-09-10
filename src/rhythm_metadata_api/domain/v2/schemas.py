@@ -136,6 +136,43 @@ class EffectiveLyricSourcesResponse(ApiModel):
     items: list[LyricSourceImageResponse]
 
 
+LyricTextFormat = Literal["plain", "lrc", "enhanced_lrc", "ttml", "word_by_word_json"]
+
+
+class LyricLanguageFormat(ApiModel):
+    language: str = Field(min_length=2, max_length=35)
+    format: LyricTextFormat
+
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: str) -> str:
+        return normalize_language_tag(value)
+
+
+class RenditionLyricReplace(ApiModel):
+    lyrics: str = Field(min_length=1, max_length=2 * 1024 * 1024)
+    format: LyricTextFormat
+
+    @field_validator("lyrics")
+    @classmethod
+    def validate_lyrics(cls, value: str) -> str:
+        normalized = value.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n")
+        if not normalized.strip():
+            raise ValueError("lyrics must not be blank")
+        return normalized
+
+
+class RenditionLyricWriteResponse(ApiModel):
+    rendition_id: str
+    revision: int
+    language: str
+    lyrics: str
+    format: LyricTextFormat
+    lyrics_language: str
+    lyrics_translations: list[LyricsTranslation]
+    lyrics_formats: list[LyricLanguageFormat]
+
+
 class LocalizedLyricsResponse(ApiModel):
     lyrics: str | None
     lyrics_language: str
@@ -459,6 +496,7 @@ class LibrarySongResponse(LocalizedLyricsResponse):
     work_id: str
     arrangement_id: str
     rendition_id: str
+    rendition_revision: int
     album_id: str
     title: str
     artist: str | None = None
@@ -468,6 +506,7 @@ class LibrarySongResponse(LocalizedLyricsResponse):
     cover_asset_id: str | None = None
     cover_url: str | None = None
     lyric_source_count: int = 0
+    lyrics_formats: list[LyricLanguageFormat] = Field(default_factory=list)
 
 
 class LibraryAlbumResponse(ApiModel):

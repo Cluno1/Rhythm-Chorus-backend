@@ -308,8 +308,9 @@ def test_asset_delivery_and_native_library_projection(client: TestClient) -> Non
     assert first_page.json()["items"] == [
         {
             "work_id": work_id,
-            "arrangement_id": arrangement_id,
-            "rendition_id": rendition_id,
+                "arrangement_id": arrangement_id,
+                "rendition_id": rendition_id,
+                "rendition_revision": 1,
             "album_id": release_id,
             "title": "Your Faithfulness",
             "artist": "Composer",
@@ -325,8 +326,13 @@ def test_asset_delivery_and_native_library_projection(client: TestClient) -> Non
                 {"language": "zh-Hant", "lyrics": "樂譜繁體歌詞"},
             ],
             "lyrics_source_images": [],
-            "lyric_source_count": 0,
-        }
+                "lyric_source_count": 0,
+                "lyrics_formats": [
+                    {"language": "en", "format": "plain"},
+                    {"language": "zh-Hans", "format": "plain"},
+                    {"language": "zh-Hant", "format": "plain"},
+                ],
+            }
     ]
     second_page = client.get(
         "/v2/library/songs",
@@ -748,6 +754,64 @@ def test_multilingual_lyrics_crud_and_validation(client: TestClient) -> None:
     assert rendition.json()["lyrics_language"] == "en"
     assert rendition.json()["lyrics_translations"] == [
         {"language": "zh-Hans", "lyrics": "演唱歌词"}
+    ]
+    rendition_id = rendition.json()["id"]
+
+    replaced = client.put(
+        f"/v2/renditions/{rendition_id}/lyrics/zh-Hans",
+        headers={
+            **AUTH,
+            "If-Match": '"rev-1"',
+            "Idempotency-Key": "replace-zh-hans-lyrics",
+        },
+        json={"lyrics": "[00:01.000]更新演唱歌词", "format": "lrc"},
+    )
+    assert replaced.status_code == 200, replaced.text
+    assert replaced.headers["etag"] == '"rev-2"'
+    assert replaced.json() == {
+        "rendition_id": rendition_id,
+        "revision": 2,
+        "language": "zh-Hans",
+        "lyrics": "[00:01.000]更新演唱歌词",
+        "format": "lrc",
+        "lyrics_language": "en",
+        "lyrics_translations": [
+            {"language": "zh-Hans", "lyrics": "[00:01.000]更新演唱歌词"}
+        ],
+        "lyrics_formats": [
+            {"language": "en", "format": "plain"},
+            {"language": "zh-Hans", "format": "lrc"},
+        ],
+    }
+
+    replayed = client.put(
+        f"/v2/renditions/{rendition_id}/lyrics/zh-Hans",
+        headers={
+            **AUTH,
+            "If-Match": '"rev-1"',
+            "Idempotency-Key": "replace-zh-hans-lyrics",
+        },
+        json={"lyrics": "[00:01.000]更新演唱歌词", "format": "lrc"},
+    )
+    assert replayed.status_code == 200
+    assert replayed.headers["idempotency-replayed"] == "true"
+
+    stale = client.put(
+        f"/v2/renditions/{rendition_id}/lyrics/en",
+        headers={
+            **AUTH,
+            "If-Match": '"rev-1"',
+            "Idempotency-Key": "stale-english-lyrics",
+        },
+        json={"lyrics": "Stale edit", "format": "plain"},
+    )
+    assert stale.status_code == 412
+    assert stale.json()["current_etag"] == '"rev-2"'
+
+    stored = client.get(f"/v2/renditions/{rendition_id}", headers=AUTH)
+    assert stored.json()["lyrics"] == "Performance lyrics"
+    assert stored.json()["lyrics_translations"] == [
+        {"language": "zh-Hans", "lyrics": "[00:01.000]更新演唱歌词"}
     ]
 
     invalid_default_duplicate = post(

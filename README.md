@@ -76,6 +76,7 @@ POST  /v2/scores/{id}/revisions
 
 POST  /v2/arrangements/{id}/renditions
 PATCH /v2/renditions/{id}
+PUT   /v2/renditions/{id}/lyrics/{language}
 POST  /v2/renditions/{id}/assets
 GET   /v2/renditions/{id}/playback
 GET   /v2/renditions/{id}/effective-lyric-sources
@@ -107,6 +108,8 @@ Work、Score 和 Rendition 共用以下向后兼容的字段结构：
 - `lyrics_translations` 是其他语言数组；语言不可重复，也不可再次出现默认语言。
 - 新建 Score/Rendition 时如省略 `lyrics_language`，默认继承所属 Work 的 `language`；仍无法确定时使用 `und`。
 - `/v2/library/songs` 按语言执行 Rendition → preferred Score → Work 回退：高优先级来源只覆盖它实际提供的语言，其他语言继续从下级来源补齐。
+- Android 只通过 `PUT /v2/renditions/{id}/lyrics/{language}` 覆盖某个 Rendition 的单一语言；请求只接受 `lyrics` 与 `format`，必须携带设备签名、实际正文 SHA-256、`If-Match` 和 `Idempotency-Key`。其他语言以及 Score/Work 底稿保持不变。
+- Rendition 用 `lyrics_formats` 记录设备写入版本的 `plain`、`lrc`、`enhanced_lrc`、`ttml` 或 `word_by_word_json`；Library 响应同时返回 `rendition_revision` 和有效语言的 `lyrics_formats`。
 
 ### 歌词来源整页图
 
@@ -150,9 +153,9 @@ curl http://10.88.0.1:8010/healthz
 
 当前 `0.3.0` 已于 `2026-09-03` 部署到该中心机，v1 数据保留在 `rhythm.sqlite3`，v2 独立使用 `rhythm-v2.sqlite3`。旧 v1 业务数据尚未迁移；v2 已导入下述 COS 典型测试样本。
 
-### 公网只读 Catalog 网关
+### 公网受限 Catalog 网关
 
-Issue 14 增加独立进程 `public-api`。它与内网管理 API 共用 Catalog 数据，但只允许 Android 当前需要的 GET/HEAD 路由；上传、修改、发布等 handler 在进入路由前统一返回 404。公网进程关闭 OpenAPI 与文档页面。
+Issue 14 增加独立进程 `public-api`。它与内网管理 API 共用 Catalog 数据，默认只允许 Android 当前需要的 GET/HEAD 路由；Issue 58 仅额外开放上面的单语言 Rendition 歌词 PUT。上传、通用修改和发布等 handler 在进入路由前统一返回 404。公网进程关闭 OpenAPI 与文档页面。
 
 启动前在 `.env` 设置至少 32 字节的 `RHYTHM_PUBLIC_TOKEN_SECRET`，并设置 scrypt 格式的管理员密码哈希：
 
@@ -162,7 +165,7 @@ docker compose up -d api
 docker compose --profile public up -d --build public-api
 ```
 
-管理员密码只在获取 5 分钟管理令牌时提交，不保存到 Android。管理员签发一次性邀请码后，客户端用 Android Keystore 内不可导出的 P-256 私钥登记；后续每个 Catalog 请求都需要短期 token、服务端一次性 nonce、时间戳和请求签名。设备登记绑定 Sonorus applicationId 与 APK 签名证书；一个用户可为 Debug 和 Release 各保留一台 active 设备，但同一 applicationId 仍只能有一台。
+管理员密码只在获取 5 分钟管理令牌时提交，不保存到 Android。管理员签发一次性邀请码后，客户端用 Android Keystore 内不可导出的 P-256 私钥登记；后续每个 Catalog 请求都需要短期 token、服务端一次性 nonce、时间戳和请求签名。歌词 PUT 还会对收到的实际 JSON 字节重新计算 SHA-256，并要求 token 具有 `catalog:lyrics:write` scope。设备登记绑定 Sonorus applicationId 与 APK 签名证书；一个用户可为 Debug 和 Release 各保留一台 active 设备，但同一 applicationId 仍只能有一台。
 
 `issue15updateidentity` 迁移会把旧登记标为 legacy 身份；升级网关后，既有 Android 客户端需要由管理员重新签发邀请码并登记一次。新的 enrollment V2 签名同时覆盖 applicationId 和证书指纹，避免这两个字段在 HTTP 传输中被替换。
 

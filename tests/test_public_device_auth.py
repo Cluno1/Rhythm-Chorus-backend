@@ -10,6 +10,7 @@ from typing import Any
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
 
 from rhythm_metadata_api.application.device_auth import (
     enrollment_canonical,
@@ -18,6 +19,7 @@ from rhythm_metadata_api.application.device_auth import (
     request_canonical,
 )
 from rhythm_metadata_api.core.config import Settings
+from rhythm_metadata_api.infrastructure.db.models import Arrangement, ChangeEvent, Rendition, Work
 from rhythm_metadata_api.public_main import _public_read_allowed, create_public_app
 
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
@@ -112,6 +114,7 @@ def signed_headers(
     path: str,
     query: str = "",
     method: str = "GET",
+    body: bytes = b"",
 ) -> dict[str, str]:
     nonce_response = client.post(
         "/v2/device/nonce",
@@ -121,8 +124,9 @@ def signed_headers(
     assert nonce_response.status_code == 200, nonce_response.text
     nonce = nonce_response.json()["nonce"]
     timestamp = int(time.time())
+    content_sha256 = hashlib.sha256(body).hexdigest()
     canonical = request_canonical(
-        method, path, query, EMPTY_SHA256, credentials["deviceId"], timestamp, nonce
+        method, path, query, content_sha256, credentials["deviceId"], timestamp, nonce
     )
     signature = key.sign(canonical, ec.ECDSA(hashes.SHA256()))
     return {
@@ -130,7 +134,7 @@ def signed_headers(
         "X-Rhythm-Device-ID": credentials["deviceId"],
         "X-Rhythm-Timestamp": str(timestamp),
         "X-Rhythm-Nonce": nonce,
-        "X-Rhythm-Content-SHA256": EMPTY_SHA256,
+        "X-Rhythm-Content-SHA256": content_sha256,
         "X-Rhythm-Signature": b64url(signature),
     }
 
@@ -210,6 +214,87 @@ def test_enroll_signed_read_replay_refresh_and_revoke(tmp_path: Path) -> None:
             json={"deviceId": credentials["deviceId"]},
         )
         assert nonce_after_revoke.status_code == 401
+
+
+def test_signed_rendition_lyric_write_hash_scope_revision_and_audit(tmp_path: Path) -> None:
+    app = create_public_app(settings(tmp_path))
+    with TestClient(app) as client:
+        admin = admin_token(client)
+        key = ec.generate_private_key(ec.SECP256R1())
+        credentials = enroll(client, create_invite(client, admin), key)
+        with Session(client.app.state.v2_container.engine) as session, session.begin():
+            work = Work(canonical_title="Signed write", language="zh-Hans")
+            session.add(work)
+            session.flush()
+            arrangement = Arrangement(work_id=work.id, name="Default")
+            session.add(arrangement)
+            session.flush()
+            rendition = Rendition(
+                arrangement_id=arrangement.id,
+                label="Signed write",
+                kind="performance",
+                lyrics="Original",
+                lyrics_language="en",
+                lyrics_translations=[{"language": "zh-Hans", "lyrics": "原文"}],
+            )
+            session.add(rendition)
+            session.flush()
+            rendition_id = rendition.id
+
+        path = f"/v2/renditions/{rendition_id}/lyrics/zh-Hans"
+        body = json.dumps(
+            {"lyrics": "[00:02.000]客户端修改", "format": "lrc"},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+        headers = signed_headers(
+            client,
+            credentials,
+            key,
+            path,
+            method="PUT",
+            body=body,
+        ) | {
+            "Content-Type": "application/json",
+            "If-Match": '"rev-1"',
+            "Idempotency-Key": "android-lyrics-1",
+        }
+        response = client.put(path, content=body, headers=headers)
+        assert response.status_code == 200, response.text
+        assert response.json()["revision"] == 2
+        assert response.json()["format"] == "lrc"
+
+        tampered_body = body.replace("客户端修改".encode(), "篡改正文".encode())
+        tampered_headers = signed_headers(
+            client,
+            credentials,
+            key,
+            path,
+            method="PUT",
+            body=body,
+        ) | {
+            "Content-Type": "application/json",
+            "If-Match": '"rev-2"',
+            "Idempotency-Key": "android-lyrics-tampered",
+        }
+        assert client.put(path, content=tampered_body, headers=tampered_headers).status_code == 401
+
+        with Session(client.app.state.v2_container.engine) as session:
+            stored = session.get(Rendition, rendition_id)
+            assert stored is not None
+            assert stored.revision == 2
+            assert stored.lyrics == "Original"
+            assert stored.lyrics_translations == [
+                {"language": "zh-Hans", "lyrics": "[00:02.000]客户端修改"}
+            ]
+            assert stored.lyrics_formats == {"en": "plain", "zh-Hans": "lrc"}
+            event = session.query(ChangeEvent).order_by(ChangeEvent.sequence.desc()).first()
+            assert event is not None
+            assert event.operation == "rendition.lyrics_replaced"
+            assert event.actor_id == "user-1"
+            assert event.device_id == credentials["deviceId"]
+
+        assert client.patch(f"/v2/renditions/{rendition_id}", json={}).status_code == 404
 
 
 def test_invite_is_single_use_and_one_active_device_per_user(tmp_path: Path) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -23,7 +24,11 @@ from rhythm_metadata_api.domain.v2.errors import (
     V2DomainError,
     V2NotFound,
 )
-from rhythm_metadata_api.domain.v2.lyrics import merge_lyrics_sources, normalize_lyrics_bundle
+from rhythm_metadata_api.domain.v2.lyrics import (
+    merge_lyrics_sources,
+    normalize_language_tag,
+    normalize_lyrics_bundle,
+)
 from rhythm_metadata_api.domain.v2.schemas import (
     ArrangementBundle,
     ArrangementCreate,
@@ -41,6 +46,7 @@ from rhythm_metadata_api.domain.v2.schemas import (
     LibraryScoreOptionResponse,
     LibraryScoreWorkResponse,
     LibrarySongResponse,
+    LyricLanguageFormat,
     LyricSourceDocumentCreate,
     LyricSourceDocumentResponse,
     LyricSourceImageResponse,
@@ -54,6 +60,8 @@ from rhythm_metadata_api.domain.v2.schemas import (
     RenditionAssetInput,
     RenditionAssetResponse,
     RenditionCreate,
+    RenditionLyricReplace,
+    RenditionLyricWriteResponse,
     RenditionPatch,
     RenditionResponse,
     ScoreAssetResponse,
@@ -125,6 +133,32 @@ class StoredResponse:
 
 
 _LYRICS_FIELDS = frozenset({"lyrics", "lyrics_language", "lyrics_translations"})
+_LYRIC_FORMATS = frozenset({"plain", "lrc", "enhanced_lrc", "ttml", "word_by_word_json"})
+
+
+def _detect_lyric_format(lyrics: str) -> str:
+    stripped = lyrics.lstrip()
+    if stripped.startswith("<") and ("<tt" in stripped[:500] or "ttml" in stripped[:500]):
+        return "ttml"
+    if stripped.startswith(("[", "{")) and ('"words"' in stripped or '"timestamp"' in stripped):
+        return "word_by_word_json"
+    if re.search(r"<\d{1,2}:\d{2}(?:\.\d{1,3})?>", lyrics):
+        return "enhanced_lrc"
+    if re.search(r"\[\d{1,2}:\d{2}(?:\.\d{1,3})?]", lyrics):
+        return "lrc"
+    return "plain"
+
+
+def _rendition_format_map(rendition: Rendition) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for raw_language, raw_format in (rendition.lyrics_formats or {}).items():
+        try:
+            language = normalize_language_tag(raw_language)
+        except (TypeError, ValueError):
+            continue
+        if raw_format in _LYRIC_FORMATS:
+            result[language.casefold()] = raw_format
+    return result
 
 
 def _translation_dicts(
@@ -1136,6 +1170,120 @@ class CatalogService:
                 {"fields": sorted(changes)},
             )
             return self._rendition_response(uow.session, rendition)
+
+    def replace_rendition_lyrics(
+        self,
+        rendition_id: str,
+        language: str,
+        request: RenditionLyricReplace,
+        expected_revision: int,
+        idempotency_key: str,
+        actor: ActorContext,
+    ) -> StoredResponse:
+        try:
+            normalized_language = normalize_language_tag(language)
+        except ValueError as error:
+            raise V2DomainError(str(error)) from error
+
+        request_payload = {
+            "language": normalized_language,
+            "body": request.model_dump(mode="json"),
+            "expected_revision": expected_revision,
+        }
+
+        def operation(
+            session: Session,
+        ) -> tuple[RenditionLyricWriteResponse, int, dict[str, str]]:
+            rendition = self._require_rendition(session, rendition_id)
+            require_revision(rendition.revision, expected_revision)
+
+            primary_lyrics = rendition.lyrics
+            primary_language = rendition.lyrics_language
+            translations = [dict(item) for item in (rendition.lyrics_translations or [])]
+            if primary_lyrics is None:
+                primary_lyrics = request.lyrics
+                primary_language = normalized_language
+                translations = []
+            elif primary_language.casefold() == normalized_language.casefold():
+                primary_lyrics = request.lyrics
+            else:
+                replacement = {
+                    "language": normalized_language,
+                    "lyrics": request.lyrics,
+                }
+                matching_index = next(
+                    (
+                        index
+                        for index, item in enumerate(translations)
+                        if normalize_language_tag(item["language"]).casefold()
+                        == normalized_language.casefold()
+                    ),
+                    None,
+                )
+                if matching_index is None:
+                    translations.append(replacement)
+                else:
+                    translations[matching_index] = replacement
+
+            lyrics, lyrics_language, lyrics_translations = _normalize_lyrics_or_error(
+                primary_lyrics,
+                primary_language,
+                translations,
+                fallback_language=None,
+            )
+            rendition.lyrics = lyrics
+            rendition.lyrics_language = lyrics_language
+            rendition.lyrics_translations = lyrics_translations
+            formats = _rendition_format_map(rendition)
+            formats[normalized_language.casefold()] = request.format
+            rendition.lyrics_formats = {
+                item_language: formats.get(
+                    item_language.casefold(),
+                    _detect_lyric_format(item_lyrics),
+                )
+                for item_language, item_lyrics in [
+                    (lyrics_language, lyrics or ""),
+                    *[
+                        (item["language"], item["lyrics"])
+                        for item in lyrics_translations
+                    ],
+                ]
+            }
+            rendition.revision += 1
+            rendition.updated_at = utc_now()
+            work_id = self._work_id_for_arrangement(session, rendition.arrangement_id)
+            self._append_event(
+                session,
+                work_id,
+                "rendition",
+                rendition.id,
+                rendition.revision,
+                "rendition.lyrics_replaced",
+                actor,
+                {"language": normalized_language, "format": request.format},
+            )
+            response = RenditionLyricWriteResponse(
+                rendition_id=rendition.id,
+                revision=rendition.revision,
+                language=normalized_language,
+                lyrics=request.lyrics,
+                format=request.format,
+                lyrics_language=lyrics_language,
+                lyrics_translations=lyrics_translations,
+                lyrics_formats=[
+                    LyricLanguageFormat(language=item_language, format=item_format)
+                    for item_language, item_format in rendition.lyrics_formats.items()
+                ],
+            )
+            return response, 200, {"ETag": etag(rendition.revision)}
+
+        return self._idempotent(
+            f"PUT:/v2/renditions/{rendition_id}/lyrics/{normalized_language}",
+            idempotency_key,
+            request_payload,
+            actor,
+            operation,
+        )
 
     def add_rendition_asset(
         self,
@@ -2156,27 +2304,50 @@ class CatalogService:
                     Score.deleted_at.is_(None),
                 )
             )
-        lyrics, lyrics_language, lyrics_translations = merge_lyrics_sources(
-            [
-                (
-                    rendition.lyrics,
-                    rendition.lyrics_language,
-                    rendition.lyrics_translations,
-                ),
-                *(
-                    [
-                        (
-                            score.lyrics,
-                            score.lyrics_language,
-                            score.lyrics_translations,
-                        )
-                    ]
-                    if score is not None
-                    else []
-                ),
-                (work.lyrics, work.lyrics_language, work.lyrics_translations),
-            ]
-        )
+        lyric_sources = [
+            (
+                rendition.lyrics,
+                rendition.lyrics_language,
+                rendition.lyrics_translations,
+            ),
+            *(
+                [(score.lyrics, score.lyrics_language, score.lyrics_translations)]
+                if score is not None
+                else []
+            ),
+            (work.lyrics, work.lyrics_language, work.lyrics_translations),
+        ]
+        lyrics, lyrics_language, lyrics_translations = merge_lyrics_sources(lyric_sources)
+        rendition_formats = _rendition_format_map(rendition)
+        resolved_formats: dict[str, tuple[str, str]] = {}
+        for source_index, (source_lyrics, source_language, source_translations) in enumerate(
+            lyric_sources
+        ):
+            source_entries = (
+                ([{"language": source_language, "lyrics": source_lyrics}] if source_lyrics else [])
+                + list(source_translations or [])
+            )
+            for entry in source_entries:
+                entry_language = normalize_language_tag(entry["language"])
+                folded = entry_language.casefold()
+                if folded in resolved_formats or not entry["lyrics"]:
+                    continue
+                stored_format = rendition_formats.get(folded) if source_index == 0 else None
+                resolved_formats[folded] = (
+                    entry_language,
+                    stored_format or _detect_lyric_format(entry["lyrics"]),
+                )
+        effective_languages = [
+            *([lyrics_language] if lyrics_language is not None else []),
+            *[item["language"] for item in lyrics_translations],
+        ]
+        lyrics_formats = [
+            LyricLanguageFormat(
+                language=language,
+                format=resolved_formats[language.casefold()][1],
+            )
+            for language in effective_languages
+        ]
         source_images: list[LyricSourceImageResponse] = []
         seen_source_pages: set[str] = set()
         source_owners = [("rendition", rendition.id)]
@@ -2192,6 +2363,7 @@ class CatalogService:
             work_id=work.id,
             arrangement_id=arrangement.id,
             rendition_id=rendition.id,
+            rendition_revision=rendition.revision,
             album_id=release.id,
             title=rendition.label,
             artist=artist or release.album_artist,
@@ -2205,6 +2377,7 @@ class CatalogService:
             lyrics_translations=lyrics_translations,
             lyrics_source_images=source_images,
             lyric_source_count=len(source_images),
+            lyrics_formats=lyrics_formats,
         )
 
     def _library_album_response(self, session: Session, release: Release) -> LibraryAlbumResponse:

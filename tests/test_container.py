@@ -146,7 +146,7 @@ def test_multilingual_lyrics_migration_backfills_existing_rows(tmp_path: Path) -
     ).fetchone()
     rendition_row = connection.execute(
         """
-        SELECT lyrics_language, lyrics_translations
+        SELECT lyrics_language, lyrics_translations, lyrics_formats
           FROM v2_renditions
          WHERE id = 'rendition-und'
         """
@@ -161,7 +161,7 @@ def test_multilingual_lyrics_migration_backfills_existing_rows(tmp_path: Path) -
     }
     connection.close()
 
-    assert version == "issue52lyricsources"
+    assert version == "issue58lyricwrite"
     assert lyric_source_tables == {
         "v2_lyric_source_documents",
         "v2_lyric_source_pages",
@@ -173,3 +173,4 @@ def test_multilingual_lyrics_migration_backfills_existing_rows(tmp_path: Path) -
     ]
     assert (score_row[0], json.loads(score_row[1])) == ("zh-Hans", [])
     assert (rendition_row[0], json.loads(rendition_row[1])) == ("und", [])
+    assert json.loads(rendition_row[2]) == {}

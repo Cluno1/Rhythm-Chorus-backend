@@ -24,6 +24,7 @@ from rhythm_metadata_api.domain.v2.schemas import (
     PartInput,
     RenditionAssetInput,
     RenditionCreate,
+    RenditionLyricReplace,
     RenditionPatch,
     ScoreCreate,
     ScorePatch,
@@ -450,6 +451,28 @@ def patch_rendition(
 ) -> Response:
     item = service.patch_rendition(rendition_id, body, require_if_match(if_match), actor)
     return model_response(item, headers={"ETag": etag(item.revision)})
+
+
+@router.put("/renditions/{rendition_id}/lyrics/{language}")
+def replace_rendition_lyrics(
+    rendition_id: str,
+    language: str,
+    body: RenditionLyricReplace,
+    service: Catalog,
+    actor: Actor,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> Response:
+    return stored_response(
+        service.replace_rendition_lyrics(
+            rendition_id,
+            language,
+            body,
+            require_if_match(if_match),
+            require_idempotency(idempotency_key),
+            actor,
+        )
+    )
 
 
 @router.post("/renditions/{rendition_id}/lyric-source-pages")

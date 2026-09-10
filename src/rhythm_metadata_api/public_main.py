@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import re
+import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Annotated
@@ -45,10 +47,21 @@ _PUBLIC_READ_ROUTES = (
     ("GET", re.compile(r"^/v2/app-updates/files/\d+/[A-Za-z0-9._-]+\.apk$")),
     ("HEAD", re.compile(r"^/v2/app-updates/files/\d+/[A-Za-z0-9._-]+\.apk$")),
 )
+_PUBLIC_WRITE_ROUTES = (
+    ("PUT", re.compile(r"^/v2/renditions/[^/]+/lyrics/[^/]+$")),
+)
 
 
 def _public_read_allowed(method: str, path: str) -> bool:
     return any(method == expected and pattern.fullmatch(path) for expected, pattern in _PUBLIC_READ_ROUTES)
+
+
+def _public_write_allowed(method: str, path: str) -> bool:
+    return any(method == expected and pattern.fullmatch(path) for expected, pattern in _PUBLIC_WRITE_ROUTES)
+
+
+def _public_route_allowed(method: str, path: str) -> bool:
+    return _public_read_allowed(method, path) or _public_write_allowed(method, path)
 
 
 def _device_token(authorization: str | None) -> str:
@@ -95,15 +108,23 @@ def public_actor_context(
     signature: Annotated[str | None, Header(alias="X-Rhythm-Signature")] = None,
     request_id: Annotated[str | None, Header(alias="X-Request-ID")] = None,
 ) -> ActorContext:
-    if not _public_read_allowed(request.method, request.url.path):
+    if not _public_route_allowed(request.method, request.url.path):
         raise HTTPException(404, "not found")
     if None in (device_id, timestamp, nonce, content_sha256, signature):
         raise HTTPException(401, "device proof headers are required")
-    if request.method in ("GET", "HEAD") and content_sha256.lower() != _EMPTY_SHA256:
-        raise HTTPException(401, "GET and HEAD requests must use the empty content hash")
+    expected_content_sha256 = (
+        _EMPTY_SHA256
+        if request.method in ("GET", "HEAD")
+        else getattr(request.state, "content_sha256", None)
+    )
+    if expected_content_sha256 is None or not secrets.compare_digest(
+        content_sha256.lower(), expected_content_sha256
+    ):
+        raise HTTPException(401, "request content hash does not match the body")
     try:
+        token = _device_token(authorization)
         principal = request.app.state.device_auth.authenticate_request(
-            _device_token(authorization),
+            token,
             device_id,
             timestamp,
             nonce,
@@ -113,11 +134,17 @@ def public_actor_context(
             request.url.path,
             request.scope.get("query_string", b"").decode("ascii"),
         )
+        if _public_write_allowed(request.method, request.url.path):
+            request.app.state.device_auth.require_scope(token, "catalog:lyrics:write")
     except (DeviceAuthError, UnicodeDecodeError) as error:
         if isinstance(error, DeviceAuthError):
             raise HTTPException(error.status_code, error.detail) from error
         raise HTTPException(400, "query string must be ASCII percent-encoded") from error
-    return ActorContext(device_id=principal.device_id, request_id=request_id)
+    return ActorContext(
+        actor_id=principal.user_id,
+        device_id=principal.device_id,
+        request_id=request_id,
+    )
 
 
 def create_public_app(settings: Settings | None = None) -> FastAPI:
@@ -158,9 +185,21 @@ def create_public_app(settings: Settings | None = None) -> FastAPI:
         if (
             path.startswith("/v2/")
             and not path.startswith(("/v2/admin/", "/v2/device/"))
-            and not _public_read_allowed(request.method, path)
+            and not _public_route_allowed(request.method, path)
         ):
             return JSONResponse({"detail": "not found"}, status_code=404)
+        if _public_write_allowed(request.method, path):
+            content_length = request.headers.get("Content-Length")
+            if content_length is not None:
+                try:
+                    if int(content_length) > 2_200_000:
+                        return JSONResponse({"detail": "request body is too large"}, status_code=413)
+                except ValueError:
+                    return JSONResponse({"detail": "invalid Content-Length"}, status_code=400)
+            body = await request.body()
+            if len(body) > 2_200_000:
+                return JSONResponse({"detail": "request body is too large"}, status_code=413)
+            request.state.content_sha256 = hashlib.sha256(body).hexdigest()
         if path.startswith("/v2/app-updates/"):
             try:
                 request.state.device_principal = _authenticate_update_request(request)

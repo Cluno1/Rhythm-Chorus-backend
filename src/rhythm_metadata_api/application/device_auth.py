@@ -353,7 +353,7 @@ class DeviceAuthService:
                 "sub": principal.user_id,
                 "device_id": principal.device_id,
                 "session_id": principal.session_id,
-                "scope": "catalog:read",
+                "scope": "catalog:read catalog:lyrics:write",
                 "cnf": {"jkt": principal.key_thumbprint},
                 "application_id": principal.application_id,
                 "signing_certificate_sha256": principal.signing_certificate_sha256,
@@ -478,6 +478,12 @@ class DeviceAuthService:
         ):
             raise DeviceAuthError(401, "token is bound to another device")
         return principal
+
+    def require_scope(self, token: str, required_scope: str) -> None:
+        claims = self._claims(token, "device")
+        scopes = {item for item in str(claims.get("scope", "")).split() if item}
+        if required_scope not in scopes:
+            raise DeviceAuthError(403, "device token does not grant the required scope")
 
     def _active_device_and_session(
         self, session: Session, principal: DevicePrincipal
