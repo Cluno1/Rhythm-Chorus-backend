@@ -69,6 +69,11 @@ def test_settings_requires_cos_credential_pair() -> None:
         Settings(cos_secret_id="only-id")
 
 
+def test_settings_rejects_update_cos_bucket_without_credentials() -> None:
+    with pytest.raises(ValueError, match="requires RHYTHM_COS_SECRET_ID"):
+        Settings(sonorus_updates_cos_bucket="sonorus-updates-1328751369")
+
+
 def test_multilingual_lyrics_migration_backfills_existing_rows(tmp_path: Path) -> None:
     database = tmp_path / "multilingual-upgrade.sqlite3"
     config = Config()
