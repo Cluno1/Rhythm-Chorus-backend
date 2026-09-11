@@ -568,3 +568,64 @@ def test_authenticated_debug_update_manifest_range_and_track_isolation(tmp_path:
             "X-Sonorus-Signing-Certificate-SHA256": STABLE_CERTIFICATE_SHA256,
         }
         assert client.get(latest_path, headers=wrong_track).status_code == 403
+
+    cos_settings = settings(tmp_path).model_copy(
+        update={
+            "cos_secret_id": "AKIDtest",
+            "cos_secret_key": "test-secret-key",
+            "cos_region": "ap-guangzhou",
+            "sonorus_updates_cos_bucket": "sonorus-updates-1328751369",
+        }
+    )
+    app = create_public_app(cos_settings)
+    with TestClient(app) as client:
+        public_path = "/v2/app-updates/debug/latest.apk"
+        public_download = client.get(public_path)
+        assert public_download.status_code == 200
+        assert public_download.content == apk
+        assert "location" not in public_download.headers
+
+        public_head = client.head(public_path, follow_redirects=False)
+        assert public_head.status_code == 200
+        assert public_head.content == b""
+        assert int(public_head.headers["content-length"]) == len(apk)
+        assert "location" not in public_head.headers
+
+        admin = admin_token(client)
+        key = ec.generate_private_key(ec.SECP256R1())
+        credentials = enroll(client, create_invite(client, admin, user_id="user-2"), key)
+        file_path = f"/v2/app-updates/files/2001001/{file_name}"
+        download_headers = update_headers(client, credentials, key, file_path) | {
+            "Range": "bytes=7-13",
+            "If-Match": f'"{hashlib.sha256(apk).hexdigest()}"',
+            "X-Sonorus-COS-Redirect": "1",
+        }
+        authenticated_download = client.get(
+            file_path,
+            headers=download_headers,
+            follow_redirects=False,
+        )
+        assert authenticated_download.status_code == 307
+        assert authenticated_download.headers["cache-control"] == "private, no-store"
+        digest = hashlib.sha256(apk).hexdigest()
+        assert authenticated_download.headers["location"].startswith(
+            "https://sonorus-updates-1328751369.cos.ap-guangzhou.myqcloud.com/"
+            f"debug/releases/2001001/{digest}?q-sign-algorithm=sha1&"
+        )
+
+        legacy_download = client.get(
+            file_path,
+            headers=update_headers(client, credentials, key, file_path),
+        )
+        assert legacy_download.status_code == 200
+        assert legacy_download.content == apk
+
+        head_headers = update_headers(client, credentials, key, file_path, method="HEAD")
+        authenticated_head = client.head(
+            file_path,
+            headers=head_headers,
+            follow_redirects=False,
+        )
+        assert authenticated_head.status_code == 200
+        assert int(authenticated_head.headers["content-length"]) == len(apk)
+        assert "location" not in authenticated_head.headers

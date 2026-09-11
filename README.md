@@ -180,6 +180,15 @@ docker compose --profile public up -d --build public-api
 
 这两个公开路由只接受信任的 Debug/Stable 固定值，每次都从对应的 `latest.json` 选择 universal（优先）或 arm64-v8a APK，并复用 manifest 身份、不可变版本副本、文件大小和 SHA-256 校验。固定地址必须重新验证缓存，所以后续发布不需要更换对外链接。
 
+配置 `RHYTHM_SONORUS_UPDATES_COS_BUCKET` 后，声明支持 COS 交付的新客户端在认证 APK
+GET 上会收到短时签名地址的 `307 Temporary Redirect`，APK 字节由私有 COS 直接交付；
+旧客户端仍由网关返回本地文件。HEAD 始终由网关返回本地清单核验后的大小和摘要。
+COS 对象使用无扩展名的内容寻址键
+`{channel}/releases/{versionCode}/{sha256}`，以适配腾讯云新桶默认域名禁止 APK 类型公网下载
+的限制；客户端最终仍以 manifest 中的 `.apk` 文件名落盘并校验。公开浏览器固定地址暂时
+继续由网关直出 `.apk`，待配置 COS 自定义域名后再迁移，因为新桶默认域名会拒绝浏览器
+下载 APK。所有 COS 对象必须在切换 `latest.json` 前上传并完整回读校验。
+
 部署前必须配置 `RHYTHM_SONORUS_DEBUG_CERTIFICATE_SHA256` 与 `RHYTHM_SONORUS_STABLE_CERTIFICATE_SHA256`。发布流程通过管理通道把不可变版本目录写入主机 `updates/`，最后原子替换对应的 `latest.json`；公网容器对该目录没有写权限。
 
 `public-api` 固定监听腾讯云内网地址 `10.1.0.16:8010`（公网映射为 `175.178.242.232:8010`），而原有管理 API 继续只监听 WireGuard 地址 `10.88.0.1:8010`。确认容器健康并完成签名联调之前，不要开放安全组 8010。

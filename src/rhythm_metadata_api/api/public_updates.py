@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse, Response
 
 from rhythm_metadata_api.application.device_auth import DevicePrincipal
 from rhythm_metadata_api.core.config import Settings
+from rhythm_metadata_api.infrastructure.storage.cos_presign import presign_cos_get
 
 router = APIRouter(prefix="/v2/app-updates", tags=["Sonorus updates"])
 _FILE_NAME = re.compile(r"^[A-Za-z0-9._-]+\.apk$")
@@ -206,6 +207,49 @@ def _repository(request: Request) -> UpdateRepository:
     return request.app.state.update_repository
 
 
+def _cos_download_url(
+    request: Request,
+    channel: str,
+    version_code: int,
+    digest: str,
+) -> str | None:
+    settings = _settings(request)
+    if not settings.sonorus_updates_cos_bucket:
+        return None
+    try:
+        url, _ = presign_cos_get(
+            bucket=settings.sonorus_updates_cos_bucket,
+            region=settings.cos_region,
+            key=f"{channel}/releases/{version_code}/{digest}",
+            secret_id=settings.cos_secret_id,
+            secret_key=settings.cos_secret_key,
+            expires_seconds=settings.cos_presign_expires_seconds,
+        )
+    except ValueError as error:
+        raise HTTPException(503, "Sonorus update delivery is not configured") from error
+    return url
+
+
+def _head_response(path: Path, headers: dict[str, str]) -> Response:
+    return Response(
+        status_code=200,
+        media_type="application/vnd.android.package-archive",
+        headers={**headers, "Content-Length": str(path.stat().st_size)},
+    )
+
+
+def _redirect_response(location: str, headers: dict[str, str]) -> Response:
+    return Response(
+        status_code=307,
+        headers={
+            **headers,
+            "Location": location,
+            "Cache-Control": "private, no-store",
+            "Referrer-Policy": "no-referrer",
+        },
+    )
+
+
 @router.get("/latest")
 def latest(request: Request) -> Response:
     channel, application_id, certificate = _channel(request)
@@ -228,7 +272,7 @@ def latest(request: Request) -> Response:
     )
 
 
-def _file_response(version_code: int, file_name: str, request: Request) -> FileResponse:
+def _file_response(version_code: int, file_name: str, request: Request) -> Response:
     channel, application_id, certificate = _channel(request)
     _, manifest, _ = _repository(request).manifest(channel, version_code)
     _repository(request).validate_manifest(
@@ -239,14 +283,21 @@ def _file_response(version_code: int, file_name: str, request: Request) -> FileR
     if_match = request.headers.get("If-Match")
     if if_match is not None and if_match != etag:
         raise HTTPException(412, "update asset changed")
+    headers = {
+        "ETag": etag,
+        "X-Checksum-SHA256": digest,
+        "Cache-Control": "private, max-age=31536000, immutable",
+    }
+    if request.method == "HEAD":
+        return _head_response(path, headers)
+    if request.headers.get("X-Sonorus-COS-Redirect") == "1":
+        cos_url = _cos_download_url(request, channel, version_code, digest)
+        if cos_url is not None:
+            return _redirect_response(cos_url, headers)
     return FileResponse(
         path,
         media_type="application/vnd.android.package-archive",
-        headers={
-            "ETag": etag,
-            "X-Checksum-SHA256": digest,
-            "Cache-Control": "private, max-age=31536000, immutable",
-        },
+        headers=headers,
     )
 
 
@@ -289,12 +340,12 @@ def _public_latest_file_response(channel: str, request: Request) -> Response:
 
 
 @router.get("/files/{version_code}/{file_name}")
-def download(version_code: int, file_name: str, request: Request) -> FileResponse:
+def download(version_code: int, file_name: str, request: Request) -> Response:
     return _file_response(version_code, file_name, request)
 
 
 @router.head("/files/{version_code}/{file_name}")
-def head(version_code: int, file_name: str, request: Request) -> FileResponse:
+def head(version_code: int, file_name: str, request: Request) -> Response:
     return _file_response(version_code, file_name, request)
 
 

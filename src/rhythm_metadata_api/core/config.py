@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     public_invite_ttl_seconds: int = 10 * 60
     public_nonce_ttl_seconds: int = 60
     sonorus_updates_root: str = ""
+    sonorus_updates_cos_bucket: str = ""
     sonorus_debug_certificate_sha256: str = ""
     sonorus_stable_certificate_sha256: str = ""
 
@@ -60,6 +61,11 @@ class Settings(BaseSettings):
             raise ValueError("public invite TTL must be between 60 seconds and one day")
         if not 15 <= self.public_nonce_ttl_seconds <= 300:
             raise ValueError("public nonce TTL must be between 15 and 300 seconds")
+        if self.sonorus_updates_cos_bucket and not (self.cos_secret_id and self.cos_secret_key):
+            raise ValueError(
+                "RHYTHM_SONORUS_UPDATES_COS_BUCKET requires RHYTHM_COS_SECRET_ID and "
+                "RHYTHM_COS_SECRET_KEY"
+            )
         for name, digest in (
             ("RHYTHM_SONORUS_DEBUG_CERTIFICATE_SHA256", self.sonorus_debug_certificate_sha256),
             ("RHYTHM_SONORUS_STABLE_CERTIFICATE_SHA256", self.sonorus_stable_certificate_sha256),
