@@ -33,6 +33,15 @@ def test_effective_lyric_sources_is_public_read_only() -> None:
     assert not _public_read_allowed("POST", path)
 
 
+def test_latest_apk_browser_downloads_are_public_read_only() -> None:
+    for channel in ("debug", "stable"):
+        path = f"/v2/app-updates/{channel}/latest.apk"
+        assert _public_read_allowed("GET", path)
+        assert _public_read_allowed("HEAD", path)
+        assert not _public_read_allowed("POST", path)
+    assert not _public_read_allowed("GET", "/v2/app-updates/beta/latest.apk")
+
+
 def b64url(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode()
 
@@ -443,8 +452,76 @@ def test_authenticated_debug_update_manifest_range_and_track_isolation(tmp_path:
     (release_dir / "manifest.json").write_bytes(encoded)
     (update_root / "debug" / "latest.json").write_bytes(encoded)
 
+    stable_apk = b"signed-sonorus-stable-apk-bytes"
+    stable_version = 2001002
+    stable_file_name = "Sonorus-1.1.0-stable.2001002-arm64-v8a.apk"
+    stable_release_dir = update_root / "stable" / "releases" / str(stable_version)
+    stable_release_dir.mkdir(parents=True)
+    (stable_release_dir / stable_file_name).write_bytes(stable_apk)
+    stable_manifest = {
+        **manifest,
+        "channel": "stable",
+        "applicationId": "io.github.cluno1.sonorus",
+        "signingCertificateSha256": STABLE_CERTIFICATE_SHA256,
+        "versionCode": stable_version,
+        "versionName": "1.1.0",
+        "assets": [
+            {
+                **manifest["assets"][0],
+                "fileName": stable_file_name,
+                "url": f"/v2/app-updates/files/{stable_version}/{stable_file_name}",
+                "sizeBytes": len(stable_apk),
+                "sha256": hashlib.sha256(stable_apk).hexdigest(),
+            }
+        ],
+    }
+    stable_encoded = json.dumps(stable_manifest, sort_keys=True).encode()
+    (stable_release_dir / "manifest.json").write_bytes(stable_encoded)
+    (update_root / "stable" / "latest.json").write_bytes(stable_encoded)
+
     app = create_public_app(settings(tmp_path))
     with TestClient(app) as client:
+        for channel, expected_apk, expected_name, expected_version in (
+            ("debug", apk, file_name, 2001001),
+            ("stable", stable_apk, stable_file_name, stable_version),
+        ):
+            public_path = f"/v2/app-updates/{channel}/latest.apk"
+            public_download = client.get(public_path)
+            assert public_download.status_code == 200
+            assert public_download.content == expected_apk
+            assert public_download.headers["content-type"] == (
+                "application/vnd.android.package-archive"
+            )
+            assert public_download.headers["content-disposition"] == (
+                f'attachment; filename="{expected_name}"'
+            )
+            assert public_download.headers["cache-control"] == (
+                "public, max-age=0, must-revalidate"
+            )
+            assert public_download.headers["x-sonorus-version-code"] == str(expected_version)
+            assert public_download.headers["x-checksum-sha256"] == hashlib.sha256(
+                expected_apk
+            ).hexdigest()
+
+            public_head = client.head(public_path)
+            assert public_head.status_code == 200
+            assert public_head.content == b""
+            assert int(public_head.headers["content-length"]) == len(expected_apk)
+
+            not_modified = client.get(
+                public_path, headers={"If-None-Match": public_download.headers["etag"]}
+            )
+            assert not_modified.status_code == 304
+            assert not_modified.content == b""
+
+        public_range = client.get(
+            "/v2/app-updates/debug/latest.apk", headers={"Range": "bytes=7-13"}
+        )
+        assert public_range.status_code == 206
+        assert public_range.content == apk[7:14]
+        assert client.get("/v2/app-updates/beta/latest.apk").status_code == 404
+        assert client.post("/v2/app-updates/debug/latest.apk").status_code == 404
+
         admin = admin_token(client)
         key = ec.generate_private_key(ec.SECP256R1())
         credentials = enroll(client, create_invite(client, admin), key)

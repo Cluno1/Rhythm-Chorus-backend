@@ -173,6 +173,13 @@ docker compose --profile public up -d --build public-api
 
 `public-api` 只读挂载 `./updates:/updates:ro`，开放设备认证的 `GET /v2/app-updates/latest` 以及 `GET/HEAD /v2/app-updates/files/{versionCode}/{fileName}`。服务器根据登记的 applicationId 与冻结证书映射 Debug/Stable，不信任客户端单独提交的 channel。更新目录之外的路径、未列入版本 manifest 的 APK 和公网写请求全部拒绝。
 
+普通浏览器无需设备登记即可通过下列固定地址下载各渠道最新 APK：
+
+- `GET/HEAD http://175.178.242.232:8010/v2/app-updates/debug/latest.apk`
+- `GET/HEAD http://175.178.242.232:8010/v2/app-updates/stable/latest.apk`
+
+这两个公开路由只接受信任的 Debug/Stable 固定值，每次都从对应的 `latest.json` 选择 universal（优先）或 arm64-v8a APK，并复用 manifest 身份、不可变版本副本、文件大小和 SHA-256 校验。固定地址必须重新验证缓存，所以后续发布不需要更换对外链接。
+
 部署前必须配置 `RHYTHM_SONORUS_DEBUG_CERTIFICATE_SHA256` 与 `RHYTHM_SONORUS_STABLE_CERTIFICATE_SHA256`。发布流程通过管理通道把不可变版本目录写入主机 `updates/`，最后原子替换对应的 `latest.json`；公网容器对该目录没有写权限。
 
 `public-api` 固定监听腾讯云内网地址 `10.1.0.16:8010`（公网映射为 `175.178.242.232:8010`），而原有管理 API 继续只监听 WireGuard 地址 `10.88.0.1:8010`。确认容器健康并完成签名联调之前，不要开放安全组 8010。

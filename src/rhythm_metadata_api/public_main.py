@@ -46,6 +46,8 @@ _PUBLIC_READ_ROUTES = (
     ("GET", re.compile(r"^/v2/app-updates/latest$")),
     ("GET", re.compile(r"^/v2/app-updates/files/\d+/[A-Za-z0-9._-]+\.apk$")),
     ("HEAD", re.compile(r"^/v2/app-updates/files/\d+/[A-Za-z0-9._-]+\.apk$")),
+    ("GET", re.compile(r"^/v2/app-updates/(?:debug|stable)/latest\.apk$")),
+    ("HEAD", re.compile(r"^/v2/app-updates/(?:debug|stable)/latest\.apk$")),
 )
 _PUBLIC_WRITE_ROUTES = (
     ("PUT", re.compile(r"^/v2/renditions/[^/]+/lyrics/[^/]+$")),
@@ -62,6 +64,12 @@ def _public_write_allowed(method: str, path: str) -> bool:
 
 def _public_route_allowed(method: str, path: str) -> bool:
     return _public_read_allowed(method, path) or _public_write_allowed(method, path)
+
+
+def _public_update_download_allowed(method: str, path: str) -> bool:
+    return method in ("GET", "HEAD") and bool(
+        re.fullmatch(r"/v2/app-updates/(?:debug|stable)/latest\.apk", path)
+    )
 
 
 def _device_token(authorization: str | None) -> str:
@@ -200,7 +208,9 @@ def create_public_app(settings: Settings | None = None) -> FastAPI:
             if len(body) > 2_200_000:
                 return JSONResponse({"detail": "request body is too large"}, status_code=413)
             request.state.content_sha256 = hashlib.sha256(body).hexdigest()
-        if path.startswith("/v2/app-updates/"):
+        if path.startswith("/v2/app-updates/") and not _public_update_download_allowed(
+            request.method, path
+        ):
             try:
                 request.state.device_principal = _authenticate_update_request(request)
             except HTTPException as error:

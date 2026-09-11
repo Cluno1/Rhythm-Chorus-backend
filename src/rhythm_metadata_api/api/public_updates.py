@@ -39,6 +39,21 @@ def _settings(request: Request) -> Settings:
     return request.app.state.update_settings
 
 
+def _configured_channel_identity(request: Request, channel: str) -> tuple[str, str]:
+    application_id = _CHANNEL_APPLICATION.get(channel)
+    if application_id is None:
+        raise HTTPException(404, "update track not found")
+    settings = _settings(request)
+    certificate = _normalize_digest(
+        settings.sonorus_debug_certificate_sha256
+        if channel == "debug"
+        else settings.sonorus_stable_certificate_sha256
+    )
+    if not settings.sonorus_updates_root or len(certificate) != 64:
+        raise HTTPException(503, "Sonorus update track is not configured")
+    return application_id, certificate
+
+
 def _channel(request: Request) -> tuple[str, str, str]:
     principal = _principal(request)
     application_id = request.headers.get("X-Sonorus-Application-ID", "")
@@ -52,21 +67,14 @@ def _channel(request: Request) -> tuple[str, str, str]:
         raise HTTPException(422, "invalid Sonorus version identity") from None
     if current_version <= 0:
         raise HTTPException(422, "invalid Sonorus version identity")
+    expected_application_id, expected_certificate = _configured_channel_identity(request, channel)
     if (
-        _CHANNEL_APPLICATION.get(channel) != application_id
+        expected_application_id != application_id
         or principal.application_id != application_id
         or principal.signing_certificate_sha256 != certificate
     ):
         raise HTTPException(403, "registered application identity does not match update track")
-    settings = _settings(request)
-    expected = _normalize_digest(
-        settings.sonorus_debug_certificate_sha256
-        if channel == "debug"
-        else settings.sonorus_stable_certificate_sha256
-    )
-    if not settings.sonorus_updates_root or len(expected) != 64:
-        raise HTTPException(503, "Sonorus update track is not configured")
-    if certificate != expected:
+    if certificate != expected_certificate:
         raise HTTPException(403, "APK certificate is not authorized for update track")
     return channel, application_id, certificate
 
@@ -242,6 +250,44 @@ def _file_response(version_code: int, file_name: str, request: Request) -> FileR
     )
 
 
+def _public_latest_file_response(channel: str, request: Request) -> Response:
+    application_id, certificate = _configured_channel_identity(request, channel)
+    raw, manifest, _ = _repository(request).manifest(channel)
+    _repository(request).validate_manifest(manifest, channel, application_id, certificate)
+    version_code = manifest["versionCode"]
+    version_raw, _, _ = _repository(request).manifest(channel, version_code)
+    if version_raw != raw:
+        raise HTTPException(500, "latest manifest does not match immutable release")
+
+    assets = manifest["assets"]
+    selected = next((asset for asset in assets if asset["abi"] == "universal"), None)
+    if selected is None:
+        selected = next((asset for asset in assets if asset["abi"] == "arm64-v8a"), None)
+    if selected is None:
+        raise HTTPException(404, "browser-compatible update asset not found")
+
+    path, digest = _repository(request).asset(
+        channel, version_code, selected["fileName"], manifest
+    )
+    etag = f'"{digest}"'
+    headers = {
+        "ETag": etag,
+        "X-Checksum-SHA256": digest,
+        "X-Sonorus-Version-Code": str(version_code),
+        "X-Sonorus-Version-Name": manifest["versionName"],
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "public, max-age=0, must-revalidate",
+    }
+    if request.headers.get("If-None-Match") == etag:
+        return Response(status_code=304, headers=headers)
+    return FileResponse(
+        path,
+        media_type="application/vnd.android.package-archive",
+        filename=path.name,
+        headers=headers,
+    )
+
+
 @router.get("/files/{version_code}/{file_name}")
 def download(version_code: int, file_name: str, request: Request) -> FileResponse:
     return _file_response(version_code, file_name, request)
@@ -250,3 +296,13 @@ def download(version_code: int, file_name: str, request: Request) -> FileRespons
 @router.head("/files/{version_code}/{file_name}")
 def head(version_code: int, file_name: str, request: Request) -> FileResponse:
     return _file_response(version_code, file_name, request)
+
+
+@router.get("/{channel}/latest.apk")
+def public_latest_download(channel: str, request: Request) -> Response:
+    return _public_latest_file_response(channel, request)
+
+
+@router.head("/{channel}/latest.apk")
+def public_latest_head(channel: str, request: Request) -> Response:
+    return _public_latest_file_response(channel, request)
