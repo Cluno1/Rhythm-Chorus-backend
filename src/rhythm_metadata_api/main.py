@@ -6,6 +6,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from rhythm_metadata_api.api.routes import health, tracks
+from rhythm_metadata_api.api.v2.chorus_routes import router as chorus_router
 from rhythm_metadata_api.api.v2.routes import router as v2_router
 from rhythm_metadata_api.application.container import V2Container
 from rhythm_metadata_api.core.config import Settings, get_settings
@@ -98,6 +99,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(tracks.router, prefix="/v1")
     app.include_router(v2_router)
+    app.include_router(chorus_router)
     return app
 
 

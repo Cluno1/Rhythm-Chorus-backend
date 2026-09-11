@@ -15,6 +15,7 @@ from rhythm_metadata_api.api.public_auth import router as public_auth_router
 from rhythm_metadata_api.api.public_updates import UpdateRepository
 from rhythm_metadata_api.api.public_updates import router as public_updates_router
 from rhythm_metadata_api.api.routes import health
+from rhythm_metadata_api.api.v2.chorus_routes import router as chorus_router
 from rhythm_metadata_api.api.v2.routes import actor_context
 from rhythm_metadata_api.api.v2.routes import router as v2_router
 from rhythm_metadata_api.application.catalog_service import ActorContext
@@ -26,6 +27,11 @@ from rhythm_metadata_api.application.device_auth import (
 )
 from rhythm_metadata_api.core.config import Settings, get_settings
 from rhythm_metadata_api.domain.v2.errors import V2DomainError
+from rhythm_metadata_api.infrastructure.storage.base import (
+    EmptyUploadError,
+    UploadTooLargeError,
+    UploadValidationError,
+)
 from rhythm_metadata_api.main import problem_response
 
 _EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -43,6 +49,9 @@ _PUBLIC_READ_ROUTES = (
     ("GET", re.compile(r"^/v2/assets/[^/]+/content$")),
     ("HEAD", re.compile(r"^/v2/assets/[^/]+/content$")),
     ("GET", re.compile(r"^/v2/sync/changes$")),
+    ("GET", re.compile(r"^/v2/works/[^/]+/chorus$")),
+    ("GET", re.compile(r"^/v2/chorus-projects/[^/]+$")),
+    ("GET", re.compile(r"^/v2/chorus-mixes/[^/]+$")),
     ("GET", re.compile(r"^/v2/app-updates/latest$")),
     ("GET", re.compile(r"^/v2/app-updates/files/\d+/[A-Za-z0-9._-]+\.apk$")),
     ("HEAD", re.compile(r"^/v2/app-updates/files/\d+/[A-Za-z0-9._-]+\.apk$")),
@@ -51,6 +60,12 @@ _PUBLIC_READ_ROUTES = (
 )
 _PUBLIC_WRITE_ROUTES = (
     ("PUT", re.compile(r"^/v2/renditions/[^/]+/lyrics/[^/]+$")),
+    ("POST", re.compile(r"^/v2/chorus-projects/[^/]+/tracks$")),
+    ("POST", re.compile(r"^/v2/chorus-tracks/[^/]+/complete$")),
+    ("PATCH", re.compile(r"^/v2/chorus-tracks/[^/]+/alignment$")),
+    ("POST", re.compile(r"^/v2/chorus-tracks/[^/]+/submit$")),
+    ("DELETE", re.compile(r"^/v2/chorus-tracks/[^/]+$")),
+    ("POST", re.compile(r"^/v2/chorus-projects/[^/]+/mixes:resolve$")),
 )
 
 
@@ -143,7 +158,12 @@ def public_actor_context(
             request.scope.get("query_string", b"").decode("ascii"),
         )
         if _public_write_allowed(request.method, request.url.path):
-            request.app.state.device_auth.require_scope(token, "catalog:lyrics:write")
+            required_scope = (
+                "catalog:lyrics:write"
+                if request.url.path.startswith("/v2/renditions/")
+                else "chorus:track:write-own"
+            )
+            request.app.state.device_auth.require_scope(token, required_scope)
     except (DeviceAuthError, UnicodeDecodeError) as error:
         if isinstance(error, DeviceAuthError):
             raise HTTPException(error.status_code, error.detail) from error
@@ -197,15 +217,16 @@ def create_public_app(settings: Settings | None = None) -> FastAPI:
         ):
             return JSONResponse({"detail": "not found"}, status_code=404)
         if _public_write_allowed(request.method, path):
+            body_limit = 2_200_000
             content_length = request.headers.get("Content-Length")
             if content_length is not None:
                 try:
-                    if int(content_length) > 2_200_000:
+                    if int(content_length) > body_limit:
                         return JSONResponse({"detail": "request body is too large"}, status_code=413)
                 except ValueError:
                     return JSONResponse({"detail": "invalid Content-Length"}, status_code=400)
             body = await request.body()
-            if len(body) > 2_200_000:
+            if len(body) > body_limit:
                 return JSONResponse({"detail": "request body is too large"}, status_code=413)
             request.state.content_sha256 = hashlib.sha256(body).hexdigest()
         if path.startswith("/v2/app-updates/") and not _public_update_download_allowed(
@@ -239,8 +260,25 @@ def create_public_app(settings: Settings | None = None) -> FastAPI:
             errors=error.errors(),
         )
 
+    @app.exception_handler(UploadValidationError)
+    async def invalid_upload(request: Request, error: UploadValidationError) -> JSONResponse:
+        return problem_response(
+            request, 422, "invalid-upload", "Invalid uploaded asset", str(error)
+        )
+
+    @app.exception_handler(EmptyUploadError)
+    async def empty_upload(request: Request, error: EmptyUploadError) -> JSONResponse:
+        return problem_response(request, 400, "empty-upload", "Empty upload", str(error))
+
+    @app.exception_handler(UploadTooLargeError)
+    async def large_upload(request: Request, error: UploadTooLargeError) -> JSONResponse:
+        return problem_response(
+            request, 413, "upload-too-large", "Upload is too large", str(error)
+        )
+
     app.include_router(health.router)
     app.include_router(public_auth_router)
     app.include_router(public_updates_router)
     app.include_router(v2_router)
+    app.include_router(chorus_router)
     return app

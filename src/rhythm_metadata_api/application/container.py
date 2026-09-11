@@ -6,6 +6,7 @@ from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session, aliased
 
 from rhythm_metadata_api.application.catalog_service import CatalogService
+from rhythm_metadata_api.application.chorus_service import ChorusService
 from rhythm_metadata_api.application.unit_of_work import UnitOfWorkFactory
 from rhythm_metadata_api.core.config import Settings
 from rhythm_metadata_api.infrastructure.db.database import (
@@ -22,6 +23,7 @@ class V2Container:
     settings: Settings
     engine: Engine
     catalog: CatalogService
+    chorus: ChorusService
 
     @classmethod
     def build(cls, settings: Settings) -> V2Container:
@@ -49,7 +51,8 @@ class V2Container:
         sessions = create_session_factory(engine)
         storage = LocalAssetStorage(settings.local_object_root)
         catalog = CatalogService(UnitOfWorkFactory(sessions), storage, settings)
-        return cls(settings=settings, engine=engine, catalog=catalog)
+        chorus = ChorusService(UnitOfWorkFactory(sessions), storage, settings)
+        return cls(settings=settings, engine=engine, catalog=catalog, chorus=chorus)
 
     def close(self) -> None:
         self.engine.dispose()

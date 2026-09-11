@@ -27,6 +27,50 @@ def presign_cos_get(
       URL host is the COS endpoint;
     - no URL parameters are signed (empty ``q-url-param-list``).
     """
+    return presign_cos_request(
+        method="GET",
+        bucket=bucket,
+        region=region,
+        key=key,
+        secret_id=secret_id,
+        secret_key=secret_key,
+        expires_seconds=expires_seconds,
+    )
+
+
+def presign_cos_put(
+    bucket: str,
+    region: str,
+    key: str,
+    secret_id: str,
+    secret_key: str,
+    expires_seconds: int = 900,
+) -> tuple[str, datetime]:
+    """Build a Tencent COS v5 pre-signed PUT URL for one exact object key."""
+    return presign_cos_request(
+        method="PUT",
+        bucket=bucket,
+        region=region,
+        key=key,
+        secret_id=secret_id,
+        secret_key=secret_key,
+        expires_seconds=expires_seconds,
+    )
+
+
+def presign_cos_request(
+    *,
+    method: str,
+    bucket: str,
+    region: str,
+    key: str,
+    secret_id: str,
+    secret_key: str,
+    expires_seconds: int = 900,
+) -> tuple[str, datetime]:
+    normalized_method = method.strip().lower()
+    if normalized_method not in {"get", "put"}:
+        raise ValueError("only GET and PUT COS requests can be signed")
     if not secret_id or not secret_key:
         raise ValueError("COS credentials are not configured")
 
@@ -41,7 +85,7 @@ def presign_cos_get(
 
     sign_key = hmac.new(secret_key.encode(), key_time.encode(), hashlib.sha1).hexdigest()
     headers_str = "host=" + quote(host, safe="-_.~")
-    http_string = f"get\n{raw_path}\n\n{headers_str}\n"
+    http_string = f"{normalized_method}\n{raw_path}\n\n{headers_str}\n"
     http_digest = hashlib.sha1(http_string.encode()).hexdigest()
     string_to_sign = f"sha1\n{key_time}\n{http_digest}\n"
     signature = hmac.new(sign_key.encode(), string_to_sign.encode(), hashlib.sha1).hexdigest()

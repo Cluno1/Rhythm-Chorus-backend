@@ -3,7 +3,7 @@ from unittest import mock
 
 import pytest
 
-from rhythm_metadata_api.infrastructure.storage.cos_presign import presign_cos_get
+from rhythm_metadata_api.infrastructure.storage.cos_presign import presign_cos_get, presign_cos_put
 
 
 def test_presign_cos_get_is_deterministic_golden() -> None:
@@ -39,9 +39,7 @@ def test_presign_cos_get_encodes_unicode_key_but_keeps_slashes() -> None:
         secret_id="AKIDx",
         secret_key="skx",
     )
-    assert url.startswith(
-        "https://bible-1328751369.cos.ap-guangzhou.myqcloud.com/music/221-"
-    )
+    assert url.startswith("https://bible-1328751369.cos.ap-guangzhou.myqcloud.com/music/221-")
     assert "%2F" not in url  # path separators stay literal slashes
     assert "%E6" in url  # unicode is percent-encoded
 
@@ -49,3 +47,26 @@ def test_presign_cos_get_encodes_unicode_key_but_keeps_slashes() -> None:
 def test_presign_cos_get_requires_credentials() -> None:
     with pytest.raises(ValueError):
         presign_cos_get("b1", "ap-guangzhou", "music/x.mp3", "", "")
+
+
+def test_presign_cos_put_signs_the_exact_object_and_method() -> None:
+    get_url, _ = presign_cos_get(
+        "chorus-1328751369",
+        "ap-guangzhou",
+        "tracks/user/take.m4a",
+        "secret-id",
+        "secret-key",
+    )
+    put_url, _ = presign_cos_put(
+        "chorus-1328751369",
+        "ap-guangzhou",
+        "tracks/user/take.m4a",
+        "secret-id",
+        "secret-key",
+    )
+
+    assert put_url.startswith(
+        "https://chorus-1328751369.cos.ap-guangzhou.myqcloud.com/tracks/user/take.m4a?"
+    )
+    assert "q-header-list=host" in put_url
+    assert put_url != get_url

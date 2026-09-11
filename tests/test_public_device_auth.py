@@ -20,7 +20,11 @@ from rhythm_metadata_api.application.device_auth import (
 )
 from rhythm_metadata_api.core.config import Settings
 from rhythm_metadata_api.infrastructure.db.models import Arrangement, ChangeEvent, Rendition, Work
-from rhythm_metadata_api.public_main import _public_read_allowed, create_public_app
+from rhythm_metadata_api.public_main import (
+    _public_read_allowed,
+    _public_write_allowed,
+    create_public_app,
+)
 
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 DEBUG_CERTIFICATE_SHA256 = "ab" * 32
@@ -31,6 +35,15 @@ def test_effective_lyric_sources_is_public_read_only() -> None:
     path = "/v2/renditions/33333333-3333-4333-8333-333333333333/effective-lyric-sources"
     assert _public_read_allowed("GET", path)
     assert not _public_read_allowed("POST", path)
+
+
+def test_chorus_public_routes_keep_audio_bytes_on_cos() -> None:
+    project_id = "00000000-0000-4000-8000-000000000001"
+    track_id = "00000000-0000-4000-8000-000000000002"
+    assert _public_read_allowed("GET", f"/v2/chorus-projects/{project_id}")
+    assert _public_write_allowed("POST", f"/v2/chorus-projects/{project_id}/tracks")
+    assert _public_write_allowed("POST", f"/v2/chorus-tracks/{track_id}/complete")
+    assert not _public_write_allowed("PUT", f"/v2/chorus-tracks/{track_id}/content")
 
 
 def test_latest_apk_browser_downloads_are_public_read_only() -> None:
@@ -95,9 +108,7 @@ def enroll(
     )
     thumbprint = hashlib.sha256(public_der).hexdigest()
     signature = key.sign(
-        enrollment_canonical(
-            nonce, invite, thumbprint, application_id, certificate_sha256
-        ),
+        enrollment_canonical(nonce, invite, thumbprint, application_id, certificate_sha256),
         ec.ECDSA(hashes.SHA256()),
     )
     response = client.post(
@@ -194,9 +205,7 @@ def test_enroll_signed_read_replay_refresh_and_revoke(tmp_path: Path) -> None:
         nonce = challenge.json()["nonce"]
         timestamp = int(time.time())
         signature = key.sign(
-            refresh_canonical(
-                credentials["deviceId"], credentials["sessionId"], timestamp, nonce
-            ),
+            refresh_canonical(credentials["deviceId"], credentials["sessionId"], timestamp, nonce),
             ec.ECDSA(hashes.SHA256()),
         )
         refreshed = client.post(
@@ -499,9 +508,10 @@ def test_authenticated_debug_update_manifest_range_and_track_isolation(tmp_path:
                 "public, max-age=0, must-revalidate"
             )
             assert public_download.headers["x-sonorus-version-code"] == str(expected_version)
-            assert public_download.headers["x-checksum-sha256"] == hashlib.sha256(
-                expected_apk
-            ).hexdigest()
+            assert (
+                public_download.headers["x-checksum-sha256"]
+                == hashlib.sha256(expected_apk).hexdigest()
+            )
 
             public_head = client.head(public_path)
             assert public_head.status_code == 200
@@ -527,12 +537,16 @@ def test_authenticated_debug_update_manifest_range_and_track_isolation(tmp_path:
         credentials = enroll(client, create_invite(client, admin), key)
 
         latest_path = "/v2/app-updates/latest"
-        response = client.get(latest_path, headers=update_headers(client, credentials, key, latest_path))
+        response = client.get(
+            latest_path, headers=update_headers(client, credentials, key, latest_path)
+        )
         assert response.status_code == 200
         assert response.json()["versionCode"] == 2001001
         etag = response.headers["etag"]
 
-        conditional = update_headers(client, credentials, key, latest_path) | {"If-None-Match": etag}
+        conditional = update_headers(client, credentials, key, latest_path) | {
+            "If-None-Match": etag
+        }
         assert client.get(latest_path, headers=conditional).status_code == 304
 
         file_path = f"/v2/app-updates/files/2001001/{file_name}"

@@ -353,7 +353,7 @@ class DeviceAuthService:
                 "sub": principal.user_id,
                 "device_id": principal.device_id,
                 "session_id": principal.session_id,
-                "scope": "catalog:read catalog:lyrics:write",
+                "scope": "catalog:read catalog:lyrics:write chorus:read chorus:track:write-own",
                 "cnf": {"jkt": principal.key_thumbprint},
                 "application_id": principal.application_id,
                 "signing_certificate_sha256": principal.signing_certificate_sha256,

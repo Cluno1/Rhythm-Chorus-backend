@@ -48,6 +48,16 @@ sudo docker compose up -d --build
 
 服务仅绑定 `10.88.0.1:8010`，不会监听公网网卡。运行容器不使用 mihomo；只有 Docker 构建阶段经中心机 `127.0.0.1:7890` 下载依赖。
 
+在线合唱上线前必须设置 `RHYTHM_CHORUS_COS_BUCKET`、`RHYTHM_COS_REGION`、
+`RHYTHM_COS_SECRET_ID` 和 `RHYTHM_COS_SECRET_KEY`。桶保持私有，设备只取得限定对象键与短时
+有效期的 HTTPS PUT/GET 签名；不得把 COS 密钥放入客户端。`api` 与 `public-api` 必须使用同一
+组配置。未设置合唱桶时的本地上传路由仅供私网开发和自动测试，不能作为公网部署方式。
+
+镜像包含 FFmpeg，用于把投稿标准化为 `48 kHz / mono / AAC-LC` 并生成内容寻址混音。
+`RHYTHM_CHORUS_MIX_TIMEOUT_SECONDS` 默认 300 秒；上线时应同时限制容器 CPU/内存，并监控
+`chorus track processing failed` 与 `chorus mix rendering failed` 日志。数据库迁移到
+`issue78chorus` 后才可开放客户端入口。
+
 持久数据位于部署目录 `data/`，包含旧 v1 SQLite、`rhythm-v2.sqlite3`、WAL 和内容寻址对象。备份时应同时备份整个 `data/`；SQLite 在线备份应优先使用 SQLite backup API，避免只复制主数据库而遗漏 WAL。
 
 当前 `0.3.0` 已于 `2026-09-03` 部署，运行镜像对应源码提交 `98ea388`，镜像标签为 `rhythm-metadata-api-api:v0.3.0-98ea388`。线上保留 v1 SQLite 及其 WAL，v2 使用独立数据库并已执行 Alembic `25ff14940d0d`；尚未进行 v1 -> v2 业务数据导入。

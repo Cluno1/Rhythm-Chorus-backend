@@ -213,10 +213,10 @@ pytest -q
 ruff check src tests scripts/build_lyric_source_plan.py scripts/import_lyric_source_plan.py
 ```
 
-当前自动化覆盖 v1 回归，以及 v2 鉴权、幂等重放/冲突、精确解析、多语言歌词与旧数据迁移、文件校验与复用、不可变谱面修订、过期 ETag、Rendition 播放选择、Range、Bundle 304 和增量事件。
+当前自动化覆盖 v1 回归，以及 v2 鉴权、幂等重放/冲突、精确解析、多语言歌词与旧数据迁移、文件校验与复用、不可变谱面修订、过期 ETag、Rendition 播放选择、Range、Bundle 304、增量事件和在线合唱上传/对齐/审核/内容寻址混音。
 
 ## 尚未实现
 
 - Metadata suggestions。
-- 删除墓碑、对象 GC、转码/预览 worker、COS adapter。
+- 删除墓碑、对象 GC，以及合唱以外的通用转码/预览 worker、COS adapter。
 - 旧 v1 Demo 数据一次性导入与 Android v2 端到端联调。

@@ -490,6 +490,182 @@ class RenditionAsset(Base):
     )
 
 
+class ChorusProject(RevisionedMixin, Base):
+    __tablename__ = "v2_chorus_projects"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    work_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_works.id", ondelete="CASCADE"), nullable=False
+    )
+    arrangement_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_arrangements.id", ondelete="CASCADE"), nullable=False
+    )
+    alignment_score_revision_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_score_revisions.id", ondelete="RESTRICT"), nullable=False
+    )
+    timeline_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
+    created_by_user_id: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('draft', 'open', 'closed', 'archived')",
+            name="chorus_project_status",
+        ),
+        Index("v2_chorus_projects_work_idx", "work_id", "status"),
+        Index("v2_chorus_projects_arrangement_idx", "arrangement_id"),
+    )
+
+
+class ChorusTrack(RevisionedMixin, Base):
+    __tablename__ = "v2_chorus_tracks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    chorus_project_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_chorus_projects.id", ondelete="CASCADE"), nullable=False
+    )
+    rendition_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_renditions.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    uploader_user_id: Mapped[str] = mapped_column(
+        ForeignKey("auth_users.id", ondelete="RESTRICT"), nullable=False
+    )
+    part_id: Mapped[str | None] = mapped_column(
+        ForeignKey("v2_parts.id", ondelete="RESTRICT"), nullable=True
+    )
+    upload_session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("v2_upload_sessions.id", ondelete="SET NULL"), nullable=True
+    )
+    contribution_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    display_label: Mapped[str] = mapped_column(String(300), nullable=False)
+    take_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    alignment_state: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    alignment_offset_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    gain_millibels: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    pan_milli: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    waveform_peaks: Mapped[list[float]] = mapped_column(
+        JSON, nullable=False, default=list, server_default=text("'[]'")
+    )
+    rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "contribution_kind IN ('vocal_part', 'harmony', 'guitar', 'piano', "
+            "'percussion', 'other')",
+            name="chorus_track_kind",
+        ),
+        CheckConstraint(
+            "alignment_state IN ('pending', 'automatic', 'manual', 'verified', 'failed')",
+            name="chorus_track_alignment_state",
+        ),
+        CheckConstraint(
+            "status IN ('draft', 'processing', 'pending_review', 'published', "
+            "'rejected', 'withdrawn', 'failed')",
+            name="chorus_track_status",
+        ),
+        CheckConstraint("take_no >= 1", name="chorus_track_take_no"),
+        CheckConstraint(
+            "gain_millibels >= -2400 AND gain_millibels <= 1200",
+            name="chorus_track_gain",
+        ),
+        CheckConstraint(
+            "pan_milli >= -1000 AND pan_milli <= 1000",
+            name="chorus_track_pan",
+        ),
+        CheckConstraint(
+            "duration_ms IS NULL OR duration_ms > 0",
+            name="chorus_track_duration",
+        ),
+        Index("v2_chorus_tracks_project_idx", "chorus_project_id", "status"),
+        Index("v2_chorus_tracks_uploader_idx", "uploader_user_id", "status"),
+    )
+
+
+class ScoreRenditionSync(Base):
+    __tablename__ = "v2_score_rendition_sync"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    score_revision_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_score_revisions.id", ondelete="CASCADE"), nullable=False
+    )
+    rendition_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_renditions.id", ondelete="CASCADE"), nullable=False
+    )
+    anchor_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    score_tick: Mapped[int] = mapped_column(Integer, nullable=False)
+    media_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    confidence_milli: Mapped[int] = mapped_column(Integer, nullable=False, default=1000)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "score_revision_id",
+            "rendition_id",
+            "anchor_order",
+            name="uq_v2_score_rendition_sync_order",
+        ),
+        CheckConstraint("anchor_order >= 0", name="score_rendition_sync_order"),
+        CheckConstraint("score_tick >= 0", name="score_rendition_sync_tick"),
+        CheckConstraint("media_ms >= 0", name="score_rendition_sync_media"),
+        CheckConstraint(
+            "confidence_milli >= 0 AND confidence_milli <= 1000",
+            name="score_rendition_sync_confidence",
+        ),
+        CheckConstraint(
+            "source IN ('in_app_clock', 'automatic', 'manual')",
+            name="score_rendition_sync_source",
+        ),
+        Index(
+            "v2_score_rendition_sync_lookup_idx",
+            "score_revision_id",
+            "rendition_id",
+            "anchor_order",
+        ),
+    )
+
+
+class ChorusMixVariant(Base):
+    __tablename__ = "v2_chorus_mix_variants"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    chorus_project_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_chorus_projects.id", ondelete="CASCADE"), nullable=False
+    )
+    selection_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    selected_track_ids: Mapped[list[str]] = mapped_column(
+        JSON, nullable=False, default=list, server_default=text("'[]'")
+    )
+    selected_track_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    mix_profile: Mapped[str] = mapped_column(String(100), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
+    asset_id: Mapped[str | None] = mapped_column(
+        ForeignKey("v2_assets.id", ondelete="SET NULL"), nullable=True
+    )
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "chorus_project_id",
+            "selection_hash",
+            "mix_profile",
+            name="uq_v2_chorus_mix_selection",
+        ),
+        CheckConstraint("selected_track_count >= 1", name="chorus_mix_track_count"),
+        CheckConstraint(
+            "state IN ('queued', 'processing', 'ready', 'failed', 'obsolete')",
+            name="chorus_mix_state",
+        ),
+        Index("v2_chorus_mix_project_idx", "chorus_project_id", "state"),
+    )
+
+
 class Release(RevisionedMixin, Base):
     """A client-visible album that may collect renditions from many works."""
 

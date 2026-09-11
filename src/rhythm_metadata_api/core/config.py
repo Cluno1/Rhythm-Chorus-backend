@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     cos_secret_key: str = ""
     cos_region: str = "ap-guangzhou"
     cos_presign_expires_seconds: int = 900
+    chorus_cos_bucket: str = ""
+    chorus_ffmpeg_path: str = "ffmpeg"
+    chorus_mix_timeout_seconds: int = 10 * 60
 
     # Public device gateway (issue 14). These remain optional for the private app;
     # create_public_app validates them before exposing a public listener.
@@ -66,6 +69,13 @@ class Settings(BaseSettings):
                 "RHYTHM_SONORUS_UPDATES_COS_BUCKET requires RHYTHM_COS_SECRET_ID and "
                 "RHYTHM_COS_SECRET_KEY"
             )
+        if self.chorus_cos_bucket and not (self.cos_secret_id and self.cos_secret_key):
+            raise ValueError(
+                "RHYTHM_CHORUS_COS_BUCKET requires RHYTHM_COS_SECRET_ID and "
+                "RHYTHM_COS_SECRET_KEY"
+            )
+        if not 30 <= self.chorus_mix_timeout_seconds <= 60 * 60:
+            raise ValueError("chorus mix timeout must be between 30 and 3600 seconds")
         for name, digest in (
             ("RHYTHM_SONORUS_DEBUG_CERTIFICATE_SHA256", self.sonorus_debug_certificate_sha256),
             ("RHYTHM_SONORUS_STABLE_CERTIFICATE_SHA256", self.sonorus_stable_certificate_sha256),
