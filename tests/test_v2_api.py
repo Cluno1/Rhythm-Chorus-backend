@@ -12,6 +12,7 @@ from rhythm_metadata_api.infrastructure.db.models import (
     Arrangement,
     Asset,
     AssetLocation,
+    ChorusProject,
     Contributor,
     Release,
     ReleaseItem,
@@ -81,6 +82,89 @@ def upload_asset(
     completed = post(client, f"/v2/uploads/{upload_id}/complete", f"{key}-complete", {})
     assert completed.status_code == 200, completed.text
     return completed.json()["asset"]
+
+
+def test_publishing_revision_opens_matching_chorus_project(client: TestClient) -> None:
+    with Session(client.app.state.v2_container.engine) as session, session.begin():
+        work = Work(canonical_title="Versioned chorus")
+        session.add(work)
+        session.flush()
+        arrangement = Arrangement(work_id=work.id, name="Main")
+        session.add(arrangement)
+        session.flush()
+        score = Score(arrangement_id=arrangement.id, label="Score", origin="manual")
+        session.add(score)
+        session.flush()
+        first_asset = Asset(
+            sha256="a" * 64,
+            byte_size=100,
+            detected_media_type="application/vnd.recordare.musicxml+xml",
+            state="ready",
+        )
+        second_asset = Asset(
+            sha256="b" * 64,
+            byte_size=120,
+            detected_media_type="application/vnd.recordare.musicxml+xml",
+            state="ready",
+        )
+        session.add_all([first_asset, second_asset])
+        session.flush()
+        first_revision = ScoreRevision(score_id=score.id, revision_no=1)
+        session.add(first_revision)
+        session.flush()
+        second_revision = ScoreRevision(
+            score_id=score.id,
+            revision_no=2,
+            based_on_revision_id=first_revision.id,
+        )
+        session.add(second_revision)
+        session.flush()
+        session.add_all(
+            [
+                ScoreRevisionAsset(
+                    score_revision_id=first_revision.id,
+                    asset_id=first_asset.id,
+                    role="primary_musicxml",
+                ),
+                ScoreRevisionAsset(
+                    score_revision_id=second_revision.id,
+                    asset_id=second_asset.id,
+                    role="primary_musicxml",
+                ),
+                ChorusProject(
+                    work_id=work.id,
+                    arrangement_id=arrangement.id,
+                    alignment_score_revision_id=first_revision.id,
+                    timeline_hash=first_asset.sha256,
+                    title="在线合唱",
+                    status="open",
+                    created_by_user_id="owner",
+                ),
+            ]
+        )
+        score.head_revision_id = second_revision.id
+        score.published_revision_id = first_revision.id
+        work_id = work.id
+        score_id = score.id
+        second_revision_id = second_revision.id
+
+    published = client.patch(
+        f"/v2/scores/{score_id}",
+        headers={**AUTH, "If-Match": '"rev-1"'},
+        json={"published_revision_id": second_revision_id},
+    )
+    assert published.status_code == 200, published.text
+
+    chorus = client.get(f"/v2/works/{work_id}/chorus", headers=AUTH)
+    assert chorus.status_code == 200, chorus.text
+    projects = chorus.json()["projects"]
+    assert len(projects) == 2
+    generated = next(
+        item for item in projects if item["alignment_score_revision_id"] == second_revision_id
+    )
+    assert generated["timeline_hash"] == "b" * 64
+    assert generated["title"] == "在线合唱"
+    assert generated["status"] == "open"
 
 
 def test_asset_delivery_and_native_library_projection(client: TestClient) -> None:

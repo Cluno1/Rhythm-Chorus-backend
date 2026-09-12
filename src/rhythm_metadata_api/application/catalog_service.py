@@ -91,6 +91,7 @@ from rhythm_metadata_api.infrastructure.db.models import (
     AssetSource,
     ChangeEvent,
     ChangeEventWork,
+    ChorusProject,
     Contributor,
     IdempotencyKey,
     LyricSourceDocument,
@@ -982,7 +983,78 @@ class CatalogService:
                 actor,
                 {"fields": sorted(changes)},
             )
+            if published is not None:
+                self._open_chorus_project_for_published_revision(
+                    uow.session,
+                    work_id=work_id,
+                    score=score,
+                    score_revision=revision,
+                    actor=actor,
+                )
             return self._score_response(uow.session, score)
+
+    def _open_chorus_project_for_published_revision(
+        self,
+        session: Session,
+        *,
+        work_id: str,
+        score: Score,
+        score_revision: ScoreRevision,
+        actor: ActorContext,
+    ) -> None:
+        template = session.scalar(
+            select(ChorusProject)
+            .where(
+                ChorusProject.work_id == work_id,
+                ChorusProject.status == "open",
+                ChorusProject.deleted_at.is_(None),
+            )
+            .order_by(ChorusProject.created_at, ChorusProject.id)
+        )
+        if template is None:
+            return
+        existing = session.scalar(
+            select(ChorusProject.id).where(
+                ChorusProject.work_id == work_id,
+                ChorusProject.alignment_score_revision_id == score_revision.id,
+                ChorusProject.deleted_at.is_(None),
+            )
+        )
+        if existing is not None:
+            return
+        timeline_hash = session.scalar(
+            select(Asset.sha256)
+            .join(ScoreRevisionAsset, ScoreRevisionAsset.asset_id == Asset.id)
+            .where(
+                ScoreRevisionAsset.score_revision_id == score_revision.id,
+                ScoreRevisionAsset.role == "primary_musicxml",
+                Asset.state == "ready",
+                Asset.deleted_at.is_(None),
+            )
+        )
+        if timeline_hash is None:
+            raise V2Conflict("published score revision has no ready primary MusicXML")
+        project = ChorusProject(
+            work_id=work_id,
+            arrangement_id=score.arrangement_id,
+            alignment_score_revision_id=score_revision.id,
+            timeline_hash=timeline_hash,
+            title=template.title,
+            status="open",
+            created_by_user_id=actor.actor_id,
+        )
+        session.add(project)
+        session.flush()
+        self._append_event(
+            session,
+            work_id,
+            "chorus_project",
+            project.id,
+            project.revision,
+            "chorus_project.created",
+            actor,
+            {"source": "score_revision_published", "score_revision_id": score_revision.id},
+        )
 
     def create_score_revision(
         self,
