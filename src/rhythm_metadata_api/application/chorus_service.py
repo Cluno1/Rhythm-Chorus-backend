@@ -253,6 +253,8 @@ class ChorusService:
                         actor,
                         {"score_revision_id": score_revision.id},
                     )
+                elif timeline.timeline_hash != request.timeline_hash:
+                    raise V2Conflict("chorus timeline hash does not match the existing revision")
                 return (
                     self._project_response(session, existing, actor),
                     200,
