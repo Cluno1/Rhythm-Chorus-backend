@@ -133,9 +133,7 @@ class ChorusTrackCreate(ChorusApiModel):
         return normalized
 
     @model_validator(mode="after")
-    def validate_part_kind_and_anchors(self) -> ChorusTrackCreate:
-        if self.contribution_kind == "vocal_part" and self.part_id is None:
-            raise ValueError("vocal_part contributions require part_id")
+    def validate_anchors(self) -> ChorusTrackCreate:
         orders = [anchor.anchor_order for anchor in self.initial_anchors]
         if orders != sorted(set(orders)):
             raise ValueError("anchor_order values must be unique and increasing")

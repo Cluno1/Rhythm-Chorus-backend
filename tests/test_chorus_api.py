@@ -104,8 +104,8 @@ def test_chorus_upload_process_publish_and_mix(client: TestClient) -> None:
         f"/v2/chorus-projects/{project_id}/tracks",
         "track-create",
         {
-            "contribution_kind": "harmony",
-            "display_label": "Upper harmony",
+            "contribution_kind": "vocal_part",
+            "display_label": "Lead vocal",
             "sha256": hashlib.sha256(audio).hexdigest(),
             "byte_size": len(audio),
             "media_type": "audio/wav",
@@ -124,6 +124,8 @@ def test_chorus_upload_process_publish_and_mix(client: TestClient) -> None:
         },
     )
     assert created_track.status_code == 201, created_track.text
+    assert created_track.json()["track"]["part_id"] is None
+    assert created_track.json()["track"]["contribution_kind"] == "vocal_part"
     track_id = created_track.json()["track"]["id"]
     assert created_track.json()["upload_status"] == "upload_required"
     assert created_track.json()["upload"]["url"] == f"/v2/chorus-tracks/{track_id}/content"
