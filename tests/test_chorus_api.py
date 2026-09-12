@@ -14,7 +14,13 @@ from sqlalchemy.orm import Session
 from rhythm_metadata_api.application.catalog_service import ActorContext
 from rhythm_metadata_api.core.config import Settings
 from rhythm_metadata_api.domain.v2.errors import V2NotFound
-from rhythm_metadata_api.infrastructure.db.models import Arrangement, Score, ScoreRevision, Work
+from rhythm_metadata_api.infrastructure.db.models import (
+    Arrangement,
+    ChorusTrack,
+    Score,
+    ScoreRevision,
+    Work,
+)
 from rhythm_metadata_api.main import create_app
 
 TOKEN = "test-private-catalog-token"
@@ -246,6 +252,89 @@ def test_chorus_upload_process_publish_and_mix(client: TestClient) -> None:
     )
     assert automatic_submitted.status_code == 200, automatic_submitted.text
     assert automatic_submitted.json()["status"] == "published"
+
+
+def test_score_revisions_share_project_but_cannot_cross_mix(client: TestClient) -> None:
+    work_id, arrangement_id, score_id, first_revision_id = _catalog_timeline(client)
+    with Session(client.app.state.v2_container.engine) as session, session.begin():
+        second_revision = ScoreRevision(
+            score_id=score_id,
+            revision_no=2,
+            based_on_revision_id=first_revision_id,
+        )
+        session.add(second_revision)
+        session.flush()
+        second_revision_id = second_revision.id
+
+    first = _post(
+        client,
+        f"/v2/works/{work_id}/chorus-projects",
+        "timeline-project-first",
+        {
+            "arrangement_id": arrangement_id,
+            "alignment_score_revision_id": first_revision_id,
+            "timeline_hash": "a" * 64,
+            "title": "Versioned chorus",
+        },
+    )
+    second = _post(
+        client,
+        f"/v2/works/{work_id}/chorus-projects",
+        "timeline-project-second",
+        {
+            "arrangement_id": arrangement_id,
+            "alignment_score_revision_id": second_revision_id,
+            "timeline_hash": "b" * 64,
+            "title": "Versioned chorus",
+        },
+    )
+    assert first.status_code == 201, first.text
+    assert second.status_code == 200, second.text
+    assert second.json()["id"] == first.json()["id"]
+    assert second.json()["score_id"] == score_id
+    assert {item["score_revision_id"] for item in second.json()["timelines"]} == {
+        first_revision_id,
+        second_revision_id,
+    }
+
+    project_id = first.json()["id"]
+    timeline_by_revision = {
+        item["score_revision_id"]: item["id"] for item in second.json()["timelines"]
+    }
+    track_ids: list[str] = []
+    for index, revision_id in enumerate((first_revision_id, second_revision_id), start=1):
+        audio = _wav_bytes(100 + index)
+        created = _post(
+            client,
+            f"/v2/chorus-projects/{project_id}/tracks",
+            f"timeline-track-{index}",
+            {
+                "chorus_timeline_id": timeline_by_revision[revision_id],
+                "contribution_kind": "other",
+                "display_label": f"Revision {index}",
+                "sha256": hashlib.sha256(audio).hexdigest(),
+                "byte_size": len(audio),
+                "media_type": "audio/wav",
+                "original_filename": f"revision-{index}.wav",
+                "duration_ms": 100 + index,
+                "rights_confirmed": True,
+            },
+        )
+        assert created.status_code == 201, created.text
+        track_ids.append(created.json()["track"]["id"])
+
+    with Session(client.app.state.v2_container.engine) as session, session.begin():
+        for track_id in track_ids:
+            session.get(ChorusTrack, track_id).status = "published"
+
+    mixed = _post(
+        client,
+        f"/v2/chorus-projects/{project_id}/mixes:resolve",
+        "timeline-cross-mix",
+        {"track_ids": track_ids},
+    )
+    assert mixed.status_code == 422, mixed.text
+    assert "same score revision" in mixed.text
 
 
 def test_non_owner_cannot_read_draft_or_withdraw_track(client: TestClient) -> None:

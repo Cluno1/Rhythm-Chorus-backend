@@ -113,7 +113,10 @@ def submit_chorus_track(
     result = service.submit_track(track_id, require_idempotency(idempotency_key), actor)
     if result.body.get("status") == "published":
         background_tasks.add_task(
-            _prepare_default_mix, service, str(result.body["chorus_project_id"])
+            _prepare_default_mix,
+            service,
+            str(result.body["chorus_project_id"]),
+            str(result.body["chorus_timeline_id"]),
         )
     return stored_response(result)
 
@@ -129,12 +132,19 @@ def moderate_chorus_track(
 ) -> Response:
     item = service.moderate_track(track_id, body, require_if_match(if_match), actor)
     if item.status == "published":
-        background_tasks.add_task(_prepare_default_mix, service, item.chorus_project_id)
+        background_tasks.add_task(
+            _prepare_default_mix,
+            service,
+            item.chorus_project_id,
+            item.chorus_timeline_id,
+        )
     return model_response(item, headers={"ETag": f'"rev-{item.revision}"'})
 
 
-def _prepare_default_mix(service: ChorusService, project_id: str) -> None:
-    mix_id = service.resolve_default_mix(project_id)
+def _prepare_default_mix(
+    service: ChorusService, project_id: str, chorus_timeline_id: str
+) -> None:
+    mix_id = service.resolve_default_mix(project_id, chorus_timeline_id)
     if mix_id is not None:
         service.render_mix(mix_id)
 

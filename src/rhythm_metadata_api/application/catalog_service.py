@@ -92,6 +92,7 @@ from rhythm_metadata_api.infrastructure.db.models import (
     ChangeEvent,
     ChangeEventWork,
     ChorusProject,
+    ChorusTimeline,
     Contributor,
     IdempotencyKey,
     LyricSourceDocument,
@@ -1013,15 +1014,13 @@ class CatalogService:
         )
         if template is None:
             return
-        existing = session.scalar(
-            select(ChorusProject.id).where(
+        project = session.scalar(
+            select(ChorusProject).where(
                 ChorusProject.work_id == work_id,
-                ChorusProject.alignment_score_revision_id == score_revision.id,
+                ChorusProject.score_id == score.id,
                 ChorusProject.deleted_at.is_(None),
             )
         )
-        if existing is not None:
-            return
         timeline_hash = session.scalar(
             select(Asset.sha256)
             .join(ScoreRevisionAsset, ScoreRevisionAsset.asset_id == Asset.id)
@@ -1034,16 +1033,40 @@ class CatalogService:
         )
         if timeline_hash is None:
             raise V2Conflict("published score revision has no ready primary MusicXML")
-        project = ChorusProject(
-            work_id=work_id,
-            arrangement_id=score.arrangement_id,
-            alignment_score_revision_id=score_revision.id,
-            timeline_hash=timeline_hash,
-            title=template.title,
-            status="open",
-            created_by_user_id=actor.actor_id,
+        if project is None:
+            project = ChorusProject(
+                work_id=work_id,
+                arrangement_id=score.arrangement_id,
+                score_id=score.id,
+                alignment_score_revision_id=score_revision.id,
+                timeline_hash=timeline_hash,
+                title=template.title,
+                status="open",
+                created_by_user_id=actor.actor_id,
+            )
+            session.add(project)
+            session.flush()
+            operation = "chorus_project.created"
+        else:
+            existing_timeline = session.scalar(
+                select(ChorusTimeline.id).where(
+                    ChorusTimeline.chorus_project_id == project.id,
+                    ChorusTimeline.score_revision_id == score_revision.id,
+                    ChorusTimeline.deleted_at.is_(None),
+                )
+            )
+            if existing_timeline is not None:
+                return
+            project.revision += 1
+            project.updated_at = utc_now()
+            operation = "chorus_timeline.created"
+        session.add(
+            ChorusTimeline(
+                chorus_project_id=project.id,
+                score_revision_id=score_revision.id,
+                timeline_hash=timeline_hash,
+            )
         )
-        session.add(project)
         session.flush()
         self._append_event(
             session,
@@ -1051,7 +1074,7 @@ class CatalogService:
             "chorus_project",
             project.id,
             project.revision,
-            "chorus_project.created",
+            operation,
             actor,
             {"source": "score_revision_published", "score_revision_id": score_revision.id},
         )

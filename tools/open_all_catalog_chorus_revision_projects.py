@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Open one chorus project for every selectable Catalog score revision."""
+"""Ensure one chorus project per Score and one timeline per selectable revision."""
 
 from __future__ import annotations
 
@@ -15,9 +15,10 @@ from urllib.request import Request, urlopen
 
 
 @dataclass(frozen=True)
-class ProjectPlan:
+class TimelinePlan:
     work_id: str
     arrangement_id: str
+    score_id: str
     score_revision_id: str
     revision_no: int
     timeline_hash: str
@@ -93,22 +94,28 @@ def build_plan(
     api_base: str,
     token: str,
     works: list[dict[str, Any]],
-) -> tuple[list[ProjectPlan], int, int]:
-    plans: list[ProjectPlan] = []
-    existing = 0
+) -> tuple[list[TimelinePlan], int, int, int, int]:
+    plans: list[TimelinePlan] = []
+    existing_projects = 0
+    existing_timelines = 0
     selectable = 0
+    missing_project_keys: set[tuple[str, str]] = set()
     for work in works:
         work_id = work["work_id"]
         chorus, _ = request_json(api_base, token, "GET", f"/v2/works/{work_id}/chorus")
-        existing_revision_ids = {
-            project["alignment_score_revision_id"] for project in chorus["projects"]
-        }
-        seen_revision_ids: set[str] = set()
+        projects_by_score = {project["score_id"]: project for project in chorus["projects"]}
+        existing_projects += len(projects_by_score)
         for option in work["score_options"]:
+            score_id = option["score_id"]
+            project = projects_by_score.get(score_id)
+            existing_revision_ids = {
+                timeline["score_revision_id"] for timeline in (project or {}).get("timelines", [])
+            }
+            seen_revision_ids: set[str] = set()
             for revision in revision_chain(
                 api_base,
                 token,
-                option["score_id"],
+                score_id,
                 option["revision_id"],
             ):
                 revision_id = revision["id"]
@@ -117,8 +124,10 @@ def build_plan(
                 seen_revision_ids.add(revision_id)
                 selectable += 1
                 if revision_id in existing_revision_ids:
-                    existing += 1
+                    existing_timelines += 1
                     continue
+                if project is None:
+                    missing_project_keys.add((work_id, score_id))
                 primary_assets = [
                     asset for asset in revision["assets"] if asset["role"] == "primary_musicxml"
                 ]
@@ -134,15 +143,22 @@ def build_plan(
                         f"ScoreRevision {revision_id} has an invalid MusicXML SHA-256"
                     )
                 plans.append(
-                    ProjectPlan(
+                    TimelinePlan(
                         work_id=work_id,
                         arrangement_id=option["arrangement_id"],
+                        score_id=score_id,
                         score_revision_id=revision_id,
                         revision_no=revision["revision_no"],
                         timeline_hash=timeline_hash,
                     )
                 )
-    return plans, existing, selectable
+    return (
+        plans,
+        existing_projects,
+        existing_timelines,
+        len(missing_project_keys),
+        selectable,
+    )
 
 
 def main() -> int:
@@ -157,8 +173,14 @@ def main() -> int:
         raise RuntimeError("RHYTHM_BOOTSTRAP_TOKEN is required")
 
     works = catalog_works(args.api_base, token)
-    plans, existing, selectable = build_plan(args.api_base, token, works)
-    created = 0
+    (
+        plans,
+        existing_projects,
+        existing_timelines,
+        planned_projects,
+        selectable,
+    ) = build_plan(args.api_base, token, works)
+    ensured_timelines = 0
     if args.apply:
         for plan in plans:
             _, status = request_json(
@@ -173,14 +195,14 @@ def main() -> int:
                     "title": args.title,
                     "status": "open",
                 },
-                f"issue80-open-version-{plan.work_id}-{plan.score_revision_id}",
+                f"issue80-ensure-timeline-{plan.work_id}-{plan.score_id}-{plan.score_revision_id}",
             )
-            if status != 201:
+            if status not in {200, 201}:
                 raise RuntimeError(
                     f"unexpected create status {status} for Work {plan.work_id} "
                     f"revision {plan.revision_no}"
                 )
-            created += 1
+            ensured_timelines += 1
 
     print(
         json.dumps(
@@ -188,9 +210,11 @@ def main() -> int:
                 "mode": "apply" if args.apply else "plan",
                 "catalog_works": len(works),
                 "selectable_revisions": selectable,
-                "existing": existing,
-                "planned": len(plans),
-                "created": created,
+                "existing_projects": existing_projects,
+                "existing_timelines": existing_timelines,
+                "planned_projects": planned_projects,
+                "planned_timelines": len(plans),
+                "ensured_timelines": ensured_timelines,
             },
             ensure_ascii=False,
             sort_keys=True,

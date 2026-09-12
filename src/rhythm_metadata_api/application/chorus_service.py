@@ -37,6 +37,7 @@ from rhythm_metadata_api.domain.v2.chorus import (
     ChorusProjectCreate,
     ChorusProjectResponse,
     ChorusSyncAnchor,
+    ChorusTimelineResponse,
     ChorusTrackAlignmentPatch,
     ChorusTrackCreate,
     ChorusTrackCreateResponse,
@@ -61,6 +62,7 @@ from rhythm_metadata_api.infrastructure.db.models import (
     ChorusMixVariant,
     ChorusModerationSettings,
     ChorusProject,
+    ChorusTimeline,
     ChorusTrack,
     IdempotencyKey,
     Part,
@@ -215,9 +217,54 @@ class ChorusService:
             score = session.get(Score, score_revision.score_id)
             if score is None or score.arrangement_id != arrangement.id:
                 raise V2DomainError("alignment score revision does not belong to the arrangement")
+            existing = session.scalar(
+                select(ChorusProject).where(
+                    ChorusProject.work_id == work.id,
+                    ChorusProject.score_id == score.id,
+                    ChorusProject.deleted_at.is_(None),
+                )
+            )
+            if existing is not None:
+                timeline = session.scalar(
+                    select(ChorusTimeline).where(
+                        ChorusTimeline.chorus_project_id == existing.id,
+                        ChorusTimeline.score_revision_id == score_revision.id,
+                        ChorusTimeline.deleted_at.is_(None),
+                    )
+                )
+                if timeline is None:
+                    session.add(
+                        ChorusTimeline(
+                            chorus_project_id=existing.id,
+                            score_revision_id=score_revision.id,
+                            timeline_hash=request.timeline_hash,
+                        )
+                    )
+                    session.flush()
+                    existing.revision += 1
+                    existing.updated_at = utc_now()
+                    self._append_event(
+                        session,
+                        work.id,
+                        "chorus_project",
+                        existing.id,
+                        existing.revision,
+                        "chorus_timeline.created",
+                        actor,
+                        {"score_revision_id": score_revision.id},
+                    )
+                return (
+                    self._project_response(session, existing, actor),
+                    200,
+                    {
+                        "Location": f"/v2/chorus-projects/{existing.id}",
+                        "ETag": etag(existing.revision),
+                    },
+                )
             project = ChorusProject(
                 work_id=work.id,
                 arrangement_id=arrangement.id,
+                score_id=score.id,
                 alignment_score_revision_id=score_revision.id,
                 timeline_hash=request.timeline_hash,
                 title=request.title.strip(),
@@ -225,6 +272,14 @@ class ChorusService:
                 created_by_user_id=actor.actor_id,
             )
             session.add(project)
+            session.flush()
+            session.add(
+                ChorusTimeline(
+                    chorus_project_id=project.id,
+                    score_revision_id=score_revision.id,
+                    timeline_hash=request.timeline_hash,
+                )
+            )
             session.flush()
             self._append_event(
                 session,
@@ -262,6 +317,9 @@ class ChorusService:
                 raise V2Conflict("chorus project is not open for contributions")
             if self.settings.environment != "development" and not self.settings.chorus_cos_bucket:
                 raise V2Conflict("chorus COS storage is required outside development")
+            timeline = self._timeline_for_request(
+                session, project, request.chorus_timeline_id
+            )
             self._ensure_actor_user(session, actor)
             if request.part_id is not None:
                 part = session.get(Part, request.part_id)
@@ -281,6 +339,7 @@ class ChorusService:
             session.flush()
             track = ChorusTrack(
                 chorus_project_id=project.id,
+                chorus_timeline_id=timeline.id,
                 rendition_id=rendition.id,
                 uploader_user_id=actor.actor_id,
                 part_id=request.part_id,
@@ -294,7 +353,7 @@ class ChorusService:
             session.flush()
             self._replace_anchors(
                 session,
-                project.alignment_score_revision_id,
+                timeline.score_revision_id,
                 rendition.id,
                 request.initial_anchors,
             )
@@ -662,9 +721,10 @@ class ChorusService:
             track = self._require_owned_track(uow.session, track_id, actor)
             require_revision(track.revision, expected_revision)
             project = self._require_project(uow.session, track.chorus_project_id)
+            timeline = self._require_timeline(uow.session, track.chorus_timeline_id)
             self._replace_anchors(
                 uow.session,
-                project.alignment_score_revision_id,
+                timeline.score_revision_id,
                 track.rendition_id,
                 request.anchors,
             )
@@ -672,7 +732,7 @@ class ChorusService:
             track.alignment_state = "manual"
             track.revision += 1
             track.updated_at = utc_now()
-            self._obsolete_project_mixes(uow.session, project.id)
+            self._obsolete_timeline_mixes(uow.session, timeline.id)
             self._append_event(
                 uow.session,
                 project.work_id,
@@ -749,7 +809,7 @@ class ChorusService:
             track.revision += 1
             track.updated_at = utc_now()
             project = self._require_project(uow.session, track.chorus_project_id)
-            self._obsolete_project_mixes(uow.session, project.id)
+            self._obsolete_timeline_mixes(uow.session, track.chorus_timeline_id)
             self._append_event(
                 uow.session,
                 project.work_id,
@@ -770,7 +830,7 @@ class ChorusService:
             track.revision += 1
             track.updated_at = utc_now()
             project = self._require_project(uow.session, track.chorus_project_id)
-            self._obsolete_project_mixes(uow.session, project.id)
+            self._obsolete_timeline_mixes(uow.session, track.chorus_timeline_id)
             self._append_event(
                 uow.session,
                 project.work_id,
@@ -798,10 +858,21 @@ class ChorusService:
                 for track in tracks
             ):
                 raise V2DomainError("all selected tracks must be published in this project")
+            timeline_ids = {track.chorus_timeline_id for track in tracks}
+            if len(timeline_ids) != 1:
+                raise V2DomainError("all selected tracks must use the same score revision")
+            inferred_timeline_id = next(iter(timeline_ids))
+            if (
+                request.chorus_timeline_id is not None
+                and request.chorus_timeline_id != inferred_timeline_id
+            ):
+                raise V2DomainError("selected tracks do not belong to the requested timeline")
+            timeline = self._timeline_for_request(session, project, inferred_timeline_id)
             selection_hash = chorus_selection_hash(tracks)
             existing = session.scalar(
                 select(ChorusMixVariant).where(
                     ChorusMixVariant.chorus_project_id == project.id,
+                    ChorusMixVariant.chorus_timeline_id == timeline.id,
                     ChorusMixVariant.selection_hash == selection_hash,
                     ChorusMixVariant.mix_profile == MIX_PROFILE,
                 )
@@ -814,6 +885,7 @@ class ChorusService:
                 )
             mix = ChorusMixVariant(
                 chorus_project_id=project.id,
+                chorus_timeline_id=timeline.id,
                 selection_hash=selection_hash,
                 selected_track_ids=sorted(request.track_ids),
                 selected_track_count=len(request.track_ids),
@@ -832,12 +904,17 @@ class ChorusService:
             operation,
         )
 
-    def resolve_default_mix(self, project_id: str) -> str | None:
+    def resolve_default_mix(
+        self, project_id: str, chorus_timeline_id: str | None = None
+    ) -> str | None:
         with self.uow_factory() as uow:
+            project = self._require_project(uow.session, project_id)
+            timeline = self._timeline_for_request(uow.session, project, chorus_timeline_id)
             tracks = list(
                 uow.session.scalars(
                     select(ChorusTrack).where(
                         ChorusTrack.chorus_project_id == project_id,
+                        ChorusTrack.chorus_timeline_id == timeline.id,
                         ChorusTrack.status == "published",
                         ChorusTrack.deleted_at.is_(None),
                     )
@@ -847,7 +924,10 @@ class ChorusService:
             return None
         response = self.resolve_mix(
             project_id,
-            ChorusMixResolveRequest(track_ids=[track.id for track in tracks]),
+            ChorusMixResolveRequest(
+                chorus_timeline_id=timeline.id,
+                track_ids=[track.id for track in tracks],
+            ),
             f"default:{chorus_selection_hash(tracks)}",
             ActorContext(actor_id="chorus-worker"),
         )
@@ -874,6 +954,8 @@ class ChorusService:
                         track = self._require_track(uow.session, track_id)
                         if track.status != "published":
                             raise V2Conflict("a selected track is no longer published")
+                        if track.chorus_timeline_id != mix.chorus_timeline_id:
+                            raise V2Conflict("a selected track belongs to another score revision")
                         asset_id = self._preferred_track_asset_id(uow.session, track.rendition_id)
                         if asset_id is None:
                             raise V2Conflict("a selected track has no playable Asset")
@@ -1175,10 +1257,22 @@ class ChorusService:
             if track.status == "published"
             or (track.uploader_user_id == actor.actor_id and track.status != "withdrawn")
         ]
+        timelines = list(
+            session.scalars(
+                select(ChorusTimeline)
+                .join(ScoreRevision, ScoreRevision.id == ChorusTimeline.score_revision_id)
+                .where(
+                    ChorusTimeline.chorus_project_id == project.id,
+                    ChorusTimeline.deleted_at.is_(None),
+                )
+                .order_by(ScoreRevision.revision_no.desc(), ChorusTimeline.id)
+            )
+        )
         return ChorusProjectResponse(
             id=project.id,
             work_id=project.work_id,
             arrangement_id=project.arrangement_id,
+            score_id=project.score_id,
             alignment_score_revision_id=project.alignment_score_revision_id,
             timeline_hash=project.timeline_hash,
             title=project.title,
@@ -1193,6 +1287,18 @@ class ChorusService:
                 )
                 for part in parts
             ],
+            timelines=[
+                ChorusTimelineResponse(
+                    id=timeline.id,
+                    chorus_project_id=timeline.chorus_project_id,
+                    score_revision_id=timeline.score_revision_id,
+                    timeline_hash=timeline.timeline_hash,
+                    revision=timeline.revision,
+                    created_at=timeline.created_at,
+                    updated_at=timeline.updated_at,
+                )
+                for timeline in timelines
+            ],
             tracks=[self._track_response(session, track, actor) for track in visible],
             created_at=project.created_at,
             updated_at=project.updated_at,
@@ -1205,13 +1311,21 @@ class ChorusService:
         anchors = list(
             session.scalars(
                 select(ScoreRenditionSync)
-                .where(ScoreRenditionSync.rendition_id == track.rendition_id)
+                .join(
+                    ChorusTimeline,
+                    ChorusTimeline.score_revision_id == ScoreRenditionSync.score_revision_id,
+                )
+                .where(
+                    ScoreRenditionSync.rendition_id == track.rendition_id,
+                    ChorusTimeline.id == track.chorus_timeline_id,
+                )
                 .order_by(ScoreRenditionSync.anchor_order)
             )
         )
         return ChorusTrackResponse(
             id=track.id,
             chorus_project_id=track.chorus_project_id,
+            chorus_timeline_id=track.chorus_timeline_id,
             rendition_id=track.rendition_id,
             uploader_display_name=(user.display_name if user else None) or "Sonorus user",
             owned_by_requester=track.uploader_user_id == actor.actor_id,
@@ -1251,6 +1365,7 @@ class ChorusService:
         return ChorusMixResponse(
             id=mix.id,
             chorus_project_id=mix.chorus_project_id,
+            chorus_timeline_id=mix.chorus_timeline_id,
             selection_hash=mix.selection_hash,
             selected_track_ids=list(mix.selected_track_ids),
             selected_track_count=mix.selected_track_count,
@@ -1333,10 +1448,10 @@ class ChorusService:
             session.flush()
 
     @staticmethod
-    def _obsolete_project_mixes(session: Session, project_id: str) -> None:
+    def _obsolete_timeline_mixes(session: Session, timeline_id: str) -> None:
         for mix in session.scalars(
             select(ChorusMixVariant).where(
-                ChorusMixVariant.chorus_project_id == project_id,
+                ChorusMixVariant.chorus_timeline_id == timeline_id,
                 ChorusMixVariant.state.in_(("queued", "processing", "ready")),
             )
         ):
@@ -1396,6 +1511,38 @@ class ChorusService:
         item = session.get(ChorusProject, project_id)
         if item is None or item.deleted_at is not None:
             raise V2NotFound("chorus project not found")
+        return item
+
+    @staticmethod
+    def _require_timeline(session: Session, timeline_id: str) -> ChorusTimeline:
+        item = session.get(ChorusTimeline, timeline_id)
+        if item is None or item.deleted_at is not None:
+            raise V2NotFound("chorus timeline not found")
+        return item
+
+    @staticmethod
+    def _timeline_for_request(
+        session: Session,
+        project: ChorusProject,
+        timeline_id: str | None,
+    ) -> ChorusTimeline:
+        if timeline_id is None:
+            item = session.scalar(
+                select(ChorusTimeline).where(
+                    ChorusTimeline.chorus_project_id == project.id,
+                    ChorusTimeline.score_revision_id
+                    == project.alignment_score_revision_id,
+                    ChorusTimeline.deleted_at.is_(None),
+                )
+            )
+        else:
+            item = session.get(ChorusTimeline, timeline_id)
+        if (
+            item is None
+            or item.deleted_at is not None
+            or item.chorus_project_id != project.id
+        ):
+            raise V2DomainError("chorus timeline does not belong to the project")
         return item
 
     @staticmethod

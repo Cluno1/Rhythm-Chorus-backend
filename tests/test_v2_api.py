@@ -13,6 +13,7 @@ from rhythm_metadata_api.infrastructure.db.models import (
     Asset,
     AssetLocation,
     ChorusProject,
+    ChorusTimeline,
     Contributor,
     Release,
     ReleaseItem,
@@ -131,21 +132,32 @@ def test_publishing_revision_opens_matching_chorus_project(client: TestClient) -
                     asset_id=second_asset.id,
                     role="primary_musicxml",
                 ),
-                ChorusProject(
-                    work_id=work.id,
-                    arrangement_id=arrangement.id,
-                    alignment_score_revision_id=first_revision.id,
-                    timeline_hash=first_asset.sha256,
-                    title="在线合唱",
-                    status="open",
-                    created_by_user_id="owner",
-                ),
             ]
+        )
+        project = ChorusProject(
+            work_id=work.id,
+            arrangement_id=arrangement.id,
+            score_id=score.id,
+            alignment_score_revision_id=first_revision.id,
+            timeline_hash=first_asset.sha256,
+            title="在线合唱",
+            status="open",
+            created_by_user_id="owner",
+        )
+        session.add(project)
+        session.flush()
+        session.add(
+            ChorusTimeline(
+                chorus_project_id=project.id,
+                score_revision_id=first_revision.id,
+                timeline_hash=first_asset.sha256,
+            )
         )
         score.head_revision_id = second_revision.id
         score.published_revision_id = first_revision.id
         work_id = work.id
         score_id = score.id
+        first_revision_id = first_revision.id
         second_revision_id = second_revision.id
 
     published = client.patch(
@@ -158,13 +170,20 @@ def test_publishing_revision_opens_matching_chorus_project(client: TestClient) -
     chorus = client.get(f"/v2/works/{work_id}/chorus", headers=AUTH)
     assert chorus.status_code == 200, chorus.text
     projects = chorus.json()["projects"]
-    assert len(projects) == 2
+    assert len(projects) == 1
+    project = projects[0]
+    assert project["score_id"] == score_id
+    assert project["alignment_score_revision_id"] != second_revision_id
+    assert {item["score_revision_id"] for item in project["timelines"]} == {
+        first_revision_id,
+        second_revision_id,
+    }
     generated = next(
-        item for item in projects if item["alignment_score_revision_id"] == second_revision_id
+        item for item in project["timelines"] if item["score_revision_id"] == second_revision_id
     )
     assert generated["timeline_hash"] == "b" * 64
-    assert generated["title"] == "在线合唱"
-    assert generated["status"] == "open"
+    assert project["title"] == "在线合唱"
+    assert project["status"] == "open"
 
 
 def test_asset_delivery_and_native_library_projection(client: TestClient) -> None:

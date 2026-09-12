@@ -500,6 +500,9 @@ class ChorusProject(RevisionedMixin, Base):
     arrangement_id: Mapped[str] = mapped_column(
         ForeignKey("v2_arrangements.id", ondelete="CASCADE"), nullable=False
     )
+    score_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_scores.id", ondelete="CASCADE"), nullable=False
+    )
     alignment_score_revision_id: Mapped[str] = mapped_column(
         ForeignKey("v2_score_revisions.id", ondelete="RESTRICT"), nullable=False
     )
@@ -515,6 +518,29 @@ class ChorusProject(RevisionedMixin, Base):
         ),
         Index("v2_chorus_projects_work_idx", "work_id", "status"),
         Index("v2_chorus_projects_arrangement_idx", "arrangement_id"),
+        Index("v2_chorus_projects_score_idx", "work_id", "score_id"),
+    )
+
+
+class ChorusTimeline(RevisionedMixin, Base):
+    __tablename__ = "v2_chorus_timelines"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    chorus_project_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_chorus_projects.id", ondelete="CASCADE"), nullable=False
+    )
+    score_revision_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_score_revisions.id", ondelete="RESTRICT"), nullable=False
+    )
+    timeline_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "chorus_project_id",
+            "score_revision_id",
+            name="uq_v2_chorus_timeline_revision",
+        ),
+        Index("v2_chorus_timelines_project_idx", "chorus_project_id", "score_revision_id"),
     )
 
 
@@ -524,6 +550,9 @@ class ChorusTrack(RevisionedMixin, Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     chorus_project_id: Mapped[str] = mapped_column(
         ForeignKey("v2_chorus_projects.id", ondelete="CASCADE"), nullable=False
+    )
+    chorus_timeline_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_chorus_timelines.id", ondelete="CASCADE"), nullable=False
     )
     rendition_id: Mapped[str] = mapped_column(
         ForeignKey("v2_renditions.id", ondelete="CASCADE"), nullable=False, unique=True
@@ -580,6 +609,7 @@ class ChorusTrack(RevisionedMixin, Base):
             name="chorus_track_duration",
         ),
         Index("v2_chorus_tracks_project_idx", "chorus_project_id", "status"),
+        Index("v2_chorus_tracks_timeline_idx", "chorus_timeline_id", "status"),
         Index("v2_chorus_tracks_uploader_idx", "uploader_user_id", "status"),
     )
 
@@ -647,6 +677,9 @@ class ChorusMixVariant(Base):
     chorus_project_id: Mapped[str] = mapped_column(
         ForeignKey("v2_chorus_projects.id", ondelete="CASCADE"), nullable=False
     )
+    chorus_timeline_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_chorus_timelines.id", ondelete="CASCADE"), nullable=False
+    )
     selection_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     selected_track_ids: Mapped[list[str]] = mapped_column(
         JSON, nullable=False, default=list, server_default=text("'[]'")
@@ -676,6 +709,7 @@ class ChorusMixVariant(Base):
             name="chorus_mix_state",
         ),
         Index("v2_chorus_mix_project_idx", "chorus_project_id", "state"),
+        Index("v2_chorus_mix_timeline_idx", "chorus_timeline_id", "state"),
     )
 
 

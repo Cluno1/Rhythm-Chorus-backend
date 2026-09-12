@@ -46,6 +46,7 @@ class ChorusSyncAnchor(ChorusApiModel):
 class ChorusTrackResponse(ChorusApiModel):
     id: str
     chorus_project_id: str
+    chorus_timeline_id: str
     rendition_id: str
     uploader_display_name: str
     owned_by_requester: bool
@@ -67,16 +68,29 @@ class ChorusTrackResponse(ChorusApiModel):
     updated_at: datetime
 
 
+class ChorusTimelineResponse(ChorusApiModel):
+    id: str
+    chorus_project_id: str
+    score_revision_id: str
+    timeline_hash: str
+    revision: int
+    created_at: datetime
+    updated_at: datetime
+
+
 class ChorusProjectResponse(ChorusApiModel):
     id: str
     work_id: str
     arrangement_id: str
+    score_id: str
+    # Kept as the legacy/default timeline for clients released before Issue 80.
     alignment_score_revision_id: str
     timeline_hash: str
     title: str
     status: str
     revision: int
     parts: list[ChorusPartResponse]
+    timelines: list[ChorusTimelineResponse]
     tracks: list[ChorusTrackResponse]
     created_at: datetime
     updated_at: datetime
@@ -88,6 +102,7 @@ class WorkChorusResponse(ChorusApiModel):
 
 
 class ChorusTrackCreate(ChorusApiModel):
+    chorus_timeline_id: str | None = None
     part_id: str | None = None
     contribution_kind: Literal["vocal_part", "harmony", "guitar", "piano", "percussion", "other"]
     display_label: str = Field(min_length=1, max_length=300)
@@ -187,6 +202,7 @@ class ChorusModerationQueueResponse(ChorusApiModel):
 
 
 class ChorusMixResolveRequest(ChorusApiModel):
+    chorus_timeline_id: str | None = None
     track_ids: list[str] = Field(min_length=1, max_length=50)
 
     @field_validator("track_ids")
@@ -200,6 +216,7 @@ class ChorusMixResolveRequest(ChorusApiModel):
 class ChorusMixResponse(ChorusApiModel):
     id: str
     chorus_project_id: str
+    chorus_timeline_id: str
     selection_hash: str
     selected_track_ids: list[str]
     selected_track_count: int
