@@ -109,12 +109,8 @@ def enrollment_canonical(
     ).encode()
 
 
-def refresh_canonical(
-    device_id: str, session_id: str, timestamp: int, nonce: str
-) -> bytes:
-    return (
-        f"RHYTHM-REFRESH-V1\n{device_id}\n{session_id}\n{timestamp}\n{nonce}"
-    ).encode()
+def refresh_canonical(device_id: str, session_id: str, timestamp: int, nonce: str) -> bytes:
+    return (f"RHYTHM-REFRESH-V1\n{device_id}\n{session_id}\n{timestamp}\n{nonce}").encode()
 
 
 def request_canonical(
@@ -164,7 +160,9 @@ class DeviceAuthService:
             if not secrets.compare_digest(expected, _b64url_decode(supplied)):
                 raise ValueError
             claims = json.loads(_b64url_decode(payload))
-            if claims.get("typ") != expected_type or int(claims["exp"]) <= int(utc_now().timestamp()):
+            if claims.get("typ") != expected_type or int(claims["exp"]) <= int(
+                utc_now().timestamp()
+            ):
                 raise ValueError
             return claims
         except (ValueError, KeyError, TypeError, json.JSONDecodeError):
@@ -208,7 +206,9 @@ class DeviceAuthService:
                 session.commit()
                 raise DeviceAuthError(429, "too many admin login attempts")
             valid = secrets.compare_digest(username, self.settings.public_admin_username)
-            valid = verify_admin_password(password, self.settings.public_admin_password_hash) and valid
+            valid = (
+                verify_admin_password(password, self.settings.public_admin_password_hash) and valid
+            )
             if not valid:
                 self._audit(
                     session, "admin_login", "failure", actor_type="admin", source_ip=source_ip
@@ -309,7 +309,9 @@ class DeviceAuthService:
             der = _b64url_decode(public_key_spki)
             key = serialization.load_der_public_key(der)
         except (ValueError, TypeError):
-            raise DeviceAuthError(422, "public key must be base64url DER SubjectPublicKeyInfo") from None
+            raise DeviceAuthError(
+                422, "public key must be base64url DER SubjectPublicKeyInfo"
+            ) from None
         if not isinstance(key, ec.EllipticCurvePublicKey) or not isinstance(
             key.curve, ec.SECP256R1
         ):
@@ -392,10 +394,15 @@ class DeviceAuthService:
             invite = self._active_invite(session, invite_code)
             self._consume_nonce(session, nonce, "enroll")
             certificate = signing_certificate_sha256.replace(":", "").lower()
-            if application_id not in {
-                "io.github.cluno1.sonorus",
-                "io.github.cluno1.sonorus.debug",
-            } or len(certificate) != 64 or any(c not in "0123456789abcdef" for c in certificate):
+            if (
+                application_id
+                not in {
+                    "io.github.cluno1.sonorus",
+                    "io.github.cluno1.sonorus.debug",
+                }
+                or len(certificate) != 64
+                or any(c not in "0123456789abcdef" for c in certificate)
+            ):
                 raise DeviceAuthError(422, "invalid Sonorus application identity")
             active = session.scalar(
                 select(RegisteredDevice).where(
@@ -463,7 +470,9 @@ class DeviceAuthService:
                 raise DeviceAuthError(409, "device or user is already registered") from None
         return EnrollmentResult(principal, self._access_token(principal), session_expires)
 
-    def require_device_token(self, token: str, expected_device_id: str | None = None) -> DevicePrincipal:
+    def require_device_token(
+        self, token: str, expected_device_id: str | None = None
+    ) -> DevicePrincipal:
         claims = self._claims(token, "device")
         principal = DevicePrincipal(
             user_id=str(claims["sub"]),
@@ -485,6 +494,14 @@ class DeviceAuthService:
         if required_scope not in scopes:
             raise DeviceAuthError(403, "device token does not grant the required scope")
 
+    def require_administrator(self, principal: DevicePrincipal) -> str:
+        """Re-check the durable device role so grants and revocations take effect immediately."""
+        with Session(self.engine) as session:
+            device, _ = self._active_device_and_session(session, principal)
+            if not device.is_administrator:
+                raise DeviceAuthError(403, "administrator device authorization is required")
+        return principal.user_id
+
     def _active_device_and_session(
         self, session: Session, principal: DevicePrincipal
     ) -> tuple[RegisteredDevice, DeviceSession]:
@@ -494,9 +511,7 @@ class DeviceAuthService:
         if (
             device is None
             or device.user_id != principal.user_id
-            or not secrets.compare_digest(
-                device.public_key_thumbprint, principal.key_thumbprint
-            )
+            or not secrets.compare_digest(device.public_key_thumbprint, principal.key_thumbprint)
             or device.application_id != principal.application_id
             or not secrets.compare_digest(
                 device.signing_certificate_sha256,
@@ -643,6 +658,36 @@ class DeviceAuthService:
                 )
             )
 
+    def list_devices(self) -> list[RegisteredDevice]:
+        with Session(self.engine) as session:
+            return list(
+                session.scalars(
+                    select(RegisteredDevice).order_by(
+                        RegisteredDevice.status,
+                        RegisteredDevice.created_at.desc(),
+                        RegisteredDevice.id,
+                    )
+                )
+            )
+
+    def set_administrator(self, device_id: str, enabled: bool, admin_id: str) -> bool:
+        with Session(self.engine) as session:
+            device = session.get(RegisteredDevice, device_id)
+            if device is None or device.status != "active":
+                raise DeviceAuthError(404, "active device not found")
+            if device.is_administrator == enabled:
+                return enabled
+            device.is_administrator = enabled
+            self._audit(
+                session,
+                "administrator_granted" if enabled else "administrator_revoked",
+                "success",
+                actor_type="admin",
+                actor_id=admin_id,
+            )
+            session.commit()
+        return enabled
+
     def revoke(self, device_id: str, admin_id: str) -> bool:
         now = utc_now()
         with Session(self.engine) as session:
@@ -650,6 +695,7 @@ class DeviceAuthService:
             if device is None or device.status != "active":
                 return False
             device.status = "revoked"
+            device.is_administrator = False
             device.revoked_at = now
             session.execute(
                 update(DeviceSession)

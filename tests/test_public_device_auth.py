@@ -234,6 +234,84 @@ def test_enroll_signed_read_replay_refresh_and_revoke(tmp_path: Path) -> None:
         assert nonce_after_revoke.status_code == 401
 
 
+def test_administrator_device_can_manage_devices_and_issue_invites_without_password(
+    tmp_path: Path,
+) -> None:
+    app = create_public_app(settings(tmp_path))
+    with TestClient(app) as client:
+        password_session = admin_token(client)
+        key = ec.generate_private_key(ec.SECP256R1())
+        credentials = enroll(client, create_invite(client, password_session), key)
+        device_id = credentials["deviceId"]
+
+        ordinary_headers = signed_headers(client, credentials, key, "/v2/admin/devices")
+        assert client.get("/v2/admin/devices", headers=ordinary_headers).status_code == 403
+
+        granted = client.post(
+            f"/v2/admin/devices/{device_id}/administrator",
+            headers={"Authorization": f"Bearer {password_session}"},
+        )
+        assert granted.status_code == 200, granted.text
+        assert granted.json() == {"deviceId": device_id, "isAdministrator": True}
+
+        administrator_headers = signed_headers(
+            client, credentials, key, "/v2/admin/devices"
+        )
+        devices = client.get("/v2/admin/devices", headers=administrator_headers)
+        assert devices.status_code == 200, devices.text
+        assert devices.json()["items"][0]["deviceId"] == device_id
+        assert devices.json()["items"][0]["isAdministrator"] is True
+
+        invite_path = "/v2/admin/invites"
+        invite_body = json.dumps(
+            {"userId": "invited-by-device", "displayName": "Device invite"},
+            separators=(",", ":"),
+        ).encode()
+        invite_headers = signed_headers(
+            client,
+            credentials,
+            key,
+            invite_path,
+            method="POST",
+            body=invite_body,
+        ) | {"Content-Type": "application/json"}
+        invitation = client.post(invite_path, content=invite_body, headers=invite_headers)
+        assert invitation.status_code == 200, invitation.text
+        assert invitation.json()["userId"] == "invited-by-device"
+
+        settings_path = "/v2/admin/chorus/moderation-settings"
+        settings_headers = signed_headers(client, credentials, key, settings_path)
+        moderation_settings = client.get(settings_path, headers=settings_headers)
+        assert moderation_settings.status_code == 200, moderation_settings.text
+        assert moderation_settings.json()["automatic_approval"] is True
+
+        settings_body = b'{"automatic_approval":false}'
+        settings_patch_headers = signed_headers(
+            client,
+            credentials,
+            key,
+            settings_path,
+            method="PATCH",
+            body=settings_body,
+        ) | {"Content-Type": "application/json"}
+        updated_settings = client.patch(
+            settings_path, content=settings_body, headers=settings_patch_headers
+        )
+        assert updated_settings.status_code == 200, updated_settings.text
+        assert updated_settings.json()["automatic_approval"] is False
+
+        demote_path = f"/v2/admin/devices/{device_id}/administrator"
+        demote_headers = signed_headers(
+            client, credentials, key, demote_path, method="DELETE"
+        )
+        demoted = client.delete(demote_path, headers=demote_headers)
+        assert demoted.status_code == 200, demoted.text
+        assert demoted.json()["isAdministrator"] is False
+
+        after_demote = signed_headers(client, credentials, key, "/v2/admin/devices")
+        assert client.get("/v2/admin/devices", headers=after_demote).status_code == 403
+
+
 def test_signed_rendition_lyric_write_hash_scope_revision_and_audit(tmp_path: Path) -> None:
     app = create_public_app(settings(tmp_path))
     with TestClient(app) as client:

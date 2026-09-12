@@ -164,9 +164,24 @@ def test_chorus_upload_process_publish_and_mix(client: TestClient) -> None:
     assert aligned.status_code == 200, aligned.text
     assert aligned.json()["alignment_state"] == "manual"
 
+    service = client.app.state.v2_container.chorus
+    assert service.moderation_settings().automatic_approval is True
+    assert (
+        service.update_moderation_settings(False, ActorContext()).automatic_approval
+        is False
+    )
+    submitted = _post(
+        client,
+        f"/v2/chorus-tracks/{track_id}/submit",
+        "track-submit-manual-review",
+        {},
+    )
+    assert submitted.status_code == 200, submitted.text
+    assert submitted.json()["status"] == "pending_review"
+
     published = client.patch(
         f"/v2/chorus-tracks/{track_id}/moderation",
-        headers={**AUTH, "If-Match": f'"rev-{aligned.json()["revision"]}"'},
+        headers={**AUTH, "If-Match": f'"rev-{submitted.json()["revision"]}"'},
         json={"status": "published", "gain_db": -1.5, "pan": 0.0},
     )
     assert published.status_code == 200, published.text
@@ -187,6 +202,50 @@ def test_chorus_upload_process_publish_and_mix(client: TestClient) -> None:
     assert ready_mix.json()["selected_track_ids"] == [track_id]
     assert ready_mix.json()["delivery"]["delivery"] == "authenticated_url"
     assert ready_mix.json()["delivery"]["media_type"] == "audio/mp4"
+
+    assert service.update_moderation_settings(True, ActorContext()).automatic_approval is True
+    automatic_audio = _wav_bytes(320)
+    automatic_track = _post(
+        client,
+        f"/v2/chorus-projects/{project_id}/tracks",
+        "automatic-track-create",
+        {
+            "contribution_kind": "harmony",
+            "display_label": "Automatically approved harmony",
+            "sha256": hashlib.sha256(automatic_audio).hexdigest(),
+            "byte_size": len(automatic_audio),
+            "media_type": "audio/wav",
+            "original_filename": "automatic.wav",
+            "duration_ms": 320,
+            "rights_confirmed": True,
+        },
+    ).json()["track"]
+    automatic_id = automatic_track["id"]
+    assert (
+        client.put(
+            f"/v2/chorus-tracks/{automatic_id}/content",
+            headers={**AUTH, "Content-Type": "audio/wav"},
+            content=automatic_audio,
+        ).status_code
+        == 200
+    )
+    assert (
+        _post(
+            client,
+            f"/v2/chorus-tracks/{automatic_id}/complete",
+            "automatic-track-complete",
+            {},
+        ).status_code
+        == 200
+    )
+    automatic_submitted = _post(
+        client,
+        f"/v2/chorus-tracks/{automatic_id}/submit",
+        "automatic-track-submit",
+        {},
+    )
+    assert automatic_submitted.status_code == 200, automatic_submitted.text
+    assert automatic_submitted.json()["status"] == "published"
 
 
 def test_non_owner_cannot_read_draft_or_withdraw_track(client: TestClient) -> None:
@@ -227,3 +286,5 @@ def test_non_owner_cannot_read_draft_or_withdraw_track(client: TestClient) -> No
     assert hidden.tracks == []
     with pytest.raises(V2NotFound):
         service.withdraw_track(track["id"], other)
+    service.withdraw_track(track["id"], ActorContext())
+    assert service.get_project(project["id"], ActorContext()).tracks == []

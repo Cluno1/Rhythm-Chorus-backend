@@ -166,6 +166,26 @@ class ChorusModerationRequest(ChorusApiModel):
         return self
 
 
+class ChorusModerationSettingsPatch(ChorusApiModel):
+    automatic_approval: bool
+
+
+class ChorusModerationSettingsResponse(ChorusApiModel):
+    automatic_approval: bool
+    updated_by: str
+    updated_at: datetime | None
+
+
+class ChorusModerationQueueItem(ChorusApiModel):
+    work_id: str
+    project_title: str
+    track: ChorusTrackResponse
+
+
+class ChorusModerationQueueResponse(ChorusApiModel):
+    items: list[ChorusModerationQueueItem]
+
+
 class ChorusMixResolveRequest(ChorusApiModel):
     track_ids: list[str] = Field(min_length=1, max_length=50)
 

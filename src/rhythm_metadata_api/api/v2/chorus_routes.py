@@ -105,13 +105,17 @@ def update_chorus_track_alignment(
 @router.post("/chorus-tracks/{track_id}/submit")
 def submit_chorus_track(
     track_id: str,
+    background_tasks: BackgroundTasks,
     service: Chorus,
     actor: Actor,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> Response:
-    return stored_response(
-        service.submit_track(track_id, require_idempotency(idempotency_key), actor)
-    )
+    result = service.submit_track(track_id, require_idempotency(idempotency_key), actor)
+    if result.body.get("status") == "published":
+        background_tasks.add_task(
+            _prepare_default_mix, service, str(result.body["chorus_project_id"])
+        )
+    return stored_response(result)
 
 
 @router.patch("/chorus-tracks/{track_id}/moderation")

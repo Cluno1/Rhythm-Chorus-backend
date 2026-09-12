@@ -7,6 +7,7 @@ def _camel(value: str) -> str:
     first, *rest = value.split("_")
     return first + "".join(part.capitalize() for part in rest)
 
+
 class CamelModel(BaseModel):
     model_config = ConfigDict(alias_generator=_camel, populate_by_name=True)
 
@@ -79,6 +80,27 @@ class DeviceStatusResponse(CamelModel):
     display_name: str | None
     status: str | None
     last_seen_at: str | None
+    is_administrator: bool = False
+
+
+class AdminDeviceResponse(CamelModel):
+    device_id: str
+    user_id: str
+    display_name: str | None
+    application_id: str
+    status: str
+    is_administrator: bool
+    created_at: str
+    last_seen_at: str | None
+
+
+class AdminDeviceListResponse(CamelModel):
+    items: list[AdminDeviceResponse]
+
+
+class AdministratorChangeResponse(CamelModel):
+    device_id: str
+    is_administrator: bool
 
 
 class RevokeResponse(CamelModel):

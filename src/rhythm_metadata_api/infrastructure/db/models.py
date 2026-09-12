@@ -584,6 +584,19 @@ class ChorusTrack(RevisionedMixin, Base):
     )
 
 
+class ChorusModerationSettings(Base):
+    __tablename__ = "v2_chorus_moderation_settings"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default="global")
+    automatic_approval: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("1")
+    )
+    updated_by: Mapped[str] = mapped_column(String(100), nullable=False, default="system")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+
 class ScoreRenditionSync(Base):
     __tablename__ = "v2_score_rendition_sync"
 
@@ -831,6 +844,9 @@ class RegisteredDevice(Base):
     key_algorithm: Mapped[str] = mapped_column(String(20), nullable=False, default="ES256")
     display_name: Mapped[str | None] = mapped_column(String(300), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    is_administrator: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

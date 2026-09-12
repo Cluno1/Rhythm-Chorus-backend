@@ -67,14 +67,33 @@ _PUBLIC_WRITE_ROUTES = (
     ("DELETE", re.compile(r"^/v2/chorus-tracks/[^/]+$")),
     ("POST", re.compile(r"^/v2/chorus-projects/[^/]+/mixes:resolve$")),
 )
+_PUBLIC_ADMIN_DEVICE_WRITE_ROUTES = (
+    ("POST", re.compile(r"^/v2/admin/invites$")),
+    ("POST", re.compile(r"^/v2/admin/devices/[^/]+/administrator$")),
+    ("DELETE", re.compile(r"^/v2/admin/devices/[^/]+/administrator$")),
+    ("POST", re.compile(r"^/v2/admin/devices/[^/]+/revoke$")),
+    ("PATCH", re.compile(r"^/v2/admin/chorus/moderation-settings$")),
+    ("PATCH", re.compile(r"^/v2/admin/chorus/tracks/[^/]+/moderation$")),
+)
 
 
 def _public_read_allowed(method: str, path: str) -> bool:
-    return any(method == expected and pattern.fullmatch(path) for expected, pattern in _PUBLIC_READ_ROUTES)
+    return any(
+        method == expected and pattern.fullmatch(path) for expected, pattern in _PUBLIC_READ_ROUTES
+    )
 
 
 def _public_write_allowed(method: str, path: str) -> bool:
-    return any(method == expected and pattern.fullmatch(path) for expected, pattern in _PUBLIC_WRITE_ROUTES)
+    return any(
+        method == expected and pattern.fullmatch(path) for expected, pattern in _PUBLIC_WRITE_ROUTES
+    )
+
+
+def _public_admin_device_write_allowed(method: str, path: str) -> bool:
+    return any(
+        method == expected and pattern.fullmatch(path)
+        for expected, pattern in _PUBLIC_ADMIN_DEVICE_WRITE_ROUTES
+    )
 
 
 def _public_route_allowed(method: str, path: str) -> bool:
@@ -216,13 +235,17 @@ def create_public_app(settings: Settings | None = None) -> FastAPI:
             and not _public_route_allowed(request.method, path)
         ):
             return JSONResponse({"detail": "not found"}, status_code=404)
-        if _public_write_allowed(request.method, path):
+        if _public_write_allowed(request.method, path) or _public_admin_device_write_allowed(
+            request.method, path
+        ):
             body_limit = 2_200_000
             content_length = request.headers.get("Content-Length")
             if content_length is not None:
                 try:
                     if int(content_length) > body_limit:
-                        return JSONResponse({"detail": "request body is too large"}, status_code=413)
+                        return JSONResponse(
+                            {"detail": "request body is too large"}, status_code=413
+                        )
                 except ValueError:
                     return JSONResponse({"detail": "invalid Content-Length"}, status_code=400)
             body = await request.body()
@@ -272,9 +295,7 @@ def create_public_app(settings: Settings | None = None) -> FastAPI:
 
     @app.exception_handler(UploadTooLargeError)
     async def large_upload(request: Request, error: UploadTooLargeError) -> JSONResponse:
-        return problem_response(
-            request, 413, "upload-too-large", "Upload is too large", str(error)
-        )
+        return problem_response(request, 413, "upload-too-large", "Upload is too large", str(error))
 
     app.include_router(health.router)
     app.include_router(public_auth_router)

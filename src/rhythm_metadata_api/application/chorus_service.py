@@ -29,7 +29,10 @@ from rhythm_metadata_api.core.config import Settings
 from rhythm_metadata_api.domain.v2.chorus import (
     ChorusMixResolveRequest,
     ChorusMixResponse,
+    ChorusModerationQueueItem,
+    ChorusModerationQueueResponse,
     ChorusModerationRequest,
+    ChorusModerationSettingsResponse,
     ChorusPartResponse,
     ChorusProjectCreate,
     ChorusProjectResponse,
@@ -56,6 +59,7 @@ from rhythm_metadata_api.infrastructure.db.models import (
     ChangeEvent,
     ChangeEventWork,
     ChorusMixVariant,
+    ChorusModerationSettings,
     ChorusProject,
     ChorusTrack,
     IdempotencyKey,
@@ -129,6 +133,68 @@ class ChorusService:
         with self.uow_factory() as uow:
             return self._project_response(
                 uow.session, self._require_project(uow.session, project_id), actor
+            )
+
+    def moderation_settings(self) -> ChorusModerationSettingsResponse:
+        with self.uow_factory() as uow:
+            item = uow.session.get(ChorusModerationSettings, "global")
+            return ChorusModerationSettingsResponse(
+                automatic_approval=item.automatic_approval if item else True,
+                updated_by=item.updated_by if item else "system",
+                updated_at=item.updated_at if item else None,
+            )
+
+    def update_moderation_settings(
+        self, automatic_approval: bool, actor: ActorContext
+    ) -> ChorusModerationSettingsResponse:
+        with self.uow_factory() as uow:
+            item = uow.session.get(ChorusModerationSettings, "global")
+            if item is None:
+                item = ChorusModerationSettings(
+                    id="global",
+                    automatic_approval=automatic_approval,
+                    updated_by=actor.actor_id,
+                )
+                uow.session.add(item)
+            else:
+                item.automatic_approval = automatic_approval
+                item.updated_by = actor.actor_id
+                item.updated_at = utc_now()
+            uow.session.flush()
+            return ChorusModerationSettingsResponse(
+                automatic_approval=item.automatic_approval,
+                updated_by=item.updated_by,
+                updated_at=item.updated_at,
+            )
+
+    def list_tracks_for_moderation(
+        self, status: str, actor: ActorContext, limit: int = 100
+    ) -> ChorusModerationQueueResponse:
+        if status not in {"pending_review", "published", "rejected"}:
+            raise V2DomainError("unsupported moderation status")
+        with self.uow_factory() as uow:
+            rows = list(
+                uow.session.execute(
+                    select(ChorusTrack, ChorusProject)
+                    .join(ChorusProject, ChorusProject.id == ChorusTrack.chorus_project_id)
+                    .where(
+                        ChorusTrack.status == status,
+                        ChorusTrack.deleted_at.is_(None),
+                        ChorusProject.deleted_at.is_(None),
+                    )
+                    .order_by(ChorusTrack.updated_at.desc(), ChorusTrack.id)
+                    .limit(limit)
+                )
+            )
+            return ChorusModerationQueueResponse(
+                items=[
+                    ChorusModerationQueueItem(
+                        work_id=project.work_id,
+                        project_title=project.title,
+                        track=self._track_response(uow.session, track, actor),
+                    )
+                    for track, project in rows
+                ]
             )
 
     def create_project(
@@ -630,7 +696,12 @@ class ChorusService:
                 raise V2Conflict(f"track cannot be submitted while {track.status}")
             if self._master_asset_id(session, track.rendition_id) is None:
                 raise V2Conflict("track has no completed audio upload")
-            track.status = "pending_review"
+            moderation = session.get(ChorusModerationSettings, "global")
+            automatic_approval = moderation.automatic_approval if moderation else True
+            track.status = "published" if automatic_approval else "pending_review"
+            track.rejection_reason = None
+            if track.status == "published" and track.alignment_state == "manual":
+                track.alignment_state = "verified"
             track.revision += 1
             track.updated_at = utc_now()
             project = self._require_project(session, track.chorus_project_id)
@@ -640,7 +711,11 @@ class ChorusService:
                 "chorus_track",
                 track.id,
                 track.revision,
-                "chorus_track.submitted",
+                (
+                    "chorus_track.published_automatically"
+                    if automatic_approval
+                    else "chorus_track.submitted"
+                ),
                 actor,
             )
             return self._track_response(session, track, actor), 200, {"ETag": etag(track.revision)}
@@ -1097,7 +1172,8 @@ class ChorusService:
         visible = [
             track
             for track in tracks
-            if track.status == "published" or track.uploader_user_id == actor.actor_id
+            if track.status == "published"
+            or (track.uploader_user_id == actor.actor_id and track.status != "withdrawn")
         ]
         return ChorusProjectResponse(
             id=project.id,
