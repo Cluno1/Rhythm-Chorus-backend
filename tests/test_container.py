@@ -82,6 +82,14 @@ def test_settings_validates_configurable_active_device_capacity() -> None:
         Settings(public_max_active_devices_per_user_app=101)
 
 
+def test_settings_validates_configurable_invite_ttl() -> None:
+    assert Settings(public_invite_ttl_seconds=86400).public_invite_ttl_seconds == 86400
+    with pytest.raises(ValueError, match="invite TTL"):
+        Settings(public_invite_ttl_seconds=59)
+    with pytest.raises(ValueError, match="invite TTL"):
+        Settings(public_invite_ttl_seconds=86401)
+
+
 def test_multi_device_migration_backfills_slots_and_supports_safe_downgrade(
     tmp_path: Path,
 ) -> None:
