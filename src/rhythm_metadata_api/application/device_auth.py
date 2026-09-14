@@ -404,26 +404,49 @@ class DeviceAuthService:
                 or any(c not in "0123456789abcdef" for c in certificate)
             ):
                 raise DeviceAuthError(422, "invalid Sonorus application identity")
-            active = session.scalar(
-                select(RegisteredDevice).where(
-                    RegisteredDevice.user_id == invite.user_id,
-                    RegisteredDevice.application_id == application_id,
-                    RegisteredDevice.status == "active",
+            active_devices = list(
+                session.scalars(
+                    select(RegisteredDevice)
+                    .where(
+                        RegisteredDevice.user_id == invite.user_id,
+                        RegisteredDevice.application_id == application_id,
+                        RegisteredDevice.status == "active",
+                    )
+                    .order_by(RegisteredDevice.active_slot, RegisteredDevice.created_at)
                 )
             )
-            if active is not None:
-                if not invite.replace_existing_device:
-                    raise DeviceAuthError(409, "user already has an active device")
-                active.status = "revoked"
-                active.revoked_at = now
+            if invite.replace_existing_device and len(active_devices) > 1:
+                raise DeviceAuthError(
+                    409,
+                    "multiple active devices exist; revoke the intended device explicitly",
+                )
+            if invite.replace_existing_device and active_devices:
+                replaced = active_devices.pop()
+                replaced.status = "revoked"
+                replaced.revoked_at = now
                 session.execute(
                     update(DeviceSession)
                     .where(
-                        DeviceSession.device_id == active.id,
+                        DeviceSession.device_id == replaced.id,
                         DeviceSession.revoked_at.is_(None),
                     )
                     .values(revoked_at=now)
                 )
+            capacity = self.settings.public_max_active_devices_per_user_app
+            if len(active_devices) >= capacity:
+                raise DeviceAuthError(
+                    409,
+                    f"user already has the maximum of {capacity} active devices",
+                )
+            occupied_slots = {
+                item.active_slot for item in active_devices if item.active_slot is not None
+            }
+            active_slot = next(
+                (slot for slot in range(1, capacity + 1) if slot not in occupied_slots),
+                None,
+            )
+            if active_slot is None:
+                raise DeviceAuthError(409, "no active device slot is available")
             device = RegisteredDevice(
                 id=new_id(),
                 user_id=invite.user_id,
@@ -432,42 +455,43 @@ class DeviceAuthService:
                 public_key_spki=public_key_spki,
                 public_key_thumbprint=thumbprint,
                 display_name=display_name,
-            )
-            session.add(device)
-            session.flush()
-            device_session = DeviceSession(
-                id=new_id(), device_id=device.id, expires_at=session_expires
-            )
-            session.add(device_session)
-            session.flush()
-            consumed = session.execute(
-                update(DeviceInvite)
-                .where(DeviceInvite.id == invite.id, DeviceInvite.consumed_at.is_(None))
-                .values(consumed_at=now, consumed_by_device_id=device.id)
-            )
-            if consumed.rowcount != 1:
-                raise DeviceAuthError(401, "invite was already consumed")
-            self._audit(
-                session,
-                "device_enrolled",
-                "success",
-                actor_type="device",
-                actor_id=device.id,
-                source_ip=source_ip,
-            )
-            principal = DevicePrincipal(
-                invite.user_id,
-                device.id,
-                device_session.id,
-                device.public_key_thumbprint,
-                device.application_id,
-                device.signing_certificate_sha256,
+                active_slot=active_slot,
             )
             try:
+                session.add(device)
+                session.flush()
+                device_session = DeviceSession(
+                    id=new_id(), device_id=device.id, expires_at=session_expires
+                )
+                session.add(device_session)
+                session.flush()
+                consumed = session.execute(
+                    update(DeviceInvite)
+                    .where(DeviceInvite.id == invite.id, DeviceInvite.consumed_at.is_(None))
+                    .values(consumed_at=now, consumed_by_device_id=device.id)
+                )
+                if consumed.rowcount != 1:
+                    raise DeviceAuthError(401, "invite was already consumed")
+                self._audit(
+                    session,
+                    "device_enrolled",
+                    "success",
+                    actor_type="device",
+                    actor_id=device.id,
+                    source_ip=source_ip,
+                )
+                principal = DevicePrincipal(
+                    invite.user_id,
+                    device.id,
+                    device_session.id,
+                    device.public_key_thumbprint,
+                    device.application_id,
+                    device.signing_certificate_sha256,
+                )
                 session.commit()
             except IntegrityError:
                 session.rollback()
-                raise DeviceAuthError(409, "device or user is already registered") from None
+                raise DeviceAuthError(409, "device or active slot is already registered") from None
         return EnrollmentResult(principal, self._access_token(principal), session_expires)
 
     def require_device_token(
@@ -655,7 +679,7 @@ class DeviceAuthService:
                 select(RegisteredDevice).where(
                     RegisteredDevice.user_id == user_id,
                     RegisteredDevice.status == "active",
-                )
+                ).order_by(RegisteredDevice.application_id, RegisteredDevice.active_slot)
             )
 
     def list_devices(self) -> list[RegisteredDevice]:

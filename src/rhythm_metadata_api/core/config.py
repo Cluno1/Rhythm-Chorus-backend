@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     public_access_token_ttl_seconds: int = 10 * 60
     public_admin_token_ttl_seconds: int = 5 * 60
     public_device_session_ttl_days: int = 90
+    public_max_active_devices_per_user_app: int = 2
     public_invite_ttl_seconds: int = 10 * 60
     public_nonce_ttl_seconds: int = 60
     sonorus_updates_root: str = ""
@@ -60,6 +61,8 @@ class Settings(BaseSettings):
             raise ValueError("public admin token TTL must be between 60 and 900 seconds")
         if not 1 <= self.public_device_session_ttl_days <= 365:
             raise ValueError("public device session TTL must be between 1 and 365 days")
+        if not 1 <= self.public_max_active_devices_per_user_app <= 100:
+            raise ValueError("public active device limit must be between 1 and 100")
         if not 60 <= self.public_invite_ttl_seconds <= 86400:
             raise ValueError("public invite TTL must be between 60 seconds and one day")
         if not 15 <= self.public_nonce_ttl_seconds <= 300:

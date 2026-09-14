@@ -165,7 +165,7 @@ docker compose up -d api
 docker compose --profile public up -d --build public-api
 ```
 
-管理员密码只在获取 5 分钟管理令牌时提交，不保存到 Android。管理员签发一次性邀请码后，客户端用 Android Keystore 内不可导出的 P-256 私钥登记；后续每个 Catalog 请求都需要短期 token、服务端一次性 nonce、时间戳和请求签名。歌词 PUT 还会对收到的实际 JSON 字节重新计算 SHA-256，并要求 token 具有 `catalog:lyrics:write` scope。设备登记绑定 Sonorus applicationId 与 APK 签名证书；一个用户可为 Debug 和 Release 各保留一台 active 设备，但同一 applicationId 仍只能有一台。
+管理员密码只在获取 5 分钟管理令牌时提交，不保存到 Android。管理员签发一次性邀请码后，客户端用 Android Keystore 内不可导出的 P-256 私钥登记；后续每个 Catalog 请求都需要短期 token、服务端一次性 nonce、时间戳和请求签名。歌词 PUT 还会对收到的实际 JSON 字节重新计算 SHA-256，并要求 token 具有 `catalog:lyrics:write` scope。设备登记绑定 Sonorus applicationId 与 APK 签名证书；每个用户、每个 applicationId 默认可保留两台 active 设备，各自使用独立密钥和 Session。容量由 `RHYTHM_PUBLIC_MAX_ACTIVE_DEVICES_PER_USER_APP` 配置（范围 `1..100`），以后扩容只需修改配置并重启，不需要再迁移数据库。
 
 `issue15updateidentity` 迁移会把旧登记标为 legacy 身份；升级网关后，既有 Android 客户端需要由管理员重新签发邀请码并登记一次。新的 enrollment V2 签名同时覆盖 applicationId 和证书指纹，避免这两个字段在 HTTP 传输中被替换。
 

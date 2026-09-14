@@ -88,6 +88,7 @@ class AdminDeviceResponse(CamelModel):
     user_id: str
     display_name: str | None
     application_id: str
+    active_slot: int | None
     status: str
     is_administrator: bool
     created_at: str
@@ -96,6 +97,7 @@ class AdminDeviceResponse(CamelModel):
 
 class AdminDeviceListResponse(CamelModel):
     items: list[AdminDeviceResponse]
+    max_active_devices_per_user_app: int
 
 
 class AdministratorChangeResponse(CamelModel):

@@ -74,6 +74,96 @@ def test_settings_rejects_update_cos_bucket_without_credentials() -> None:
         Settings(sonorus_updates_cos_bucket="sonorus-updates-1328751369")
 
 
+def test_settings_validates_configurable_active_device_capacity() -> None:
+    assert Settings(public_max_active_devices_per_user_app=3).public_max_active_devices_per_user_app == 3
+    with pytest.raises(ValueError, match="active device limit"):
+        Settings(public_max_active_devices_per_user_app=0)
+    with pytest.raises(ValueError, match="active device limit"):
+        Settings(public_max_active_devices_per_user_app=101)
+
+
+def test_multi_device_migration_backfills_slots_and_supports_safe_downgrade(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "multi-device-upgrade.sqlite3"
+    config = Config()
+    config.set_main_option(
+        "script_location",
+        str(Path(database_module.__file__).with_name("migrations")),
+    )
+    config.set_main_option("sqlalchemy.url", f"sqlite+pysqlite:///{database}")
+    command.upgrade(config, "issue80timeline")
+
+    timestamp = "2026-09-15T00:00:00+00:00"
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute(
+        "INSERT INTO auth_users (id, display_name, status, created_at, updated_at) "
+        "VALUES ('migration-user', 'Migration User', 'active', ?, ?)",
+        (timestamp, timestamp),
+    )
+    connection.executemany(
+        """
+        INSERT INTO auth_devices (
+            id, user_id, application_id, signing_certificate_sha256,
+            public_key_spki, public_key_thumbprint, key_algorithm, display_name,
+            status, is_administrator, created_at, last_seen_at, revoked_at
+        ) VALUES (?, 'migration-user', 'io.github.cluno1.sonorus', ?, ?, ?,
+                  'ES256', ?, ?, 0, ?, NULL, ?)
+        """,
+        [
+            (
+                "active-device",
+                "a" * 64,
+                "active-key",
+                "b" * 64,
+                "Phone",
+                "active",
+                timestamp,
+                None,
+            ),
+            (
+                "revoked-device",
+                "a" * 64,
+                "revoked-key",
+                "c" * 64,
+                "Old phone",
+                "revoked",
+                timestamp,
+                timestamp,
+            ),
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+    command.upgrade(config, "head")
+    connection = sqlite3.connect(database)
+    slots = connection.execute(
+        "SELECT id, active_slot FROM auth_devices ORDER BY id"
+    ).fetchall()
+    indexes = {
+        row[1]: row[2]
+        for row in connection.execute("PRAGMA index_list('auth_devices')").fetchall()
+    }
+    connection.close()
+    assert slots == [("active-device", 1), ("revoked-device", None)]
+    assert indexes["uq_auth_devices_active_user_app_slot"] == 1
+
+    command.downgrade(config, "issue80timeline")
+    connection = sqlite3.connect(database)
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info('auth_devices')").fetchall()
+    }
+    indexes = {
+        row[1]: row[2]
+        for row in connection.execute("PRAGMA index_list('auth_devices')").fetchall()
+    }
+    connection.close()
+    assert "active_slot" not in columns
+    assert indexes["uq_auth_devices_active_user_app"] == 1
+
+
 def test_multilingual_lyrics_migration_backfills_existing_rows(tmp_path: Path) -> None:
     database = tmp_path / "multilingual-upgrade.sqlite3"
     config = Config()
@@ -166,7 +256,7 @@ def test_multilingual_lyrics_migration_backfills_existing_rows(tmp_path: Path) -
     }
     connection.close()
 
-    assert version == "issue80timeline"
+    assert version == "issue83multidevice"
     assert lyric_source_tables == {
         "v2_lyric_source_documents",
         "v2_lyric_source_pages",

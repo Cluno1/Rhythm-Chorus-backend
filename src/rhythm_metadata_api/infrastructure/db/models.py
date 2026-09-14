@@ -878,6 +878,7 @@ class RegisteredDevice(Base):
     key_algorithm: Mapped[str] = mapped_column(String(20), nullable=False, default="ES256")
     display_name: Mapped[str | None] = mapped_column(String(300), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    active_slot: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_administrator: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("0")
     )
@@ -887,11 +888,16 @@ class RegisteredDevice(Base):
 
     __table_args__ = (
         CheckConstraint("status IN ('active', 'revoked')", name="auth_device_status"),
+        CheckConstraint(
+            "status != 'active' OR (active_slot IS NOT NULL AND active_slot > 0)",
+            name="auth_device_active_slot",
+        ),
         Index("auth_devices_user_idx", "user_id"),
         Index(
-            "uq_auth_devices_active_user_app",
+            "uq_auth_devices_active_user_app_slot",
             "user_id",
             "application_id",
+            "active_slot",
             unique=True,
             sqlite_where=text("status = 'active'"),
         ),

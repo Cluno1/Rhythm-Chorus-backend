@@ -7,9 +7,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+import pytest
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from rhythm_metadata_api.application.device_auth import (
@@ -19,7 +21,13 @@ from rhythm_metadata_api.application.device_auth import (
     request_canonical,
 )
 from rhythm_metadata_api.core.config import Settings
-from rhythm_metadata_api.infrastructure.db.models import Arrangement, ChangeEvent, Rendition, Work
+from rhythm_metadata_api.infrastructure.db.models import (
+    Arrangement,
+    ChangeEvent,
+    RegisteredDevice,
+    Rendition,
+    Work,
+)
 from rhythm_metadata_api.public_main import (
     _public_read_allowed,
     _public_write_allowed,
@@ -59,7 +67,7 @@ def b64url(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode()
 
 
-def settings(tmp_path: Path) -> Settings:
+def settings(tmp_path: Path, *, max_active_devices: int = 2) -> Settings:
     return Settings(
         bootstrap_token="private-test-token",
         v2_database_path=str(tmp_path / "catalog.sqlite3"),
@@ -67,6 +75,7 @@ def settings(tmp_path: Path) -> Settings:
         public_token_secret="test-only-secret-that-is-longer-than-32-bytes",
         public_admin_username="owner",
         public_admin_password_hash=hash_admin_password("correct horse battery staple"),
+        public_max_active_devices_per_user_app=max_active_devices,
         sonorus_updates_root=str(tmp_path / "updates"),
         sonorus_debug_certificate_sha256=DEBUG_CERTIFICATE_SHA256,
         sonorus_stable_certificate_sha256=STABLE_CERTIFICATE_SHA256,
@@ -82,23 +91,33 @@ def admin_token(client: TestClient) -> str:
     return response.json()["accessToken"]
 
 
-def create_invite(client: TestClient, token: str, user_id: str = "user-1") -> str:
+def create_invite(
+    client: TestClient,
+    token: str,
+    user_id: str = "user-1",
+    *,
+    replace_existing_device: bool = False,
+) -> str:
     response = client.post(
         "/v2/admin/invites",
         headers={"Authorization": f"Bearer {token}"},
-        json={"userId": user_id, "displayName": "Test User"},
+        json={
+            "userId": user_id,
+            "displayName": "Test User",
+            "replaceExistingDevice": replace_existing_device,
+        },
     )
     assert response.status_code == 200
     return response.json()["inviteCode"]
 
 
-def enroll(
+def enroll_response(
     client: TestClient,
     invite: str,
     key: ec.EllipticCurvePrivateKey,
     application_id: str = "io.github.cluno1.sonorus.debug",
     certificate_sha256: str = DEBUG_CERTIFICATE_SHA256,
-) -> dict[str, Any]:
+):
     challenge = client.post("/v2/device/challenge", json={"inviteCode": invite})
     assert challenge.status_code == 200
     nonce = challenge.json()["nonce"]
@@ -111,7 +130,7 @@ def enroll(
         enrollment_canonical(nonce, invite, thumbprint, application_id, certificate_sha256),
         ec.ECDSA(hashes.SHA256()),
     )
-    response = client.post(
+    return client.post(
         "/v2/device/enroll",
         json={
             "inviteCode": invite,
@@ -123,6 +142,16 @@ def enroll(
             "signingCertificateSha256": certificate_sha256,
         },
     )
+
+
+def enroll(
+    client: TestClient,
+    invite: str,
+    key: ec.EllipticCurvePrivateKey,
+    application_id: str = "io.github.cluno1.sonorus.debug",
+    certificate_sha256: str = DEBUG_CERTIFICATE_SHA256,
+) -> dict[str, Any]:
+    response = enroll_response(client, invite, key, application_id, certificate_sha256)
     assert response.status_code == 200, response.text
     return response.json()
 
@@ -393,47 +422,186 @@ def test_signed_rendition_lyric_write_hash_scope_revision_and_audit(tmp_path: Pa
         assert client.patch(f"/v2/renditions/{rendition_id}", json={}).status_code == 404
 
 
-def test_invite_is_single_use_and_one_active_device_per_user(tmp_path: Path) -> None:
+def test_invite_is_single_use_and_active_device_capacity_defaults_to_two(
+    tmp_path: Path,
+) -> None:
     app = create_public_app(settings(tmp_path))
     with TestClient(app) as client:
         admin = admin_token(client)
         first_invite = create_invite(client, admin, "same-user")
-        enroll(client, first_invite, ec.generate_private_key(ec.SECP256R1()))
+        first_key = ec.generate_private_key(ec.SECP256R1())
+        first = enroll(client, first_invite, first_key)
         assert (
             client.post("/v2/device/challenge", json={"inviteCode": first_invite}).status_code
             == 401
         )
 
-        second_invite = create_invite(client, admin, "same-user")
-        challenge = client.post("/v2/device/challenge", json={"inviteCode": second_invite})
-        nonce = challenge.json()["nonce"]
-        key = ec.generate_private_key(ec.SECP256R1())
-        public_der = key.public_key().public_bytes(
-            serialization.Encoding.DER,
-            serialization.PublicFormat.SubjectPublicKeyInfo,
+        second_key = ec.generate_private_key(ec.SECP256R1())
+        second = enroll(
+            client,
+            create_invite(client, admin, "same-user"),
+            second_key,
         )
-        signature = key.sign(
-            enrollment_canonical(
-                nonce,
-                second_invite,
-                hashlib.sha256(public_der).hexdigest(),
-                "io.github.cluno1.sonorus.debug",
-                DEBUG_CERTIFICATE_SHA256,
-            ),
-            ec.ECDSA(hashes.SHA256()),
-        )
-        rejected = client.post(
-            "/v2/device/enroll",
-            json={
-                "inviteCode": second_invite,
-                "nonce": nonce,
-                "publicKeySpki": b64url(public_der),
-                "signature": b64url(signature),
-                "applicationId": "io.github.cluno1.sonorus.debug",
-                "signingCertificateSha256": DEBUG_CERTIFICATE_SHA256,
-            },
+        rejected = enroll_response(
+            client,
+            create_invite(client, admin, "same-user"),
+            ec.generate_private_key(ec.SECP256R1()),
         )
         assert rejected.status_code == 409
+        assert rejected.json()["detail"] == "user already has the maximum of 2 active devices"
+
+        devices = client.get(
+            "/v2/admin/devices",
+            headers={"Authorization": f"Bearer {admin}"},
+        )
+        assert devices.status_code == 200
+        assert devices.json()["maxActiveDevicesPerUserApp"] == 2
+        active = [
+            item
+            for item in devices.json()["items"]
+            if item["userId"] == "same-user"
+            and item["applicationId"] == "io.github.cluno1.sonorus.debug"
+            and item["status"] == "active"
+        ]
+        assert sorted(item["activeSlot"] for item in active) == [1, 2]
+
+        revoked = client.post(
+            f"/v2/admin/devices/{first['deviceId']}/revoke",
+            headers={"Authorization": f"Bearer {admin}"},
+        )
+        assert revoked.json() == {"revoked": True}
+        assert (
+            client.post(
+                "/v2/device/nonce",
+                headers={"Authorization": f"Device {first['accessToken']}"},
+                json={"deviceId": first["deviceId"]},
+            ).status_code
+            == 401
+        )
+        assert (
+            client.post(
+                "/v2/device/nonce",
+                headers={"Authorization": f"Device {second['accessToken']}"},
+                json={"deviceId": second["deviceId"]},
+            ).status_code
+            == 200
+        )
+
+
+def test_active_device_capacity_can_expand_to_three_without_schema_changes(
+    tmp_path: Path,
+) -> None:
+    app = create_public_app(settings(tmp_path, max_active_devices=3))
+    with TestClient(app) as client:
+        admin = admin_token(client)
+        enrolled = [
+            enroll(
+                client,
+                create_invite(client, admin, "three-device-user"),
+                ec.generate_private_key(ec.SECP256R1()),
+            )
+            for _ in range(3)
+        ]
+        assert len({item["deviceId"] for item in enrolled}) == 3
+
+        devices = client.get(
+            "/v2/admin/devices",
+            headers={"Authorization": f"Bearer {admin}"},
+        ).json()
+        assert devices["maxActiveDevicesPerUserApp"] == 3
+        assert sorted(
+            item["activeSlot"]
+            for item in devices["items"]
+            if item["userId"] == "three-device-user" and item["status"] == "active"
+        ) == [1, 2, 3]
+
+
+def test_replace_is_rejected_when_multiple_active_devices_make_it_ambiguous(
+    tmp_path: Path,
+) -> None:
+    app = create_public_app(settings(tmp_path))
+    with TestClient(app) as client:
+        admin = admin_token(client)
+        for _ in range(2):
+            enroll(
+                client,
+                create_invite(client, admin, "replace-user"),
+                ec.generate_private_key(ec.SECP256R1()),
+            )
+
+        rejected = enroll_response(
+            client,
+            create_invite(
+                client,
+                admin,
+                "replace-user",
+                replace_existing_device=True,
+            ),
+            ec.generate_private_key(ec.SECP256R1()),
+        )
+        assert rejected.status_code == 409
+        assert rejected.json()["detail"] == (
+            "multiple active devices exist; revoke the intended device explicitly"
+        )
+
+
+def test_replace_keeps_legacy_behavior_when_exactly_one_device_is_active(
+    tmp_path: Path,
+) -> None:
+    app = create_public_app(settings(tmp_path))
+    with TestClient(app) as client:
+        admin = admin_token(client)
+        old = enroll(
+            client,
+            create_invite(client, admin, "legacy-replace-user"),
+            ec.generate_private_key(ec.SECP256R1()),
+        )
+        new = enroll(
+            client,
+            create_invite(
+                client,
+                admin,
+                "legacy-replace-user",
+                replace_existing_device=True,
+            ),
+            ec.generate_private_key(ec.SECP256R1()),
+        )
+        assert old["deviceId"] != new["deviceId"]
+
+        devices = client.get(
+            "/v2/admin/devices",
+            headers={"Authorization": f"Bearer {admin}"},
+        ).json()["items"]
+        status_by_id = {item["deviceId"]: item["status"] for item in devices}
+        assert status_by_id[old["deviceId"]] == "revoked"
+        assert status_by_id[new["deviceId"]] == "active"
+
+
+def test_database_rejects_duplicate_active_slots(tmp_path: Path) -> None:
+    app = create_public_app(settings(tmp_path, max_active_devices=3))
+    with TestClient(app) as client:
+        admin = admin_token(client)
+        enrolled = enroll(
+            client,
+            create_invite(client, admin, "slot-user"),
+            ec.generate_private_key(ec.SECP256R1()),
+        )
+        with Session(client.app.state.v2_container.engine) as session:
+            existing = session.get(RegisteredDevice, enrolled["deviceId"])
+            assert existing is not None
+            session.add(
+                RegisteredDevice(
+                    user_id=existing.user_id,
+                    application_id=existing.application_id,
+                    signing_certificate_sha256=existing.signing_certificate_sha256,
+                    public_key_spki="another-key",
+                    public_key_thumbprint="f" * 64,
+                    display_name="Conflicting slot",
+                    active_slot=existing.active_slot,
+                )
+            )
+            with pytest.raises(IntegrityError):
+                session.commit()
 
 
 def test_same_user_can_register_debug_and_release_separately(tmp_path: Path) -> None:

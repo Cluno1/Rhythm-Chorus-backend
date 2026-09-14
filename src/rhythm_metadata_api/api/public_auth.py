@@ -178,13 +178,17 @@ def list_devices(request: Request, _: AdminActor) -> AdminDeviceListResponse:
                 user_id=item.user_id,
                 display_name=item.display_name,
                 application_id=item.application_id,
+                active_slot=item.active_slot,
                 status=item.status,
                 is_administrator=item.is_administrator,
                 created_at=item.created_at.isoformat(),
                 last_seen_at=item.last_seen_at.isoformat() if item.last_seen_at else None,
             )
             for item in service(request).list_devices()
-        ]
+        ],
+        max_active_devices_per_user_app=(
+            service(request).settings.public_max_active_devices_per_user_app
+        ),
     )
 
 
