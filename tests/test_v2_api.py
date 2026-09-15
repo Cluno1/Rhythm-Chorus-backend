@@ -473,6 +473,20 @@ def test_asset_delivery_and_native_library_projection(client: TestClient) -> Non
     assert score_work["origins"] == ["ocr"]
     assert score_work["score_options"][0]["preferred"] is True
 
+    archived = client.patch(
+        f"/v2/works/{work_id}",
+        headers={**AUTH, "If-Match": '"rev-1"'},
+        json={"status": "archived"},
+    )
+    assert archived.status_code == 200, archived.text
+    assert client.get("/v2/library/songs", headers=AUTH).json()["items"] == []
+    archived_albums = client.get("/v2/library/albums", headers=AUTH).json()["items"]
+    assert archived_albums[0]["song_count"] == 0
+    assert client.get("/v2/library/score-works", headers=AUTH).json()["items"] == []
+    archived_album = client.get(f"/v2/library/albums/{release_id}", headers=AUTH).json()
+    assert archived_album["album"]["song_count"] == 0
+    assert archived_album["songs"] == []
+
 
 def test_asset_delivery_returns_signed_cos_url_without_auth_in_url(tmp_path: Path) -> None:
     settings = Settings(
@@ -564,6 +578,78 @@ def test_v2_requires_auth_and_problem_details(client: TestClient) -> None:
     assert missing_key.status_code == 422
     assert missing_key.headers["content-type"].startswith("application/problem+json")
     assert missing_key.json()["type"].endswith("/domain-validation")
+
+
+def test_work_edit_replaces_people_languages_and_external_ids(client: TestClient) -> None:
+    composer = post(
+        client,
+        "/v2/contributors",
+        "editable-composer",
+        {"display_name": "Original Composer"},
+    )
+    lyricist = post(
+        client,
+        "/v2/contributors",
+        "editable-lyricist",
+        {"display_name": "New Lyricist", "sort_name": "Lyricist, New"},
+    )
+    work = post(
+        client,
+        "/v2/works",
+        "editable-work",
+        {
+            "canonical_title": "Editable Work",
+            "credits": [
+                {
+                    "contributor_id": composer.json()["id"],
+                    "role": "composer",
+                    "position": 1,
+                }
+            ],
+        },
+    )
+
+    contributors = client.get("/v2/contributors?q=Lyricist", headers=AUTH)
+    assert contributors.status_code == 200
+    assert [item["display_name"] for item in contributors.json()["items"]] == [
+        "New Lyricist"
+    ]
+
+    patched = client.patch(
+        f"/v2/works/{work.json()['id']}",
+        headers={**AUTH, "If-Match": '"rev-1"'},
+        json={
+            "language": "zh_hant",
+            "lyrics": "主要歌词",
+            "lyrics_language": "zh-hant",
+            "lyrics_translations": [{"language": "en_us", "lyrics": "English lyrics"}],
+            "aliases": [{"namespace": "legacy", "external_id": "work-99"}],
+            "credits": [
+                {
+                    "contributor_id": lyricist.json()["id"],
+                    "role": "lyricist",
+                    "position": 1,
+                },
+                {
+                    "contributor_id": composer.json()["id"],
+                    "role": "composer",
+                    "position": 2,
+                },
+            ],
+        },
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.headers["etag"] == '"rev-2"'
+    assert patched.json()["language"] == "zh-Hant"
+    assert patched.json()["lyrics_language"] == "zh-Hant"
+    assert patched.json()["lyrics_translations"] == [
+        {"language": "en-US", "lyrics": "English lyrics"}
+    ]
+    assert patched.json()["aliases"] == [{"namespace": "legacy", "external_id": "work-99"}]
+    assert [item["display_name"] for item in patched.json()["credits"]] == [
+        "New Lyricist",
+        "Original Composer",
+    ]
 
 
 def test_private_catalog_end_to_end(client: TestClient) -> None:

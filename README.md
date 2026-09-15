@@ -44,6 +44,10 @@ Authorization: Bearer <RHYTHM_BOOTSTRAP_TOKEN>
 ## v2 核心接口
 
 ```text
+POST  /v2/contributors
+GET   /v2/contributors
+GET   /v2/contributors/{id}
+
 POST  /v2/works/resolve
 POST  /v2/works
 GET   /v2/works
@@ -83,6 +87,10 @@ GET   /v2/renditions/{id}/effective-lyric-sources
 
 GET   /v2/sync/changes?after=<sequence>
 ```
+
+`PATCH /v2/works/{id}` 除作品名称、状态和多语言歌词外，也支持整体替换
+`credits`（人员、职责、顺序）与 `aliases`（外部系统身份）。`draft` 与 `archived`
+作品不会进入客户端歌曲/乐谱投影，也不会计入专辑歌曲数；Release/专辑本身仍独立管理。
 
 典型文件流程：客户端先计算 hash 和大小，`POST /v2/uploads`；若不是 `reused`，流式 `PUT` 字节并 `POST complete`；最后把返回的 Asset ID 关联到 ScoreRevision 或 Rendition。
 

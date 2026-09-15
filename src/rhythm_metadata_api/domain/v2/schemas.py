@@ -201,6 +201,11 @@ class ContributorResponse(ContributorCreate):
     revision: int
 
 
+class ContributorListResponse(ApiModel):
+    items: list[ContributorResponse]
+    next_cursor: str | None
+
+
 class WorkCreate(LocalizedLyricsCreate):
     canonical_title: str = Field(min_length=1, max_length=500)
     language: str | None = Field(default=None, max_length=35)
@@ -208,11 +213,23 @@ class WorkCreate(LocalizedLyricsCreate):
     aliases: list[WorkAliasInput] = Field(default_factory=list)
     credits: list[CreditInput] = Field(default_factory=list)
 
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: str | None) -> str | None:
+        return normalize_language_tag(value) if value is not None else None
+
 
 class WorkPatch(LocalizedLyricsPatch):
     canonical_title: str | None = Field(default=None, min_length=1, max_length=500)
     language: str | None = Field(default=None, max_length=35)
     status: Literal["draft", "active", "archived"] | None = None
+    aliases: list[WorkAliasInput] | None = None
+    credits: list[CreditInput] | None = None
+
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: str | None) -> str | None:
+        return normalize_language_tag(value) if value is not None else None
 
 
 class WorkCreditResponse(ApiModel):

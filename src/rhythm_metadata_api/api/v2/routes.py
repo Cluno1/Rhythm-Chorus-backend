@@ -18,6 +18,7 @@ from rhythm_metadata_api.domain.v2.schemas import (
     ArrangementCreate,
     ArrangementPatch,
     ContributorCreate,
+    ContributorListResponse,
     LyricSourceDocumentCreate,
     LyricSourceLinkCreate,
     LyricSourcePageCreate,
@@ -108,6 +109,18 @@ def create_contributor(
     return stored_response(
         service.create_contributor(body, require_idempotency(idempotency_key), actor)
     )
+
+
+@router.get("/contributors", response_model=ContributorListResponse)
+def list_contributors(
+    service: Catalog,
+    _: Actor,
+    q: str | None = None,
+    cursor: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> ContributorListResponse:
+    items, next_cursor = service.list_contributors(q, cursor, limit)
+    return ContributorListResponse(items=items, next_cursor=next_cursor)
 
 
 @router.get("/contributors/{contributor_id}")

@@ -11,7 +11,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, TypeVar
 
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import and_, case, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -260,6 +260,36 @@ class CatalogService:
                 revision=contributor.revision,
             )
 
+    def list_contributors(
+        self, query: str | None, cursor: str | None, limit: int
+    ) -> tuple[list[ContributorResponse], str | None]:
+        with self.uow_factory() as uow:
+            statement = select(Contributor).where(Contributor.deleted_at.is_(None))
+            if query:
+                term = f"%{query.strip()}%"
+                statement = statement.where(
+                    or_(
+                        Contributor.display_name.ilike(term),
+                        Contributor.sort_name.ilike(term),
+                    )
+                )
+            if cursor:
+                statement = statement.where(Contributor.id > cursor)
+            rows = list(
+                uow.session.scalars(statement.order_by(Contributor.id).limit(limit + 1))
+            )
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            return [
+                ContributorResponse(
+                    id=item.id,
+                    display_name=item.display_name,
+                    sort_name=item.sort_name,
+                    revision=item.revision,
+                )
+                for item in rows
+            ], rows[-1].id if has_more and rows else None
+
     def create_work(
         self,
         request: WorkCreate,
@@ -337,33 +367,70 @@ class CatalogService:
     def patch_work(
         self, work_id: str, request: WorkPatch, expected_revision: int, actor: ActorContext
     ) -> WorkResponse:
-        with self.uow_factory() as uow:
-            work = self._require_work(uow.session, work_id)
-            require_revision(work.revision, expected_revision)
-            changes = request.model_dump(exclude_unset=True)
-            if not changes:
+        try:
+            with self.uow_factory() as uow:
+                work = self._require_work(uow.session, work_id)
+                require_revision(work.revision, expected_revision)
+                changes = request.model_dump(exclude_unset=True)
+                aliases = changes.pop("aliases", None)
+                credits = changes.pop("credits", None)
+                if not changes and aliases is None and credits is None:
+                    return self._work_response(uow.session, work)
+                if credits is not None:
+                    self._require_contributors(
+                        uow.session, [credit["contributor_id"] for credit in credits]
+                    )
+                _merge_lyrics_patch(
+                    work,
+                    changes,
+                    fallback_language=changes.get("language", work.language),
+                )
+                for key, value in changes.items():
+                    setattr(work, key, value.strip() if isinstance(value, str) else value)
+                if aliases is not None:
+                    uow.session.execute(delete(WorkAlias).where(WorkAlias.work_id == work.id))
+                    uow.session.add_all(
+                        [
+                            WorkAlias(
+                                work_id=work.id,
+                                namespace=alias["namespace"].strip().lower(),
+                                external_id=alias["external_id"].strip(),
+                            )
+                            for alias in aliases
+                        ]
+                    )
+                if credits is not None:
+                    uow.session.execute(delete(WorkCredit).where(WorkCredit.work_id == work.id))
+                    uow.session.add_all(
+                        [
+                            WorkCredit(
+                                work_id=work.id,
+                                contributor_id=credit["contributor_id"],
+                                role=credit["role"].strip().lower(),
+                                position=credit["position"],
+                            )
+                            for credit in credits
+                        ]
+                    )
+                changed_fields = sorted(
+                    [*changes, *(["aliases"] if aliases is not None else []), *(["credits"] if credits is not None else [])]
+                )
+                work.revision += 1
+                work.updated_at = utc_now()
+                self._append_event(
+                    uow.session,
+                    work.id,
+                    "work",
+                    work.id,
+                    work.revision,
+                    "work.updated",
+                    actor,
+                    {"fields": changed_fields},
+                )
+                uow.session.flush()
                 return self._work_response(uow.session, work)
-            _merge_lyrics_patch(
-                work,
-                changes,
-                fallback_language=changes.get("language", work.language),
-            )
-            for key, value in changes.items():
-                setattr(work, key, value.strip() if isinstance(value, str) else value)
-            work.revision += 1
-            work.updated_at = utc_now()
-            self._append_event(
-                uow.session,
-                work.id,
-                "work",
-                work.id,
-                work.revision,
-                "work.updated",
-                actor,
-                {"fields": sorted(changes)},
-            )
-            uow.session.flush()
-            return self._work_response(uow.session, work)
+        except IntegrityError as error:
+            raise V2Conflict("a supplied alias or credit is already in use") from error
 
     def resolve_work(self, request: WorkResolveRequest) -> WorkResolveResponse:
         with self.uow_factory() as uow:
@@ -2321,9 +2388,6 @@ class CatalogService:
         )
 
     def _library_song_statement(self):
-        deliverable_providers = ["local"]
-        if self.settings.cos_secret_id and self.settings.cos_secret_key:
-            deliverable_providers.append("cos")
         return (
             select(ReleaseItem, Release, Rendition, Arrangement, Work)
             .join(Release, Release.id == ReleaseItem.release_id)
@@ -2335,24 +2399,33 @@ class CatalogService:
                 Rendition.deleted_at.is_(None),
                 Arrangement.deleted_at.is_(None),
                 Work.deleted_at.is_(None),
-                select(RenditionAsset.id)
-                .join(Asset, Asset.id == RenditionAsset.asset_id)
+                Work.status == "active",
+                self._playable_audio_exists(),
+            )
+        )
+
+    def _playable_audio_exists(self):
+        deliverable_providers = ["local"]
+        if self.settings.cos_secret_id and self.settings.cos_secret_key:
+            deliverable_providers.append("cos")
+        return (
+            select(RenditionAsset.id)
+            .join(Asset, Asset.id == RenditionAsset.asset_id)
+            .where(
+                RenditionAsset.rendition_id == Rendition.id,
+                RenditionAsset.role.in_(PLAYBACK_AUDIO_ROLES),
+                Asset.state == "ready",
+                Asset.deleted_at.is_(None),
+                Asset.detected_media_type.in_(PLAYABLE_AUDIO_MEDIA_TYPES),
+                select(AssetLocation.id)
                 .where(
-                    RenditionAsset.rendition_id == Rendition.id,
-                    RenditionAsset.role.in_(PLAYBACK_AUDIO_ROLES),
-                    Asset.state == "ready",
-                    Asset.deleted_at.is_(None),
-                    Asset.detected_media_type.in_(PLAYABLE_AUDIO_MEDIA_TYPES),
-                    select(AssetLocation.id)
-                    .where(
-                        AssetLocation.asset_id == Asset.id,
-                        AssetLocation.state == "available",
-                        AssetLocation.provider.in_(deliverable_providers),
-                    )
-                    .exists(),
+                    AssetLocation.asset_id == Asset.id,
+                    AssetLocation.state == "available",
+                    AssetLocation.provider.in_(deliverable_providers),
                 )
                 .exists(),
             )
+            .exists()
         )
 
     def _library_song_response(
@@ -2476,9 +2549,6 @@ class CatalogService:
         )
 
     def _library_album_response(self, session: Session, release: Release) -> LibraryAlbumResponse:
-        deliverable_providers = ["local"]
-        if self.settings.cos_secret_id and self.settings.cos_secret_key:
-            deliverable_providers.append("cos")
         song_count = session.scalar(
             select(func.count(ReleaseItem.id))
             .join(Rendition, Rendition.id == ReleaseItem.rendition_id)
@@ -2489,23 +2559,8 @@ class CatalogService:
                 Rendition.deleted_at.is_(None),
                 Arrangement.deleted_at.is_(None),
                 Work.deleted_at.is_(None),
-                select(RenditionAsset.id)
-                .join(Asset, Asset.id == RenditionAsset.asset_id)
-                .where(
-                    RenditionAsset.rendition_id == Rendition.id,
-                    RenditionAsset.role.in_(PLAYBACK_AUDIO_ROLES),
-                    Asset.state == "ready",
-                    Asset.deleted_at.is_(None),
-                    Asset.detected_media_type.in_(PLAYABLE_AUDIO_MEDIA_TYPES),
-                    select(AssetLocation.id)
-                    .where(
-                        AssetLocation.asset_id == Asset.id,
-                        AssetLocation.state == "available",
-                        AssetLocation.provider.in_(deliverable_providers),
-                    )
-                    .exists(),
-                )
-                .exists(),
+                Work.status == "active",
+                self._playable_audio_exists(),
             )
         )
         cover_delivery = self._cover_delivery(session, release.cover_asset_id)
