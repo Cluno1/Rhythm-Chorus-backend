@@ -30,7 +30,9 @@ from rhythm_metadata_api.domain.v2.schemas import (
     ScorePatch,
     ScoreRevisionCreate,
     UploadCreate,
+    WorkBundleResponse,
     WorkCreate,
+    WorkListResponse,
     WorkPatch,
     WorkResolveRequest,
 )
@@ -129,19 +131,16 @@ def create_work(
     return stored_response(service.create_work(body, require_idempotency(idempotency_key), actor))
 
 
-@router.get("/works")
+@router.get("/works", response_model=WorkListResponse)
 def list_works(
     service: Catalog,
     _: Actor,
     q: str | None = None,
     cursor: str | None = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
-) -> dict[str, Any]:
+) -> WorkListResponse:
     items, next_cursor = service.list_works(q, cursor, limit)
-    return {
-        "items": [item.model_dump(mode="json") for item in items],
-        "next_cursor": next_cursor,
-    }
+    return WorkListResponse(items=items, next_cursor=next_cursor)
 
 
 @router.get("/works/{work_id}")
@@ -162,7 +161,7 @@ def patch_work(
     return model_response(item, headers={"ETag": etag(item.revision)})
 
 
-@router.get("/works/{work_id}/bundle")
+@router.get("/works/{work_id}/bundle", response_model=WorkBundleResponse)
 def get_work_bundle(
     work_id: str,
     service: Catalog,

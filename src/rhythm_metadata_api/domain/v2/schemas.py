@@ -235,6 +235,11 @@ class WorkResponse(LocalizedLyricsResponse):
     updated_at: datetime
 
 
+class WorkListResponse(ApiModel):
+    items: list[WorkResponse]
+    next_cursor: str | None
+
+
 class WorkResolveMetadata(ApiModel):
     title: str | None = Field(default=None, max_length=500)
     composer: str | None = Field(default=None, max_length=500)

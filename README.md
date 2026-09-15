@@ -193,6 +193,10 @@ COS 对象使用无扩展名的内容寻址键
 
 `public-api` 固定监听腾讯云内网地址 `10.1.0.16:8010`（公网映射为 `175.178.242.232:8010`），而原有管理 API 继续只监听 WireGuard 地址 `10.88.0.1:8010`。确认容器健康并完成签名联调之前，不要开放安全组 8010。
 
+Sonorus Web 管理台通过 WireGuard 内的管理 API 调用 `/v2/admin/session` 校验管理员密码，
+浏览器只接收 Web BFF 生成的短时不透明会话 ID。该管理员令牌本身不能读取或修改 Catalog；
+Catalog 仍由 BFF 在服务端使用 bootstrap Token，并通过显式路由白名单代理。
+
 ## COS 典型样本导入
 
 `scripts/import_cos_samples.py` 从 GMUSIC Mongo 索引和 COS 导入一组固定的小样本，用来验证多谱、修订、扫描附件、MIDI Rendition、Asset 去重和 Range 播放。当前样本为 `321`、`348`、`528`、`test1`、`110`。
