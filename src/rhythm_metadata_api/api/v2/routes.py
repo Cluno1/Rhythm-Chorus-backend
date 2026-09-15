@@ -28,8 +28,10 @@ from rhythm_metadata_api.domain.v2.schemas import (
     RenditionLyricReplace,
     RenditionPatch,
     ScoreCreate,
+    ScoreListResponse,
     ScorePatch,
     ScoreRevisionCreate,
+    ScoreRevisionListResponse,
     UploadCreate,
     WorkBundleResponse,
     WorkCreate,
@@ -371,6 +373,18 @@ def create_score(
     )
 
 
+@router.get("/scores", response_model=ScoreListResponse)
+def list_scores(
+    service: Catalog,
+    _: Actor,
+    q: str | None = None,
+    cursor: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> ScoreListResponse:
+    items, next_cursor = service.list_scores(q, cursor, limit)
+    return ScoreListResponse(items=items, next_cursor=next_cursor)
+
+
 @router.get("/scores/{score_id}")
 def get_score(score_id: str, service: Catalog, _: Actor) -> Response:
     item = service.get_score(score_id)
@@ -427,6 +441,13 @@ def create_score_revision(
             actor,
         )
     )
+
+
+@router.get("/scores/{score_id}/revisions", response_model=ScoreRevisionListResponse)
+def list_score_revisions(
+    score_id: str, service: Catalog, _: Actor
+) -> ScoreRevisionListResponse:
+    return ScoreRevisionListResponse(items=service.list_score_revisions(score_id))
 
 
 @router.get("/score-revisions/{revision_id}")

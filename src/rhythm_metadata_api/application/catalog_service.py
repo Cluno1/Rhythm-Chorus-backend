@@ -13,7 +13,7 @@ from typing import Any, TypeVar
 
 from sqlalchemy import and_, case, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from rhythm_metadata_api.application.unit_of_work import UnitOfWorkFactory
 from rhythm_metadata_api.core.config import Settings
@@ -66,6 +66,7 @@ from rhythm_metadata_api.domain.v2.schemas import (
     RenditionResponse,
     ScoreAssetResponse,
     ScoreCreate,
+    ScoreListItemResponse,
     ScorePatch,
     ScoreResponse,
     ScoreRevisionCreate,
@@ -1016,6 +1017,88 @@ class CatalogService:
         with self.uow_factory() as uow:
             return self._score_response(uow.session, self._require_score(uow.session, score_id))
 
+    def list_scores(
+        self, query: str | None, cursor: str | None, limit: int
+    ) -> tuple[list[ScoreListItemResponse], str | None]:
+        with self.uow_factory() as uow:
+            head_revision = aliased(ScoreRevision)
+            published_revision = aliased(ScoreRevision)
+            part_count = (
+                select(func.count(Part.id))
+                .where(
+                    Part.arrangement_id == Arrangement.id,
+                    Part.deleted_at.is_(None),
+                )
+                .correlate(Arrangement)
+                .scalar_subquery()
+            )
+            statement = (
+                select(
+                    Score,
+                    Arrangement,
+                    Work,
+                    head_revision.revision_no,
+                    published_revision.revision_no,
+                    part_count,
+                )
+                .join(Arrangement, Arrangement.id == Score.arrangement_id)
+                .join(Work, Work.id == Arrangement.work_id)
+                .outerjoin(head_revision, head_revision.id == Score.head_revision_id)
+                .outerjoin(
+                    published_revision,
+                    published_revision.id == Score.published_revision_id,
+                )
+                .where(
+                    Score.deleted_at.is_(None),
+                    Arrangement.deleted_at.is_(None),
+                    Work.deleted_at.is_(None),
+                )
+            )
+            if query:
+                term = f"%{query.strip()}%"
+                statement = statement.where(
+                    or_(
+                        Score.label.ilike(term),
+                        Arrangement.name.ilike(term),
+                        Work.canonical_title.ilike(term),
+                    )
+                )
+            if cursor:
+                statement = statement.where(Score.id > cursor)
+            rows = uow.session.execute(statement.order_by(Score.id).limit(limit + 1)).all()
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            return [
+                ScoreListItemResponse(
+                    id=score.id,
+                    arrangement_id=arrangement.id,
+                    work_id=work.id,
+                    work_title=work.canonical_title,
+                    arrangement_name=arrangement.name,
+                    arrangement_voicing=arrangement.voicing,
+                    arrangement_key_signature=arrangement.key_signature,
+                    part_count=score_part_count,
+                    label=score.label,
+                    origin=score.origin,
+                    head_revision_id=score.head_revision_id,
+                    head_revision_no=head_revision_no,
+                    published_revision_id=score.published_revision_id,
+                    published_revision_no=published_revision_no,
+                    preferred=arrangement.preferred_score_id == score.id,
+                    revision=score.revision,
+                    created_at=score.created_at,
+                    updated_at=score.updated_at,
+                )
+                for (
+                    score,
+                    arrangement,
+                    work,
+                    head_revision_no,
+                    published_revision_no,
+                    score_part_count,
+                ) in rows
+            ], rows[-1][0].id if has_more and rows else None
+
     def patch_score(
         self, score_id: str, request: ScorePatch, expected_revision: int, actor: ActorContext
     ) -> ScoreResponse:
@@ -1229,6 +1312,18 @@ class CatalogService:
             return self._score_revision_response(
                 uow.session, self._require_score_revision(uow.session, revision_id)
             )
+
+    def list_score_revisions(self, score_id: str) -> list[ScoreRevisionResponse]:
+        with self.uow_factory() as uow:
+            self._require_score(uow.session, score_id)
+            revisions = list(
+                uow.session.scalars(
+                    select(ScoreRevision)
+                    .where(ScoreRevision.score_id == score_id)
+                    .order_by(ScoreRevision.revision_no.desc())
+                )
+            )
+            return [self._score_revision_response(uow.session, item) for item in revisions]
 
     def create_rendition(
         self,

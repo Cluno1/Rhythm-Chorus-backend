@@ -75,8 +75,11 @@ POST  /v2/scores/{id}/lyric-source-pages
 POST  /v2/renditions/{id}/lyric-source-pages
 
 POST  /v2/arrangements/{id}/scores
+GET   /v2/scores
+GET   /v2/scores/{id}
 PATCH /v2/scores/{id}
 POST  /v2/scores/{id}/revisions
+GET   /v2/scores/{id}/revisions
 
 POST  /v2/arrangements/{id}/renditions
 PATCH /v2/renditions/{id}

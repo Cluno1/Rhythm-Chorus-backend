@@ -434,6 +434,36 @@ class ScoreResponse(LocalizedLyricsResponse):
     revision: int
 
 
+class ScoreListItemResponse(ApiModel):
+    id: str
+    arrangement_id: str
+    work_id: str
+    work_title: str
+    arrangement_name: str
+    arrangement_voicing: str | None
+    arrangement_key_signature: str | None
+    part_count: int
+    label: str
+    origin: str
+    head_revision_id: str | None
+    head_revision_no: int | None
+    published_revision_id: str | None
+    published_revision_no: int | None
+    preferred: bool
+    revision: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class ScoreListResponse(ApiModel):
+    items: list[ScoreListItemResponse]
+    next_cursor: str | None
+
+
+class ScoreRevisionListResponse(ApiModel):
+    items: list[ScoreRevisionResponse]
+
+
 class RenditionAssetInput(ApiModel):
     asset_id: str
     role: Literal["master", "stream", "mix", "stem", "midi"]

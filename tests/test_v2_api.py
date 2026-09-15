@@ -863,6 +863,135 @@ def test_private_catalog_end_to_end(client: TestClient) -> None:
     ]
 
 
+def test_score_admin_list_and_revision_history(client: TestClient) -> None:
+    work = post(
+        client,
+        "/v2/works",
+        "score-list-work",
+        {"canonical_title": "夜空中最亮的星", "language": "zh-Hans"},
+    ).json()
+    arrangement = post(
+        client,
+        f"/v2/works/{work['id']}/arrangements",
+        "score-list-arrangement",
+        {
+            "name": "正式编配",
+            "voicing": "SATB",
+            "key_signature": "C",
+            "parts": [
+                {"code": "S", "name": "女高音", "display_order": 1},
+                {"code": "A", "name": "女低音", "display_order": 2},
+            ],
+        },
+    ).json()
+    score_response = post(
+        client,
+        f"/v2/arrangements/{arrangement['id']}/scores",
+        "score-list-score",
+        {"label": "精校谱", "origin": "midi_transcription"},
+    )
+    score = score_response.json()
+
+    musicxml = b"<?xml version='1.0'?><score-partwise version='4.0'><part-list/></score-partwise>"
+    asset = upload_asset(
+        client,
+        key="score-list-musicxml",
+        content=musicxml,
+        media_type="application/vnd.recordare.musicxml+xml",
+        filename="score.musicxml",
+    )
+    revision_response = client.post(
+        f"/v2/scores/{score['id']}/revisions",
+        headers={**AUTH, "Idempotency-Key": "score-list-revision", "If-Match": '"rev-1"'},
+        json={
+            "edit_message": "修正节拍与歌词",
+            "assets": [{"asset_id": asset["id"], "role": "primary_musicxml"}],
+        },
+    )
+    assert revision_response.status_code == 201, revision_response.text
+    revision = revision_response.json()
+    published = client.patch(
+        f"/v2/scores/{score['id']}",
+        headers={**AUTH, "If-Match": '"rev-2"'},
+        json={"published_revision_id": revision["id"]},
+    )
+    assert published.status_code == 200, published.text
+    preferred = client.patch(
+        f"/v2/arrangements/{arrangement['id']}",
+        headers={**AUTH, "If-Match": '"rev-1"'},
+        json={"preferred_score_id": score["id"]},
+    )
+    assert preferred.status_code == 200, preferred.text
+
+    second_work = post(
+        client,
+        "/v2/works",
+        "score-list-other-work",
+        {"canonical_title": "另一首歌"},
+    ).json()
+    second_arrangement = post(
+        client,
+        f"/v2/works/{second_work['id']}/arrangements",
+        "score-list-other-arrangement",
+        {"name": "默认编配"},
+    ).json()
+    second_score = post(
+        client,
+        f"/v2/arrangements/{second_arrangement['id']}/scores",
+        "score-list-other-score",
+        {"label": "粗谱", "origin": "ocr"},
+    ).json()
+
+    filtered = client.get("/v2/scores?q=夜空", headers=AUTH)
+    assert filtered.status_code == 200, filtered.text
+    assert filtered.json()["next_cursor"] is None
+    assert filtered.json()["items"] == [
+        {
+            "id": score["id"],
+            "arrangement_id": arrangement["id"],
+            "work_id": work["id"],
+            "work_title": "夜空中最亮的星",
+            "arrangement_name": "正式编配",
+            "arrangement_voicing": "SATB",
+            "arrangement_key_signature": "C",
+            "part_count": 2,
+            "label": "精校谱",
+            "origin": "midi_transcription",
+            "head_revision_id": revision["id"],
+            "head_revision_no": 1,
+            "published_revision_id": revision["id"],
+            "published_revision_no": 1,
+            "preferred": True,
+            "revision": 3,
+            "created_at": filtered.json()["items"][0]["created_at"],
+            "updated_at": filtered.json()["items"][0]["updated_at"],
+        }
+    ]
+
+    first_page = client.get("/v2/scores?limit=1", headers=AUTH).json()
+    assert len(first_page["items"]) == 1
+    assert first_page["next_cursor"] is not None
+    second_page = client.get(
+        f"/v2/scores?limit=1&cursor={first_page['next_cursor']}", headers=AUTH
+    ).json()
+    assert len(second_page["items"]) == 1
+    assert {first_page["items"][0]["id"], second_page["items"][0]["id"]} == {
+        score["id"],
+        second_score["id"],
+    }
+
+    revisions = client.get(f"/v2/scores/{score['id']}/revisions", headers=AUTH)
+    assert revisions.status_code == 200, revisions.text
+    assert len(revisions.json()["items"]) == 1
+    listed_revision = revisions.json()["items"][0]
+    assert listed_revision["id"] == revision["id"]
+    assert listed_revision["revision_no"] == 1
+    assert listed_revision["edit_message"] == "修正节拍与歌词"
+    assert listed_revision["assets"] == revision["assets"]
+    missing = client.get("/v2/scores/missing/revisions", headers=AUTH)
+    assert missing.status_code == 404
+
+
 def test_multilingual_lyrics_crud_and_validation(client: TestClient) -> None:
     work = post(
         client,
