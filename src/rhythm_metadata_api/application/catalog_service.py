@@ -11,7 +11,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, TypeVar
 
-from sqlalchemy import and_, case, delete, func, or_, select
+from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
@@ -66,11 +66,15 @@ from rhythm_metadata_api.domain.v2.schemas import (
     RenditionResponse,
     ScoreAssetResponse,
     ScoreCreate,
+    ScoreDeleteImpactResponse,
+    ScoreDeleteResponse,
     ScoreListItemResponse,
     ScorePatch,
     ScoreResponse,
     ScoreRevisionCreate,
     ScoreRevisionResponse,
+    ScoreWithRevisionCreate,
+    ScoreWithRevisionResponse,
     UploadCreate,
     UploadCreateResponse,
     UploadStatusResponse,
@@ -92,8 +96,10 @@ from rhythm_metadata_api.infrastructure.db.models import (
     AssetSource,
     ChangeEvent,
     ChangeEventWork,
+    ChorusMixVariant,
     ChorusProject,
     ChorusTimeline,
+    ChorusTrack,
     Contributor,
     IdempotencyKey,
     LyricSourceDocument,
@@ -106,6 +112,7 @@ from rhythm_metadata_api.infrastructure.db.models import (
     RenditionAsset,
     RenditionCredit,
     Score,
+    ScoreRenditionSync,
     ScoreRevision,
     ScoreRevisionAsset,
     UploadSession,
@@ -1013,6 +1020,129 @@ class CatalogService:
             operation,
         )
 
+    def create_score_with_revision(
+        self,
+        arrangement_id: str,
+        request: ScoreWithRevisionCreate,
+        idempotency_key: str,
+        actor: ActorContext,
+    ) -> StoredResponse:
+        def operation(
+            session: Session,
+        ) -> tuple[ScoreWithRevisionResponse, int, dict[str, str]]:
+            if request.preferred and not request.publish:
+                raise V2DomainError("a preferred score must also be published")
+            arrangement = self._require_arrangement(session, arrangement_id)
+            if request.derived_from_revision_id:
+                source_revision = self._require_score_revision(
+                    session, request.derived_from_revision_id
+                )
+                source_score = self._require_score(session, source_revision.score_id)
+                if source_score.arrangement_id != arrangement.id:
+                    raise V2DomainError("derived revision must belong to the same arrangement")
+            work_language = session.scalar(
+                select(Work.language).where(Work.id == arrangement.work_id)
+            )
+            lyrics, lyrics_language, lyrics_translations = _normalize_lyrics_or_error(
+                request.lyrics,
+                request.lyrics_language,
+                request.lyrics_translations,
+                fallback_language=work_language,
+            )
+            revision_request = ScoreRevisionCreate(
+                edit_message=request.edit_message,
+                assets=request.assets,
+            )
+            assets = self._validate_score_assets(session, revision_request)
+            score = Score(
+                arrangement_id=arrangement.id,
+                label=request.label.strip(),
+                origin=request.origin,
+                derived_from_revision_id=request.derived_from_revision_id,
+                lyrics=lyrics,
+                lyrics_language=lyrics_language,
+                lyrics_translations=lyrics_translations,
+            )
+            session.add(score)
+            session.flush()
+            revision = ScoreRevision(
+                score_id=score.id,
+                revision_no=1,
+                edit_message=request.edit_message,
+                editor_id=actor.actor_id,
+            )
+            session.add(revision)
+            session.flush()
+            for item, _ in assets:
+                session.add(
+                    ScoreRevisionAsset(
+                        score_revision_id=revision.id,
+                        asset_id=item.asset_id,
+                        role=item.role,
+                    )
+                )
+            score.head_revision_id = revision.id
+            if request.publish:
+                score.published_revision_id = revision.id
+            if request.preferred:
+                arrangement.preferred_score_id = score.id
+                arrangement.revision += 1
+                arrangement.updated_at = utc_now()
+                self._append_event(
+                    session,
+                    arrangement.work_id,
+                    "arrangement",
+                    arrangement.id,
+                    arrangement.revision,
+                    "arrangement.updated",
+                    actor,
+                    {"fields": ["preferred_score_id"], "source": "score.created"},
+                )
+            self._append_event(
+                session,
+                arrangement.work_id,
+                "score",
+                score.id,
+                score.revision,
+                "score.created_with_revision",
+                actor,
+                {
+                    "score_revision_id": revision.id,
+                    "revision_no": 1,
+                    "published": request.publish,
+                    "preferred": request.preferred,
+                },
+            )
+            session.flush()
+            if request.publish:
+                self._open_chorus_project_for_published_revision(
+                    session,
+                    work_id=arrangement.work_id,
+                    score=score,
+                    score_revision=revision,
+                    actor=actor,
+                )
+            return (
+                ScoreWithRevisionResponse(
+                    score=self._score_response(session, score),
+                    revision=self._score_revision_response(session, revision),
+                    arrangement=self._arrangement_response(session, arrangement),
+                ),
+                201,
+                {
+                    "Location": f"/v2/scores/{score.id}",
+                    "ETag": etag(score.revision),
+                },
+            )
+
+        return self._idempotent(
+            f"POST:/v2/arrangements/{arrangement_id}/scores-with-revision",
+            idempotency_key,
+            request,
+            actor,
+            operation,
+        )
+
     def get_score(self, score_id: str) -> ScoreResponse:
         with self.uow_factory() as uow:
             return self._score_response(uow.session, self._require_score(uow.session, score_id))
@@ -1324,6 +1454,441 @@ class CatalogService:
                 )
             )
             return [self._score_revision_response(uow.session, item) for item in revisions]
+
+    def score_delete_impact(self, score_id: str) -> ScoreDeleteImpactResponse:
+        with self.uow_factory() as uow:
+            score = self._require_score(uow.session, score_id)
+            context = self._collect_score_delete_context(uow.session, score)
+            return context["impact"]
+
+    def delete_score(
+        self,
+        score_id: str,
+        expected_revision: int,
+        actor: ActorContext,
+    ) -> ScoreDeleteResponse:
+        garbage_asset_ids: set[str] = set()
+        with self.uow_factory() as uow:
+            session = uow.session
+            score = self._require_score(session, score_id)
+            require_revision(score.revision, expected_revision)
+            context = self._collect_score_delete_context(session, score)
+            impact: ScoreDeleteImpactResponse = context["impact"]
+            arrangement = self._require_arrangement(session, score.arrangement_id)
+            entity_revision = score.revision
+            revision_ids: set[str] = context["revision_ids"]
+            project_ids: set[str] = context["project_ids"]
+            timeline_ids: set[str] = context["timeline_ids"]
+            track_ids: set[str] = context["track_ids"]
+            chorus_rendition_ids: set[str] = context["chorus_rendition_ids"]
+            upload_session_ids: set[str] = context["upload_session_ids"]
+            candidate_asset_ids: set[str] = context["candidate_asset_ids"]
+
+            if arrangement.preferred_score_id == score.id:
+                arrangement.preferred_score_id = None
+                arrangement.revision += 1
+                arrangement.updated_at = utc_now()
+                self._append_event(
+                    session,
+                    arrangement.work_id,
+                    "arrangement",
+                    arrangement.id,
+                    arrangement.revision,
+                    "arrangement.updated",
+                    actor,
+                    {"fields": ["preferred_score_id"], "source": "score.deleted"},
+                )
+            if revision_ids:
+                session.execute(
+                    update(Score)
+                    .where(
+                        Score.id != score.id,
+                        Score.derived_from_revision_id.in_(revision_ids),
+                    )
+                    .values(derived_from_revision_id=None)
+                )
+            if project_ids:
+                session.execute(
+                    delete(ChorusMixVariant).where(
+                        ChorusMixVariant.chorus_project_id.in_(project_ids)
+                    )
+                )
+            if track_ids:
+                session.execute(delete(ChorusTrack).where(ChorusTrack.id.in_(track_ids)))
+            if timeline_ids:
+                session.execute(
+                    delete(ChorusTimeline).where(ChorusTimeline.id.in_(timeline_ids))
+                )
+            if project_ids:
+                session.execute(
+                    delete(ChorusProject).where(ChorusProject.id.in_(project_ids))
+                )
+            if upload_session_ids:
+                session.execute(
+                    delete(UploadSession).where(UploadSession.id.in_(upload_session_ids))
+                )
+            if revision_ids or chorus_rendition_ids:
+                conditions = []
+                if revision_ids:
+                    conditions.append(ScoreRenditionSync.score_revision_id.in_(revision_ids))
+                if chorus_rendition_ids:
+                    conditions.append(ScoreRenditionSync.rendition_id.in_(chorus_rendition_ids))
+                session.execute(delete(ScoreRenditionSync).where(or_(*conditions)))
+            if chorus_rendition_ids:
+                session.execute(
+                    delete(ReleaseItem).where(ReleaseItem.rendition_id.in_(chorus_rendition_ids))
+                )
+                session.execute(
+                    delete(LyricSourceLink).where(
+                        LyricSourceLink.rendition_id.in_(chorus_rendition_ids)
+                    )
+                )
+                session.execute(
+                    delete(RenditionCredit).where(
+                        RenditionCredit.rendition_id.in_(chorus_rendition_ids)
+                    )
+                )
+                session.execute(
+                    delete(RenditionAsset).where(
+                        RenditionAsset.rendition_id.in_(chorus_rendition_ids)
+                    )
+                )
+                session.execute(
+                    delete(Rendition).where(Rendition.id.in_(chorus_rendition_ids))
+                )
+            session.execute(delete(LyricSourceLink).where(LyricSourceLink.score_id == score.id))
+            if revision_ids:
+                session.execute(
+                    delete(ScoreRevisionAsset).where(
+                        ScoreRevisionAsset.score_revision_id.in_(revision_ids)
+                    )
+                )
+                score.head_revision_id = None
+                score.published_revision_id = None
+                score.derived_from_revision_id = None
+                session.flush()
+                session.execute(
+                    delete(ScoreRevision).where(ScoreRevision.id.in_(revision_ids))
+                )
+            session.delete(score)
+            session.flush()
+            for asset_id in candidate_asset_ids:
+                if not self._asset_has_live_business_reference(session, asset_id):
+                    asset = session.get(Asset, asset_id)
+                    if asset is not None:
+                        asset.deleted_at = utc_now()
+                        garbage_asset_ids.add(asset_id)
+            self._append_event(
+                session,
+                impact.work_id,
+                "score",
+                score_id,
+                entity_revision,
+                "score.deleted",
+                actor,
+                impact.model_dump(mode="json"),
+                tombstone=True,
+            )
+
+        garbage_collected = 0
+        pending_cleanup = 0
+        for asset_id in garbage_asset_ids:
+            with self.uow_factory() as uow:
+                locations = list(
+                    uow.session.scalars(
+                        select(AssetLocation).where(AssetLocation.asset_id == asset_id)
+                    )
+                )
+            if any(location.provider != "local" for location in locations):
+                pending_cleanup += 1
+                continue
+            try:
+                for location in locations:
+                    self.storage.discard(location.storage_key)
+            except OSError:
+                pending_cleanup += 1
+                continue
+            with self.uow_factory() as uow:
+                if self._asset_has_live_business_reference(uow.session, asset_id):
+                    pending_cleanup += 1
+                    continue
+                uow.session.execute(
+                    delete(AssetSource).where(AssetSource.asset_id == asset_id)
+                )
+                uow.session.execute(
+                    delete(AssetLocation).where(AssetLocation.asset_id == asset_id)
+                )
+                uow.session.execute(delete(Asset).where(Asset.id == asset_id))
+            garbage_collected += 1
+
+        return ScoreDeleteResponse(
+            deleted=True,
+            impact=impact,
+            garbage_collected_assets=garbage_collected,
+            pending_asset_cleanup=pending_cleanup,
+        )
+
+    def _collect_score_delete_context(
+        self,
+        session: Session,
+        score: Score,
+    ) -> dict[str, Any]:
+        arrangement = self._require_arrangement(session, score.arrangement_id)
+        revision_ids = set(
+            session.scalars(select(ScoreRevision.id).where(ScoreRevision.score_id == score.id))
+        )
+        project_conditions = [ChorusProject.score_id == score.id]
+        if revision_ids:
+            project_conditions.extend(
+                [
+                    ChorusProject.alignment_score_revision_id.in_(revision_ids),
+                    ChorusProject.id.in_(
+                        select(ChorusTimeline.chorus_project_id).where(
+                            ChorusTimeline.score_revision_id.in_(revision_ids)
+                        )
+                    ),
+                ]
+            )
+        project_ids = set(
+            session.scalars(select(ChorusProject.id).where(or_(*project_conditions)))
+        )
+        timeline_ids = set()
+        track_rows: list[tuple[str, str, str | None]] = []
+        mix_asset_ids: set[str] = set()
+        if project_ids:
+            timeline_ids = set(
+                session.scalars(
+                    select(ChorusTimeline.id).where(
+                        ChorusTimeline.chorus_project_id.in_(project_ids)
+                    )
+                )
+            )
+            track_rows = list(
+                session.execute(
+                    select(
+                        ChorusTrack.id,
+                        ChorusTrack.rendition_id,
+                        ChorusTrack.upload_session_id,
+                    ).where(ChorusTrack.chorus_project_id.in_(project_ids))
+                )
+            )
+            mix_asset_ids = {
+                asset_id
+                for asset_id in session.scalars(
+                    select(ChorusMixVariant.asset_id).where(
+                        ChorusMixVariant.chorus_project_id.in_(project_ids)
+                    )
+                )
+                if asset_id is not None
+            }
+        track_ids = {row[0] for row in track_rows}
+        chorus_rendition_ids = {row[1] for row in track_rows}
+        referenced_upload_session_ids = {row[2] for row in track_rows if row[2] is not None}
+        upload_session_ids = {
+            upload_id
+            for upload_id in referenced_upload_session_ids
+            if session.scalar(
+                select(ChorusTrack.id)
+                .where(
+                    ChorusTrack.upload_session_id == upload_id,
+                    ChorusTrack.id.not_in(track_ids),
+                )
+                .limit(1)
+            )
+            is None
+        }
+        upload_asset_ids = {
+            asset_id
+            for asset_id in session.scalars(
+                select(UploadSession.completed_asset_id).where(
+                    UploadSession.id.in_(upload_session_ids)
+                )
+            )
+            if asset_id is not None
+        }
+
+        score_asset_ids: set[str] = set()
+        score_file_links = 0
+        if revision_ids:
+            score_asset_rows = list(
+                session.execute(
+                    select(ScoreRevisionAsset.asset_id).where(
+                        ScoreRevisionAsset.score_revision_id.in_(revision_ids)
+                    )
+                )
+            )
+            score_file_links = len(score_asset_rows)
+            score_asset_ids = {row[0] for row in score_asset_rows}
+        rendition_asset_ids: set[str] = set()
+        rendition_cover_asset_ids: set[str] = set()
+        if chorus_rendition_ids:
+            rendition_asset_ids = set(
+                session.scalars(
+                    select(RenditionAsset.asset_id).where(
+                        RenditionAsset.rendition_id.in_(chorus_rendition_ids)
+                    )
+                )
+            )
+            rendition_cover_asset_ids = {
+                asset_id
+                for asset_id in session.scalars(
+                    select(Rendition.cover_asset_id).where(
+                        Rendition.id.in_(chorus_rendition_ids)
+                    )
+                )
+                if asset_id is not None
+            }
+        candidate_asset_ids = (
+            score_asset_ids
+            | rendition_asset_ids
+            | rendition_cover_asset_ids
+            | mix_asset_ids
+            | upload_asset_ids
+        )
+        shared_asset_ids = {
+            asset_id
+            for asset_id in candidate_asset_ids
+            if self._asset_has_reference_outside_score_branch(
+                session,
+                asset_id,
+                revision_ids=revision_ids,
+                rendition_ids=chorus_rendition_ids,
+                project_ids=project_ids,
+                track_ids=track_ids,
+            )
+        }
+
+        sync_conditions = []
+        if revision_ids:
+            sync_conditions.append(ScoreRenditionSync.score_revision_id.in_(revision_ids))
+        if chorus_rendition_ids:
+            sync_conditions.append(ScoreRenditionSync.rendition_id.in_(chorus_rendition_ids))
+        sync_anchors = session.scalar(
+            select(func.count()).select_from(ScoreRenditionSync).where(or_(*sync_conditions))
+        ) if sync_conditions else 0
+        lyric_conditions = [LyricSourceLink.score_id == score.id]
+        if chorus_rendition_ids:
+            lyric_conditions.append(LyricSourceLink.rendition_id.in_(chorus_rendition_ids))
+        impact = ScoreDeleteImpactResponse(
+            score_id=score.id,
+            work_id=arrangement.work_id,
+            arrangement_id=arrangement.id,
+            revisions=len(revision_ids),
+            score_file_links=score_file_links,
+            lyric_source_links=session.scalar(
+                select(func.count()).select_from(LyricSourceLink).where(or_(*lyric_conditions))
+            ) or 0,
+            sync_anchors=sync_anchors or 0,
+            detached_derived_scores=session.scalar(
+                select(func.count()).select_from(Score).where(
+                    Score.id != score.id,
+                    Score.derived_from_revision_id.in_(revision_ids),
+                )
+            ) if revision_ids else 0,
+            chorus_projects=len(project_ids),
+            chorus_timelines=len(timeline_ids),
+            chorus_tracks=len(track_ids),
+            upload_sessions=len(upload_session_ids),
+            chorus_renditions=len(chorus_rendition_ids),
+            release_items=session.scalar(
+                select(func.count()).select_from(ReleaseItem).where(
+                    ReleaseItem.rendition_id.in_(chorus_rendition_ids)
+                )
+            ) if chorus_rendition_ids else 0,
+            candidate_assets=len(candidate_asset_ids),
+            garbage_collect_assets=len(candidate_asset_ids - shared_asset_ids),
+            shared_assets=len(shared_asset_ids),
+            clears_preferred_score=arrangement.preferred_score_id == score.id,
+        )
+        return {
+            "impact": impact,
+            "revision_ids": revision_ids,
+            "project_ids": project_ids,
+            "timeline_ids": timeline_ids,
+            "track_ids": track_ids,
+            "chorus_rendition_ids": chorus_rendition_ids,
+            "upload_session_ids": upload_session_ids,
+            "candidate_asset_ids": candidate_asset_ids,
+        }
+
+    @staticmethod
+    def _asset_has_reference_outside_score_branch(
+        session: Session,
+        asset_id: str,
+        *,
+        revision_ids: set[str],
+        rendition_ids: set[str],
+        project_ids: set[str],
+        track_ids: set[str],
+    ) -> bool:
+        direct_checks = [
+            select(Work.id).where(Work.cover_asset_id == asset_id),
+            select(Arrangement.id).where(Arrangement.cover_asset_id == asset_id),
+            select(Release.id).where(Release.cover_asset_id == asset_id),
+            select(LyricSourceDocument.id).where(
+                LyricSourceDocument.document_asset_id == asset_id
+            ),
+            select(LyricSourcePage.id).where(LyricSourcePage.image_asset_id == asset_id),
+        ]
+        if session.scalar(
+            select(Rendition.id).where(
+                Rendition.cover_asset_id == asset_id,
+                Rendition.id.not_in(rendition_ids),
+            ).limit(1)
+        ) is not None:
+            return True
+        if session.scalar(
+            select(ScoreRevisionAsset.id).where(
+                ScoreRevisionAsset.asset_id == asset_id,
+                ScoreRevisionAsset.score_revision_id.not_in(revision_ids),
+            ).limit(1)
+        ) is not None:
+            return True
+        if session.scalar(
+            select(RenditionAsset.id).where(
+                RenditionAsset.asset_id == asset_id,
+                RenditionAsset.rendition_id.not_in(rendition_ids),
+            ).limit(1)
+        ) is not None:
+            return True
+        if session.scalar(
+            select(ChorusMixVariant.id).where(
+                ChorusMixVariant.asset_id == asset_id,
+                ChorusMixVariant.chorus_project_id.not_in(project_ids),
+            ).limit(1)
+        ) is not None:
+            return True
+        if session.scalar(
+            select(ChorusTrack.id)
+            .join(UploadSession, UploadSession.id == ChorusTrack.upload_session_id)
+            .where(
+                UploadSession.completed_asset_id == asset_id,
+                ChorusTrack.id.not_in(track_ids),
+            )
+            .limit(1)
+        ) is not None:
+            return True
+        return any(session.scalar(statement.limit(1)) is not None for statement in direct_checks)
+
+    @staticmethod
+    def _asset_has_live_business_reference(session: Session, asset_id: str) -> bool:
+        checks = [
+            select(Work.id).where(Work.cover_asset_id == asset_id),
+            select(Arrangement.id).where(Arrangement.cover_asset_id == asset_id),
+            select(Rendition.id).where(Rendition.cover_asset_id == asset_id),
+            select(Release.id).where(Release.cover_asset_id == asset_id),
+            select(LyricSourceDocument.id).where(
+                LyricSourceDocument.document_asset_id == asset_id
+            ),
+            select(LyricSourcePage.id).where(LyricSourcePage.image_asset_id == asset_id),
+            select(ScoreRevisionAsset.id).where(ScoreRevisionAsset.asset_id == asset_id),
+            select(RenditionAsset.id).where(RenditionAsset.asset_id == asset_id),
+            select(ChorusMixVariant.id).where(ChorusMixVariant.asset_id == asset_id),
+            select(ChorusTrack.id)
+            .join(UploadSession, UploadSession.id == ChorusTrack.upload_session_id)
+            .where(UploadSession.completed_asset_id == asset_id),
+        ]
+        return any(session.scalar(statement.limit(1)) is not None for statement in checks)
 
     def create_rendition(
         self,

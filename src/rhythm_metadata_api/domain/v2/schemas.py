@@ -434,6 +434,53 @@ class ScoreResponse(LocalizedLyricsResponse):
     revision: int
 
 
+class ScoreWithRevisionCreate(ScoreCreate):
+    edit_message: str | None = Field(default=None, max_length=2000)
+    assets: list[ScoreAssetInput] = Field(min_length=1)
+    publish: bool = False
+    preferred: bool = False
+
+    @model_validator(mode="after")
+    def valid_initial_revision(self) -> ScoreWithRevisionCreate:
+        if sum(item.role == "primary_musicxml" for item in self.assets) != 1:
+            raise ValueError("exactly one primary_musicxml asset is required")
+        return self
+
+
+class ScoreWithRevisionResponse(ApiModel):
+    score: ScoreResponse
+    revision: ScoreRevisionResponse
+    arrangement: ArrangementResponse
+
+
+class ScoreDeleteImpactResponse(ApiModel):
+    score_id: str
+    work_id: str
+    arrangement_id: str
+    revisions: int
+    score_file_links: int
+    lyric_source_links: int
+    sync_anchors: int
+    detached_derived_scores: int
+    chorus_projects: int
+    chorus_timelines: int
+    chorus_tracks: int
+    upload_sessions: int
+    chorus_renditions: int
+    release_items: int
+    candidate_assets: int
+    garbage_collect_assets: int
+    shared_assets: int
+    clears_preferred_score: bool
+
+
+class ScoreDeleteResponse(ApiModel):
+    deleted: bool
+    impact: ScoreDeleteImpactResponse
+    garbage_collected_assets: int
+    pending_asset_cleanup: int
+
+
 class ScoreListItemResponse(ApiModel):
     id: str
     arrangement_id: str

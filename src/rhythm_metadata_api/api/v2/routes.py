@@ -28,10 +28,13 @@ from rhythm_metadata_api.domain.v2.schemas import (
     RenditionLyricReplace,
     RenditionPatch,
     ScoreCreate,
+    ScoreDeleteImpactResponse,
+    ScoreDeleteResponse,
     ScoreListResponse,
     ScorePatch,
     ScoreRevisionCreate,
     ScoreRevisionListResponse,
+    ScoreWithRevisionCreate,
     UploadCreate,
     WorkBundleResponse,
     WorkCreate,
@@ -373,6 +376,24 @@ def create_score(
     )
 
 
+@router.post("/arrangements/{arrangement_id}/scores-with-revision")
+def create_score_with_revision(
+    arrangement_id: str,
+    body: ScoreWithRevisionCreate,
+    service: Catalog,
+    actor: Actor,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> Response:
+    return stored_response(
+        service.create_score_with_revision(
+            arrangement_id,
+            body,
+            require_idempotency(idempotency_key),
+            actor,
+        )
+    )
+
+
 @router.get("/scores", response_model=ScoreListResponse)
 def list_scores(
     service: Catalog,
@@ -391,6 +412,11 @@ def get_score(score_id: str, service: Catalog, _: Actor) -> Response:
     return model_response(item, headers={"ETag": etag(item.revision)})
 
 
+@router.get("/scores/{score_id}/delete-impact", response_model=ScoreDeleteImpactResponse)
+def score_delete_impact(score_id: str, service: Catalog, _: Actor) -> Response:
+    return model_response(service.score_delete_impact(score_id))
+
+
 @router.patch("/scores/{score_id}")
 def patch_score(
     score_id: str,
@@ -401,6 +427,18 @@ def patch_score(
 ) -> Response:
     item = service.patch_score(score_id, body, require_if_match(if_match), actor)
     return model_response(item, headers={"ETag": etag(item.revision)})
+
+
+@router.delete("/scores/{score_id}", response_model=ScoreDeleteResponse)
+def delete_score(
+    score_id: str,
+    service: Catalog,
+    actor: Actor,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> Response:
+    return model_response(
+        service.delete_score(score_id, require_if_match(if_match), actor)
+    )
 
 
 @router.post("/scores/{score_id}/lyric-source-pages")

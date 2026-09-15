@@ -12,16 +12,24 @@ from rhythm_metadata_api.infrastructure.db.models import (
     Arrangement,
     Asset,
     AssetLocation,
+    AssetSource,
+    AuthUser,
+    ChangeEvent,
+    ChangeEventWork,
+    ChorusMixVariant,
     ChorusProject,
     ChorusTimeline,
+    ChorusTrack,
     Contributor,
     Release,
     ReleaseItem,
     Rendition,
     RenditionAsset,
     Score,
+    ScoreRenditionSync,
     ScoreRevision,
     ScoreRevisionAsset,
+    UploadSession,
     Work,
     WorkCredit,
     utc_now,
@@ -83,6 +91,402 @@ def upload_asset(
     completed = post(client, f"/v2/uploads/{upload_id}/complete", f"{key}-complete", {})
     assert completed.status_code == 200, completed.text
     return completed.json()["asset"]
+
+
+def test_create_score_with_initial_revision_is_atomic_and_idempotent(
+    client: TestClient,
+) -> None:
+    work = post(client, "/v2/works", "atomic-work", {"canonical_title": "Amazing Grace"})
+    assert work.status_code == 201
+    arrangement = post(
+        client,
+        f"/v2/works/{work.json()['id']}/arrangements",
+        "atomic-arrangement",
+        {"name": "SATB", "voicing": "SATB"},
+    )
+    assert arrangement.status_code == 201
+    asset = upload_asset(
+        client,
+        key="atomic-score-file",
+        content=b"<score-partwise version='4.0'><part-list/></score-partwise>",
+        media_type="application/vnd.recordare.musicxml+xml",
+        filename="amazing-grace.musicxml",
+    )
+    payload = {
+        "label": "SATB total score",
+        "origin": "external_import",
+        "edit_message": "Initial reviewed score",
+        "assets": [{"asset_id": asset["id"], "role": "primary_musicxml"}],
+        "publish": True,
+        "preferred": True,
+    }
+    created = post(
+        client,
+        f"/v2/arrangements/{arrangement.json()['id']}/scores-with-revision",
+        "atomic-score",
+        payload,
+    )
+    assert created.status_code == 201, created.text
+    assert created.headers["etag"] == '"rev-1"'
+    result = created.json()
+    assert result["score"]["head_revision_id"] == result["revision"]["id"]
+    assert result["score"]["published_revision_id"] == result["revision"]["id"]
+    assert result["revision"]["revision_no"] == 1
+    assert result["arrangement"]["preferred_score_id"] == result["score"]["id"]
+
+    replay = post(
+        client,
+        f"/v2/arrangements/{arrangement.json()['id']}/scores-with-revision",
+        "atomic-score",
+        payload,
+    )
+    assert replay.status_code == 201
+    assert replay.headers["Idempotency-Replayed"] == "true"
+    assert replay.json()["score"]["id"] == result["score"]["id"]
+
+    with Session(client.app.state.v2_container.engine) as session:
+        assert session.query(Score).count() == 1
+        assert session.query(ScoreRevision).count() == 1
+        assert session.query(ScoreRevisionAsset).count() == 1
+
+    invalid = post(
+        client,
+        f"/v2/arrangements/{arrangement.json()['id']}/scores-with-revision",
+        "atomic-score-invalid",
+        {**payload, "publish": False, "preferred": True},
+    )
+    assert invalid.status_code == 422
+
+
+def test_delete_score_removes_its_branch_and_exclusive_asset(client: TestClient) -> None:
+    work = post(client, "/v2/works", "delete-work", {"canonical_title": "Bad score work"})
+    arrangement = post(
+        client,
+        f"/v2/works/{work.json()['id']}/arrangements",
+        "delete-arrangement",
+        {"name": "SATB", "voicing": "SATB"},
+    )
+    asset = upload_asset(
+        client,
+        key="delete-score-file",
+        content=b"<score-partwise version='4.0'><part-list/></score-partwise>",
+        media_type="application/vnd.recordare.musicxml+xml",
+        filename="bad.musicxml",
+    )
+    created = post(
+        client,
+        f"/v2/arrangements/{arrangement.json()['id']}/scores-with-revision",
+        "delete-score",
+        {
+            "label": "Wrong score",
+            "origin": "external_import",
+            "assets": [{"asset_id": asset["id"], "role": "primary_musicxml"}],
+            "publish": True,
+            "preferred": True,
+        },
+    )
+    assert created.status_code == 201, created.text
+    score = created.json()["score"]
+
+    with Session(client.app.state.v2_container.engine) as session:
+        location = session.query(AssetLocation).filter_by(asset_id=asset["id"]).one()
+        object_path = Path(client.app.state.v2_container.settings.local_object_root) / location.storage_key
+    assert object_path.is_file()
+
+    impact = client.get(f"/v2/scores/{score['id']}/delete-impact", headers=AUTH)
+    assert impact.status_code == 200, impact.text
+    assert impact.json() == {
+        "score_id": score["id"],
+        "work_id": work.json()["id"],
+        "arrangement_id": arrangement.json()["id"],
+        "revisions": 1,
+        "score_file_links": 1,
+        "lyric_source_links": 0,
+        "sync_anchors": 0,
+        "detached_derived_scores": 0,
+        "chorus_projects": 0,
+        "chorus_timelines": 0,
+        "chorus_tracks": 0,
+        "upload_sessions": 0,
+        "chorus_renditions": 0,
+        "release_items": 0,
+        "candidate_assets": 1,
+        "garbage_collect_assets": 1,
+        "shared_assets": 0,
+        "clears_preferred_score": True,
+    }
+
+    stale = client.delete(
+        f"/v2/scores/{score['id']}",
+        headers={**AUTH, "If-Match": '"rev-99"'},
+    )
+    assert stale.status_code == 412
+
+    deleted = client.delete(
+        f"/v2/scores/{score['id']}",
+        headers={**AUTH, "If-Match": '"rev-1"'},
+    )
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["deleted"] is True
+    assert deleted.json()["garbage_collected_assets"] == 1
+    assert deleted.json()["pending_asset_cleanup"] == 0
+    assert client.get(f"/v2/scores/{score['id']}", headers=AUTH).status_code == 404
+    assert client.get(f"/v2/works/{work.json()['id']}", headers=AUTH).status_code == 200
+    assert not object_path.exists()
+
+    with Session(client.app.state.v2_container.engine) as session:
+        kept_arrangement = session.get(Arrangement, arrangement.json()["id"])
+        assert kept_arrangement is not None
+        assert kept_arrangement.preferred_score_id is None
+        assert session.get(Asset, asset["id"]) is None
+        assert session.query(AssetLocation).filter_by(asset_id=asset["id"]).count() == 0
+        assert session.query(AssetSource).filter_by(asset_id=asset["id"]).count() == 0
+        event = (
+            session.query(ChangeEvent)
+            .filter_by(entity_id=score["id"], operation="score.deleted")
+            .one()
+        )
+        assert event.tombstone is True
+        assert (
+            session.query(ChangeEventWork)
+            .filter_by(event_sequence=event.sequence, work_id=work.json()["id"])
+            .count()
+            == 1
+        )
+
+
+def test_delete_score_preserves_shared_and_sibling_resources(client: TestClient) -> None:
+    work = post(client, "/v2/works", "shared-work", {"canonical_title": "Shared work"})
+    arrangement = post(
+        client,
+        f"/v2/works/{work.json()['id']}/arrangements",
+        "shared-arrangement",
+        {"name": "SATB", "voicing": "SATB"},
+    )
+    asset = upload_asset(
+        client,
+        key="shared-score-file",
+        content=b"<score-partwise version='4.0'><part-list/></score-partwise>",
+        media_type="application/vnd.recordare.musicxml+xml",
+        filename="shared.musicxml",
+    )
+    target = post(
+        client,
+        f"/v2/arrangements/{arrangement.json()['id']}/scores-with-revision",
+        "shared-target-score",
+        {
+            "label": "Bad score",
+            "origin": "external_import",
+            "assets": [{"asset_id": asset["id"], "role": "primary_musicxml"}],
+        },
+    ).json()
+    sibling = post(
+        client,
+        f"/v2/arrangements/{arrangement.json()['id']}/scores-with-revision",
+        "shared-sibling-score",
+        {
+            "label": "Good score",
+            "origin": "manual",
+            "derived_from_revision_id": target["revision"]["id"],
+            "assets": [{"asset_id": asset["id"], "role": "primary_musicxml"}],
+        },
+    ).json()
+    with Session(client.app.state.v2_container.engine) as session, session.begin():
+        rendition = Rendition(
+            arrangement_id=arrangement.json()["id"],
+            label="Ordinary reference recording",
+            kind="reference",
+        )
+        session.add(rendition)
+        session.flush()
+        rendition_id = rendition.id
+        session.add(
+            ScoreRenditionSync(
+                score_revision_id=target["revision"]["id"],
+                rendition_id=rendition.id,
+                anchor_order=0,
+                score_tick=0,
+                media_ms=0,
+                confidence_milli=1000,
+                source="manual",
+            )
+        )
+
+    impact = client.get(
+        f"/v2/scores/{target['score']['id']}/delete-impact", headers=AUTH
+    )
+    assert impact.status_code == 200
+    assert impact.json()["shared_assets"] == 1
+    assert impact.json()["garbage_collect_assets"] == 0
+    assert impact.json()["detached_derived_scores"] == 1
+    assert impact.json()["sync_anchors"] == 1
+
+    deleted = client.delete(
+        f"/v2/scores/{target['score']['id']}",
+        headers={**AUTH, "If-Match": '"rev-1"'},
+    )
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["garbage_collected_assets"] == 0
+
+    with Session(client.app.state.v2_container.engine) as session:
+        kept_score = session.get(Score, sibling["score"]["id"])
+        assert kept_score is not None
+        assert kept_score.derived_from_revision_id is None
+        assert session.get(Rendition, rendition_id) is not None
+        assert session.query(ScoreRenditionSync).count() == 0
+        assert session.get(Asset, asset["id"]) is not None
+        assert (
+            session.query(ScoreRevisionAsset)
+            .filter_by(score_revision_id=sibling["revision"]["id"], asset_id=asset["id"])
+            .count()
+            == 1
+        )
+
+
+def test_delete_score_removes_dependent_chorus_branch(client: TestClient) -> None:
+    work = post(client, "/v2/works", "chorus-delete-work", {"canonical_title": "Chorus"})
+    arrangement = post(
+        client,
+        f"/v2/works/{work.json()['id']}/arrangements",
+        "chorus-delete-arrangement",
+        {"name": "Choir", "voicing": "SATB"},
+    )
+    asset = upload_asset(
+        client,
+        key="chorus-delete-file",
+        content=b"<score-partwise version='4.0'><part-list/></score-partwise>",
+        media_type="application/vnd.recordare.musicxml+xml",
+        filename="chorus.musicxml",
+    )
+    created = post(
+        client,
+        f"/v2/arrangements/{arrangement.json()['id']}/scores-with-revision",
+        "chorus-delete-score",
+        {
+            "label": "Wrong chorus score",
+            "origin": "external_import",
+            "assets": [{"asset_id": asset["id"], "role": "primary_musicxml"}],
+        },
+    ).json()
+
+    with Session(client.app.state.v2_container.engine) as session, session.begin():
+        upload = session.query(UploadSession).filter_by(completed_asset_id=asset["id"]).one()
+        user = AuthUser(id="chorus-delete-user", display_name="Chorus singer")
+        session.add(user)
+        project = ChorusProject(
+            work_id=work.json()["id"],
+            arrangement_id=arrangement.json()["id"],
+            score_id=created["score"]["id"],
+            alignment_score_revision_id=created["revision"]["id"],
+            timeline_hash=asset["sha256"],
+            title="Bad chorus project",
+            status="open",
+            created_by_user_id=user.id,
+        )
+        session.add(project)
+        session.flush()
+        timeline = ChorusTimeline(
+            chorus_project_id=project.id,
+            score_revision_id=created["revision"]["id"],
+            timeline_hash=asset["sha256"],
+        )
+        rendition = Rendition(
+            arrangement_id=arrangement.json()["id"],
+            label="Chorus submission",
+            kind="chorus_track",
+        )
+        release = Release(key="chorus-delete-release", title="Kept release")
+        session.add_all([timeline, rendition, release])
+        session.flush()
+        track = ChorusTrack(
+            chorus_project_id=project.id,
+            chorus_timeline_id=timeline.id,
+            rendition_id=rendition.id,
+            uploader_user_id=user.id,
+            upload_session_id=upload.id,
+            contribution_kind="vocal_part",
+            display_label="Soprano",
+        )
+        session.add(track)
+        session.flush()
+        session.add_all(
+            [
+                RenditionAsset(
+                    rendition_id=rendition.id,
+                    asset_id=asset["id"],
+                    role="original",
+                ),
+                ScoreRenditionSync(
+                    score_revision_id=created["revision"]["id"],
+                    rendition_id=rendition.id,
+                    anchor_order=0,
+                    score_tick=0,
+                    media_ms=0,
+                    confidence_milli=1000,
+                    source="manual",
+                ),
+                ChorusMixVariant(
+                    chorus_project_id=project.id,
+                    chorus_timeline_id=timeline.id,
+                    selection_hash="0" * 64,
+                    selected_track_ids=[track.id],
+                    selected_track_count=1,
+                    mix_profile="default",
+                    state="ready",
+                    asset_id=asset["id"],
+                ),
+                ReleaseItem(
+                    release_id=release.id,
+                    rendition_id=rendition.id,
+                    display_order=1,
+                ),
+            ]
+        )
+        project_id = project.id
+        timeline_id = timeline.id
+        track_id = track.id
+        rendition_id = rendition.id
+        release_id = release.id
+        upload_id = upload.id
+
+    impact = client.get(
+        f"/v2/scores/{created['score']['id']}/delete-impact", headers=AUTH
+    )
+    assert impact.status_code == 200, impact.text
+    assert {
+        key: impact.json()[key]
+        for key in (
+            "chorus_projects",
+            "chorus_timelines",
+            "chorus_tracks",
+            "upload_sessions",
+            "chorus_renditions",
+            "release_items",
+            "sync_anchors",
+        )
+    } == {
+        "chorus_projects": 1,
+        "chorus_timelines": 1,
+        "chorus_tracks": 1,
+        "upload_sessions": 1,
+        "chorus_renditions": 1,
+        "release_items": 1,
+        "sync_anchors": 1,
+    }
+
+    deleted = client.delete(
+        f"/v2/scores/{created['score']['id']}",
+        headers={**AUTH, "If-Match": '"rev-1"'},
+    )
+    assert deleted.status_code == 200, deleted.text
+    with Session(client.app.state.v2_container.engine) as session:
+        assert session.get(ChorusProject, project_id) is None
+        assert session.get(ChorusTimeline, timeline_id) is None
+        assert session.get(ChorusTrack, track_id) is None
+        assert session.get(Rendition, rendition_id) is None
+        assert session.get(UploadSession, upload_id) is None
+        assert session.get(Release, release_id) is not None
+        assert session.query(ReleaseItem).filter_by(release_id=release_id).count() == 0
 
 
 def test_publishing_revision_opens_matching_chorus_project(client: TestClient) -> None:

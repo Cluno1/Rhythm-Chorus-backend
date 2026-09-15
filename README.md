@@ -75,9 +75,12 @@ POST  /v2/scores/{id}/lyric-source-pages
 POST  /v2/renditions/{id}/lyric-source-pages
 
 POST  /v2/arrangements/{id}/scores
+POST  /v2/arrangements/{id}/scores-with-revision
 GET   /v2/scores
 GET   /v2/scores/{id}
 PATCH /v2/scores/{id}
+GET   /v2/scores/{id}/delete-impact
+DELETE /v2/scores/{id}
 POST  /v2/scores/{id}/revisions
 GET   /v2/scores/{id}/revisions
 
@@ -96,6 +99,11 @@ GET   /v2/sync/changes?after=<sequence>
 作品不会进入客户端歌曲/乐谱投影，也不会计入专辑歌曲数；Release/专辑本身仍独立管理。
 
 典型文件流程：客户端先计算 hash 和大小，`POST /v2/uploads`；若不是 `reused`，流式 `PUT` 字节并 `POST complete`；最后把返回的 Asset ID 关联到 ScoreRevision 或 Rendition。
+
+管理端新增乐谱时可使用 `scores-with-revision`，在单个数据库事务中同时创建
+Score、修订 1、主 MusicXML 关系，并按需设置 published/preferred。删除乐谱前先调用
+`delete-impact` 展示范围，再用最新 Score ETag 执行 `DELETE`：目标 Revision 和依赖的合唱
+工程分支会清除，父节点、兄弟资源与共享 Asset 保留，无其他引用的本地 Asset 同时物理回收。
 
 ### 多语言歌词
 
