@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, Query, Request, Response
+from fastapi.responses import JSONResponse
 
 from rhythm_metadata_api.api.v2.routes import (
     Actor,
@@ -12,9 +13,11 @@ from rhythm_metadata_api.api.v2.routes import (
     stored_response,
 )
 from rhythm_metadata_api.application.chorus_service import ChorusService
+from rhythm_metadata_api.application.pending_center import PendingCenterService
 from rhythm_metadata_api.domain.v2.chorus import (
     ChorusMixResolveRequest,
     ChorusModerationRequest,
+    ChorusModerationSettingsPatch,
     ChorusProjectCreate,
     ChorusTrackAlignmentPatch,
     ChorusTrackCreate,
@@ -28,6 +31,30 @@ def chorus(request: Request) -> ChorusService:
 
 
 Chorus = Annotated[ChorusService, Depends(chorus)]
+
+
+@router.get("/management/pending")
+def management_pending(
+    service: Chorus,
+    actor: Actor,
+    track_status: Literal["pending_review", "published", "rejected"] = "pending_review",
+    track_limit: Annotated[int, Query(ge=1, le=100)] = 30,
+    track_offset: Annotated[int, Query(ge=0)] = 0,
+) -> Response:
+    payload = PendingCenterService(service.uow_factory).summary().model_dump(mode="json")
+    payload["tracks"] = service.list_tracks_for_moderation(
+        track_status, actor, track_limit, track_offset
+    ).model_dump(mode="json")
+    payload["track_counts"] = service.moderation_counts()
+    payload["moderation_settings"] = service.moderation_settings().model_dump(mode="json")
+    return JSONResponse(content=payload, headers={"Cache-Control": "no-store"})
+
+
+@router.patch("/management/chorus-moderation-settings")
+def management_moderation_settings(
+    body: ChorusModerationSettingsPatch, service: Chorus, actor: Actor
+) -> Response:
+    return model_response(service.update_moderation_settings(body.automatic_approval, actor))
 
 
 @router.get("/works/{work_id}/chorus")

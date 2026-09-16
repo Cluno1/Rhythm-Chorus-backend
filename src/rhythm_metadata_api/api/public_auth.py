@@ -260,8 +260,9 @@ def list_chorus_tracks_for_moderation(
         Literal["pending_review", "published", "rejected"], Query()
     ] = "pending_review",
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
 ):
-    return model_response(chorus_service(request).list_tracks_for_moderation(status, admin, limit))
+    return model_response(chorus_service(request).list_tracks_for_moderation(status, admin, limit, offset))
 
 
 @router.patch("/admin/chorus/tracks/{track_id}/moderation")

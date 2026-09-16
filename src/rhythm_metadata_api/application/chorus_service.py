@@ -14,7 +14,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, TypeVar
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from rhythm_metadata_api.application.catalog_service import (
@@ -175,25 +175,33 @@ class ChorusService:
             )
 
     def list_tracks_for_moderation(
-        self, status: str, actor: ActorContext, limit: int = 100
+        self, status: str, actor: ActorContext, limit: int = 100, offset: int = 0
     ) -> ChorusModerationQueueResponse:
         if status not in {"pending_review", "published", "rejected"}:
             raise V2DomainError("unsupported moderation status")
         with self.uow_factory() as uow:
+            conditions = (
+                ChorusTrack.status == status,
+                ChorusTrack.deleted_at.is_(None),
+                ChorusProject.deleted_at.is_(None),
+            )
+            total = uow.session.scalar(
+                select(func.count(ChorusTrack.id))
+                .join(ChorusProject, ChorusProject.id == ChorusTrack.chorus_project_id)
+                .where(*conditions)
+            ) or 0
             rows = list(
                 uow.session.execute(
                     select(ChorusTrack, ChorusProject)
                     .join(ChorusProject, ChorusProject.id == ChorusTrack.chorus_project_id)
-                    .where(
-                        ChorusTrack.status == status,
-                        ChorusTrack.deleted_at.is_(None),
-                        ChorusProject.deleted_at.is_(None),
-                    )
+                    .where(*conditions)
                     .order_by(ChorusTrack.updated_at.desc(), ChorusTrack.id)
                     .limit(limit)
+                    .offset(offset)
                 )
             )
             return ChorusModerationQueueResponse(
+                total=total,
                 items=[
                     ChorusModerationQueueItem(
                         work_id=project.work_id,
@@ -203,6 +211,22 @@ class ChorusService:
                     for track, project in rows
                 ]
             )
+
+    def moderation_counts(self) -> dict[str, int]:
+        counts = {status: 0 for status in ("pending_review", "published", "rejected")}
+        with self.uow_factory() as uow:
+            rows = uow.session.execute(
+                select(ChorusTrack.status, func.count(ChorusTrack.id))
+                .join(ChorusProject, ChorusProject.id == ChorusTrack.chorus_project_id)
+                .where(
+                    ChorusTrack.status.in_(counts),
+                    ChorusTrack.deleted_at.is_(None),
+                    ChorusProject.deleted_at.is_(None),
+                )
+                .group_by(ChorusTrack.status)
+            )
+            counts.update({status: count for status, count in rows})
+        return counts
 
     def create_project(
         self,

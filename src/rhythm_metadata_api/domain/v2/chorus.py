@@ -211,6 +211,7 @@ class ChorusModerationQueueItem(ChorusApiModel):
 
 class ChorusModerationQueueResponse(ChorusApiModel):
     items: list[ChorusModerationQueueItem]
+    total: int
 
 
 class ChorusMixResolveRequest(ChorusApiModel):
