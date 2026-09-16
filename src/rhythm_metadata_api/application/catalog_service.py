@@ -349,6 +349,8 @@ class CatalogService:
         actor: ActorContext,
     ) -> StoredResponse:
         def operation(session: Session) -> tuple[WorkResponse, int, dict[str, str]]:
+            if request.cover_asset_id is not None:
+                self._validate_cover_asset(session, request.cover_asset_id)
             self._require_contributors(
                 session, [credit.contributor_id for credit in request.credits]
             )
@@ -362,6 +364,7 @@ class CatalogService:
                 canonical_title=request.canonical_title.strip(),
                 language=request.language,
                 status=request.status,
+                cover_asset_id=request.cover_asset_id,
                 lyrics=lyrics,
                 lyrics_language=lyrics_language,
                 lyrics_translations=lyrics_translations,
@@ -432,6 +435,8 @@ class CatalogService:
                     self._require_contributors(
                         uow.session, [credit["contributor_id"] for credit in credits]
                     )
+                if "cover_asset_id" in changes and changes["cover_asset_id"] is not None:
+                    self._validate_cover_asset(uow.session, changes["cover_asset_id"])
                 _merge_lyrics_patch(
                     work,
                     changes,
@@ -3014,6 +3019,7 @@ class CatalogService:
             canonical_title=work.canonical_title,
             language=work.language,
             status=work.status,
+            cover_asset_id=work.cover_asset_id,
             lyrics=work.lyrics,
             lyrics_language=work.lyrics_language,
             lyrics_translations=work.lyrics_translations,
