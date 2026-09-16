@@ -1771,6 +1771,16 @@ def test_shared_lyric_source_pages_and_effective_precedence(client: TestClient) 
         assert page.status_code == 201, page.text
         pages.append(page.json())
 
+    document_list = client.get("/v2/lyric-source-documents", headers=AUTH)
+    assert document_list.status_code == 200, document_list.text
+    listed_document = next(
+        item for item in document_list.json()["items"] if item["id"] == document_id
+    )
+    assert listed_document["title"] == "IHOP Songbook 2024"
+    assert [page["id"] for page in listed_document["pages"]] == [
+        page["id"] for page in pages
+    ]
+
     work_ids = []
     for index in (1, 2):
         work = post(

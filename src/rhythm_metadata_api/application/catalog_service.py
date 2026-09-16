@@ -49,6 +49,7 @@ from rhythm_metadata_api.domain.v2.schemas import (
     LibrarySongResponse,
     LyricLanguageFormat,
     LyricSourceDocumentCreate,
+    LyricSourceDocumentListResponse,
     LyricSourceDocumentResponse,
     LyricSourceImageResponse,
     LyricSourceLinkCreate,
@@ -897,6 +898,23 @@ class CatalogService:
         with self.uow_factory() as uow:
             document = self._require_lyric_source_document(uow.session, document_id)
             return self._lyric_source_document_response(uow.session, document)
+
+    def list_lyric_source_documents(self) -> LyricSourceDocumentListResponse:
+        with self.uow_factory() as uow:
+            documents = list(
+                uow.session.scalars(
+                    select(LyricSourceDocument).order_by(
+                        LyricSourceDocument.title,
+                        LyricSourceDocument.id,
+                    )
+                )
+            )
+            return LyricSourceDocumentListResponse(
+                items=[
+                    self._lyric_source_document_response(uow.session, document)
+                    for document in documents
+                ]
+            )
 
     def add_lyric_source_page(
         self,

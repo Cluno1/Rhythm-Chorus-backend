@@ -111,6 +111,10 @@ class LyricSourceDocumentResponse(LyricSourceDocumentCreate):
     updated_at: datetime
 
 
+class LyricSourceDocumentListResponse(ApiModel):
+    items: list[LyricSourceDocumentResponse]
+
+
 class LyricSourceImageResponse(ApiModel):
     link_id: str
     source_page_id: str

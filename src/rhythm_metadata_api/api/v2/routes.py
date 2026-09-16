@@ -20,6 +20,7 @@ from rhythm_metadata_api.domain.v2.schemas import (
     ContributorCreate,
     ContributorListResponse,
     LyricSourceDocumentCreate,
+    LyricSourceDocumentListResponse,
     LyricSourceLinkCreate,
     LyricSourcePageCreate,
     PartInput,
@@ -322,6 +323,13 @@ def create_lyric_source_document(
     return stored_response(
         service.create_lyric_source_document(body, require_idempotency(idempotency_key), actor)
     )
+
+
+@router.get("/lyric-source-documents", response_model=LyricSourceDocumentListResponse)
+def list_lyric_source_documents(
+    service: Catalog, _: Actor
+) -> LyricSourceDocumentListResponse:
+    return service.list_lyric_source_documents()
 
 
 @router.get("/lyric-source-documents/{document_id}")
