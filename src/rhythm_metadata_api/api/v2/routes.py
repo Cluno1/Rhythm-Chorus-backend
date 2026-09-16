@@ -22,6 +22,7 @@ from rhythm_metadata_api.domain.v2.schemas import (
     LyricSourceDocumentCreate,
     LyricSourceDocumentListResponse,
     LyricSourceLinkCreate,
+    LyricSourceLinkPatch,
     LyricSourcePageCreate,
     PartInput,
     ReleaseListResponse,
@@ -370,6 +371,36 @@ def attach_work_lyric_source_page(
             actor,
         )
     )
+
+
+@router.patch("/works/{work_id}/lyric-source-pages/{link_id}")
+def update_work_lyric_source_page(
+    work_id: str,
+    link_id: str,
+    body: LyricSourceLinkPatch,
+    service: Catalog,
+    actor: Actor,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> Response:
+    revision = require_if_match(if_match)
+    item = service.update_work_lyric_source_page(
+        work_id, link_id, body, revision, actor
+    )
+    return model_response(item, headers={"ETag": etag(revision + 1)})
+
+
+@router.delete("/works/{work_id}/lyric-source-pages/{link_id}")
+def remove_work_lyric_source_page(
+    work_id: str,
+    link_id: str,
+    service: Catalog,
+    actor: Actor,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> Response:
+    item = service.remove_work_lyric_source_page(
+        work_id, link_id, require_if_match(if_match), actor
+    )
+    return model_response(item, headers={"ETag": etag(item.revision)})
 
 
 @router.post("/arrangements/{arrangement_id}/scores")

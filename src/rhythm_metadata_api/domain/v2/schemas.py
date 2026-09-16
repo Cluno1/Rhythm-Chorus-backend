@@ -92,6 +92,14 @@ class LyricSourceLinkCreate(ApiModel):
     note: str | None = Field(default=None, max_length=10_000)
 
 
+class LyricSourceLinkPatch(ApiModel):
+    display_order: int | None = Field(default=None, ge=1)
+    language_relations: list[LyricSourceLanguageRelation] | None = Field(
+        default=None, max_length=100
+    )
+    note: str | None = Field(default=None, max_length=10_000)
+
+
 class LyricSourcePageResponse(ApiModel):
     id: str
     document_id: str

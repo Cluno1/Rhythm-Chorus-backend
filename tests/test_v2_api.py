@@ -1997,3 +1997,39 @@ def test_shared_lyric_source_pages_and_effective_precedence(client: TestClient) 
         ]
         == pages[0]["id"]
     )
+
+    work_before_edit = client.get(f"/v2/works/{work_ids[0]}", headers=AUTH).json()
+    edited_link = client.patch(
+        f"/v2/works/{work_ids[0]}/lyric-source-pages/{second_work_page.json()['link_id']}",
+        headers={**AUTH, "If-Match": f'"rev-{work_before_edit["revision"]}"'},
+        json={
+            "display_order": 4,
+            "language_relations": [{"language": "en", "relation": "printed"}],
+            "note": "Revised source page",
+        },
+    )
+    assert edited_link.status_code == 200, edited_link.text
+    assert edited_link.json()["display_order"] == 4
+    assert edited_link.json()["language_relations"] == [
+        {"language": "en", "relation": "printed", "derived_from_language": None}
+    ]
+    assert edited_link.json()["note"] == "Revised source page"
+
+    stale_removal = client.delete(
+        f"/v2/works/{work_ids[0]}/lyric-source-pages/{second_work_page.json()['link_id']}",
+        headers={**AUTH, "If-Match": f'"rev-{work_before_edit["revision"]}"'},
+    )
+    assert stale_removal.status_code == 412
+
+    removed_link = client.delete(
+        f"/v2/works/{work_ids[0]}/lyric-source-pages/{second_work_page.json()['link_id']}",
+        headers={**AUTH, "If-Match": edited_link.headers["etag"]},
+    )
+    assert removed_link.status_code == 200, removed_link.text
+    assert [item["source_page_id"] for item in removed_link.json()["lyrics_source_images"]] == [
+        pages[0]["id"]
+    ]
+    assert client.get(f"/v2/works/{work_ids[1]}", headers=AUTH).json()[
+        "lyrics_source_images"
+    ][0]["source_page_id"] == pages[0]["id"]
+    assert client.get(f"/v2/lyric-source-documents/{document_id}", headers=AUTH).status_code == 200
