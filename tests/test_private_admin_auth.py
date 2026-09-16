@@ -25,7 +25,9 @@ def test_private_api_accepts_admin_login_without_expanding_catalog_scope(
             json={"username": "owner", "password": "correct horse battery staple"},
         )
         assert response.status_code == 200
-        admin_token = response.json()["accessToken"]
+        session = response.json()
+        assert session["expiresIn"] == 7 * 24 * 60 * 60
+        admin_token = session["accessToken"]
 
         devices = client.get(
             "/v2/admin/devices",

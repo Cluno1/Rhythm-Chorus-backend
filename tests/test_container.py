@@ -90,6 +90,16 @@ def test_settings_validates_configurable_invite_ttl() -> None:
         Settings(public_invite_ttl_seconds=86401)
 
 
+def test_settings_defaults_admin_token_ttl_to_seven_days() -> None:
+    seven_days = 7 * 24 * 60 * 60
+
+    assert Settings().public_admin_token_ttl_seconds == seven_days
+    configured = Settings(public_admin_token_ttl_seconds=seven_days)
+    assert configured.public_admin_token_ttl_seconds == seven_days
+    with pytest.raises(ValueError, match="admin token TTL"):
+        Settings(public_admin_token_ttl_seconds=seven_days + 1)
+
+
 def test_multi_device_migration_backfills_slots_and_supports_safe_downgrade(
     tmp_path: Path,
 ) -> None:

@@ -3,6 +3,8 @@ from functools import lru_cache
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+PUBLIC_ADMIN_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="RHYTHM_", env_file=".env", extra="ignore")
@@ -37,7 +39,7 @@ class Settings(BaseSettings):
     public_admin_username: str = "admin"
     public_admin_password_hash: str = ""
     public_access_token_ttl_seconds: int = 10 * 60
-    public_admin_token_ttl_seconds: int = 5 * 60
+    public_admin_token_ttl_seconds: int = PUBLIC_ADMIN_TOKEN_TTL_SECONDS
     public_device_session_ttl_days: int = 90
     public_max_active_devices_per_user_app: int = 2
     public_invite_ttl_seconds: int = 10 * 60
@@ -57,8 +59,8 @@ class Settings(BaseSettings):
             raise ValueError("RHYTHM_COS_PRESIGN_EXPIRES_SECONDS must be between 60 and 3600")
         if not 60 <= self.public_access_token_ttl_seconds <= 3600:
             raise ValueError("public access token TTL must be between 60 and 3600 seconds")
-        if not 60 <= self.public_admin_token_ttl_seconds <= 900:
-            raise ValueError("public admin token TTL must be between 60 and 900 seconds")
+        if not 60 <= self.public_admin_token_ttl_seconds <= PUBLIC_ADMIN_TOKEN_TTL_SECONDS:
+            raise ValueError("public admin token TTL must be between 60 and 604800 seconds")
         if not 1 <= self.public_device_session_ttl_days <= 365:
             raise ValueError("public device session TTL must be between 1 and 365 days")
         if not 1 <= self.public_max_active_devices_per_user_app <= 100:
