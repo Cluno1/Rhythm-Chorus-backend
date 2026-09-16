@@ -533,6 +533,26 @@ class RenditionAssetResponse(RenditionAssetInput):
     media_type: str
 
 
+class RenditionCreditResponse(ApiModel):
+    id: str
+    contributor_id: str
+    display_name: str
+    role: str
+    position: int
+
+
+class RenditionReleasePlacementInput(ApiModel):
+    release_id: str
+    disc_no: int = Field(default=1, ge=1)
+    track_no: int | None = Field(default=None, ge=1)
+    display_order: int = Field(ge=1)
+
+
+class RenditionReleasePlacementResponse(RenditionReleasePlacementInput):
+    id: str
+    release_title: str
+
+
 class RenditionCreate(LocalizedLyricsCreate):
     label: str = Field(min_length=1, max_length=500)
     kind: str = Field(min_length=1, max_length=50)
@@ -540,6 +560,12 @@ class RenditionCreate(LocalizedLyricsCreate):
     recorded_at: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     location: str | None = Field(default=None, max_length=500)
     duration_ms: int | None = Field(default=None, ge=0)
+    cover_asset_id: str | None = None
+    credits: list[CreditInput] = Field(default_factory=list, max_length=100)
+    release_placements: list[RenditionReleasePlacementInput] = Field(
+        default_factory=list, max_length=100
+    )
+    lyrics_formats: list[LyricLanguageFormat] = Field(default_factory=list, max_length=100)
     assets: list[RenditionAssetInput] = Field(default_factory=list)
 
 
@@ -550,6 +576,12 @@ class RenditionPatch(LocalizedLyricsPatch):
     recorded_at: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     location: str | None = Field(default=None, max_length=500)
     duration_ms: int | None = Field(default=None, ge=0)
+    cover_asset_id: str | None = None
+    credits: list[CreditInput] | None = Field(default=None, max_length=100)
+    release_placements: list[RenditionReleasePlacementInput] | None = Field(
+        default=None, max_length=100
+    )
+    lyrics_formats: list[LyricLanguageFormat] | None = Field(default=None, max_length=100)
 
 
 class RenditionResponse(LocalizedLyricsResponse):
@@ -561,8 +593,27 @@ class RenditionResponse(LocalizedLyricsResponse):
     recorded_at: str | None
     location: str | None
     duration_ms: int | None
+    management_category: Literal["finished_audio", "reference_resource", "chorus_track"]
+    cover_asset_id: str | None
+    credits: list[RenditionCreditResponse]
+    release_placements: list[RenditionReleasePlacementResponse]
+    lyrics_formats: list[LyricLanguageFormat]
     revision: int
     assets: list[RenditionAssetResponse]
+
+
+class ReleaseListItemResponse(ApiModel):
+    id: str
+    key: str
+    title: str
+    album_artist: str | None
+    release_date: str | None
+    cover_asset_id: str | None
+    revision: int
+
+
+class ReleaseListResponse(ApiModel):
+    items: list[ReleaseListItemResponse]
 
 
 class PlaybackResponse(ApiModel):

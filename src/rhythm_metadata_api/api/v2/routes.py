@@ -23,6 +23,7 @@ from rhythm_metadata_api.domain.v2.schemas import (
     LyricSourceLinkCreate,
     LyricSourcePageCreate,
     PartInput,
+    ReleaseListResponse,
     RenditionAssetInput,
     RenditionCreate,
     RenditionLyricReplace,
@@ -524,6 +525,11 @@ def patch_rendition(
     return model_response(item, headers={"ETag": etag(item.revision)})
 
 
+@router.get("/releases", response_model=ReleaseListResponse)
+def list_releases(service: Catalog, _: Actor) -> ReleaseListResponse:
+    return ReleaseListResponse(items=service.list_releases())
+
+
 @router.put("/renditions/{rendition_id}/lyrics/{language}")
 def replace_rendition_lyrics(
     rendition_id: str,
@@ -584,6 +590,23 @@ def add_rendition_asset(
             actor,
         )
     )
+
+
+@router.delete("/renditions/{rendition_id}/assets/{link_id}")
+def remove_rendition_asset(
+    rendition_id: str,
+    link_id: str,
+    service: Catalog,
+    actor: Actor,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> Response:
+    item = service.remove_rendition_asset(
+        rendition_id,
+        link_id,
+        require_if_match(if_match),
+        actor,
+    )
+    return model_response(item, headers={"ETag": etag(item.revision)})
 
 
 @router.get("/renditions/{rendition_id}/playback")

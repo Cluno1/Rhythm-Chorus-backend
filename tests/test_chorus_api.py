@@ -210,6 +210,9 @@ def test_chorus_upload_process_publish_and_mix(client: TestClient) -> None:
     assert ready_mix.json()["selected_track_ids"] == [track_id]
     assert ready_mix.json()["delivery"]["delivery"] == "authenticated_url"
     assert ready_mix.json()["delivery"]["media_type"] == "audio/mp4"
+    project_with_mix = client.get(f"/v2/chorus-projects/{project_id}", headers=AUTH)
+    assert project_with_mix.json()["mixes"][0]["id"] == mix_id
+    assert project_with_mix.json()["mixes"][0]["state"] == "ready"
 
     assert service.update_moderation_settings(True, ActorContext()).automatic_approval is True
     automatic_audio = _wav_bytes(320)
@@ -378,4 +381,6 @@ def test_non_owner_cannot_read_draft_or_withdraw_track(client: TestClient) -> No
     with pytest.raises(V2NotFound):
         service.withdraw_track(track["id"], other)
     service.withdraw_track(track["id"], ActorContext())
-    assert service.get_project(project["id"], ActorContext()).tracks == []
+    management_view = service.get_project(project["id"], ActorContext())
+    assert management_view.tracks[0].status == "withdrawn"
+    assert service.get_project(project["id"], other).tracks == []

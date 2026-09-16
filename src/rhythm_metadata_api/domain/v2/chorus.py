@@ -78,6 +78,19 @@ class ChorusTimelineResponse(ChorusApiModel):
     updated_at: datetime
 
 
+class ChorusMixSummaryResponse(ChorusApiModel):
+    id: str
+    chorus_timeline_id: str
+    selected_track_ids: list[str]
+    selected_track_count: int
+    mix_profile: str
+    state: str
+    duration_ms: int | None
+    error_summary: str | None
+    created_at: datetime
+    ready_at: datetime | None
+
+
 class ChorusProjectResponse(ChorusApiModel):
     id: str
     work_id: str
@@ -92,6 +105,7 @@ class ChorusProjectResponse(ChorusApiModel):
     parts: list[ChorusPartResponse]
     timelines: list[ChorusTimelineResponse]
     tracks: list[ChorusTrackResponse]
+    mixes: list[ChorusMixSummaryResponse]
     created_at: datetime
     updated_at: datetime
 

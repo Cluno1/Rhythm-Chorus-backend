@@ -29,6 +29,7 @@ from rhythm_metadata_api.core.config import Settings
 from rhythm_metadata_api.domain.v2.chorus import (
     ChorusMixResolveRequest,
     ChorusMixResponse,
+    ChorusMixSummaryResponse,
     ChorusModerationQueueItem,
     ChorusModerationQueueResponse,
     ChorusModerationRequest,
@@ -115,13 +116,17 @@ class ChorusService:
     def list_for_work(self, work_id: str, actor: ActorContext) -> WorkChorusResponse:
         with self.uow_factory() as uow:
             self._require_work(uow.session, work_id)
+            management_actor = actor.device_id is None and actor.actor_id == "owner"
+            project_statuses = (
+                ("draft", "open", "closed") if management_actor else ("open", "closed")
+            )
             projects = list(
                 uow.session.scalars(
                     select(ChorusProject)
                     .where(
                         ChorusProject.work_id == work_id,
                         ChorusProject.deleted_at.is_(None),
-                        ChorusProject.status.in_(("open", "closed")),
+                        ChorusProject.status.in_(project_statuses),
                     )
                     .order_by(ChorusProject.created_at, ChorusProject.id)
                 )
@@ -1253,12 +1258,16 @@ class ChorusService:
                 .order_by(ChorusTrack.created_at, ChorusTrack.id)
             )
         )
-        visible = [
-            track
-            for track in tracks
-            if track.status == "published"
-            or (track.uploader_user_id == actor.actor_id and track.status != "withdrawn")
-        ]
+        visible = (
+            tracks
+            if actor.device_id is None and actor.actor_id == "owner"
+            else [
+                track
+                for track in tracks
+                if track.status == "published"
+                or (track.uploader_user_id == actor.actor_id and track.status != "withdrawn")
+            ]
+        )
         timelines = list(
             session.scalars(
                 select(ChorusTimeline)
@@ -1268,6 +1277,13 @@ class ChorusService:
                     ChorusTimeline.deleted_at.is_(None),
                 )
                 .order_by(ScoreRevision.revision_no.desc(), ChorusTimeline.id)
+            )
+        )
+        mixes = list(
+            session.scalars(
+                select(ChorusMixVariant)
+                .where(ChorusMixVariant.chorus_project_id == project.id)
+                .order_by(ChorusMixVariant.created_at.desc(), ChorusMixVariant.id)
             )
         )
         return ChorusProjectResponse(
@@ -1302,6 +1318,21 @@ class ChorusService:
                 for timeline in timelines
             ],
             tracks=[self._track_response(session, track, actor) for track in visible],
+            mixes=[
+                ChorusMixSummaryResponse(
+                    id=mix.id,
+                    chorus_timeline_id=mix.chorus_timeline_id,
+                    selected_track_ids=mix.selected_track_ids,
+                    selected_track_count=mix.selected_track_count,
+                    mix_profile=mix.mix_profile,
+                    state=mix.state,
+                    duration_ms=mix.duration_ms,
+                    error_summary=mix.error_summary,
+                    created_at=mix.created_at,
+                    ready_at=mix.ready_at,
+                )
+                for mix in mixes
+            ],
             created_at=project.created_at,
             updated_at=project.updated_at,
         )
@@ -1558,7 +1589,8 @@ class ChorusService:
         self, session: Session, track_id: str, actor: ActorContext
     ) -> ChorusTrack:
         item = self._require_track(session, track_id)
-        if item.uploader_user_id != actor.actor_id:
+        management_actor = actor.device_id is None and actor.actor_id == "owner"
+        if item.uploader_user_id != actor.actor_id and not management_actor:
             raise V2NotFound("chorus track not found")
         return item
 

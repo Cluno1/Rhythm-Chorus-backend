@@ -40,6 +40,7 @@ from rhythm_metadata_api.domain.v2.schemas import (
     ChangesResponse,
     ContributorCreate,
     ContributorResponse,
+    CreditInput,
     EffectiveLyricSourcesResponse,
     LibraryAlbumDetailResponse,
     LibraryAlbumResponse,
@@ -57,12 +58,16 @@ from rhythm_metadata_api.domain.v2.schemas import (
     PartInput,
     PartResponse,
     PlaybackResponse,
+    ReleaseListItemResponse,
     RenditionAssetInput,
     RenditionAssetResponse,
     RenditionCreate,
+    RenditionCreditResponse,
     RenditionLyricReplace,
     RenditionLyricWriteResponse,
     RenditionPatch,
+    RenditionReleasePlacementInput,
+    RenditionReleasePlacementResponse,
     RenditionResponse,
     ScoreAssetResponse,
     ScoreCreate,
@@ -169,6 +174,44 @@ def _rendition_format_map(rendition: Rendition) -> dict[str, str]:
         if raw_format in _LYRIC_FORMATS:
             result[language.casefold()] = raw_format
     return result
+
+
+def _rendition_management_category(kind: str) -> str:
+    normalized = kind.strip().lower()
+    if normalized == "chorus_track":
+        return "chorus_track"
+    if normalized in {"rehearsal", "reference_audio", "reference_midi"}:
+        return "reference_resource"
+    return "finished_audio"
+
+
+def _normalize_rendition_formats(
+    lyrics: str | None,
+    lyrics_language: str,
+    translations: list[dict[str, str]],
+    requested: list[LyricLanguageFormat],
+) -> dict[str, str]:
+    content_by_language = {
+        lyrics_language.casefold(): (lyrics_language, lyrics or ""),
+        **{
+            item["language"].casefold(): (item["language"], item["lyrics"])
+            for item in translations
+        },
+    }
+    requested_by_language: dict[str, str] = {}
+    for item in requested:
+        key = item.language.casefold()
+        if key in requested_by_language:
+            raise V2DomainError(f"duplicate lyric format language: {item.language}")
+        if key not in content_by_language:
+            raise V2DomainError(f"lyric format language has no lyrics: {item.language}")
+        requested_by_language[key] = item.format
+    if lyrics is None:
+        return {}
+    return {
+        language: requested_by_language.get(key, _detect_lyric_format(content))
+        for key, (language, content) in content_by_language.items()
+    }
 
 
 def _translation_dicts(
@@ -1908,6 +1951,8 @@ class CatalogService:
                 request.lyrics_translations,
                 fallback_language=work_language,
             )
+            if request.cover_asset_id is not None:
+                self._validate_cover_asset(session, request.cover_asset_id)
             rendition = Rendition(
                 arrangement_id=arrangement.id,
                 label=request.label.strip(),
@@ -1916,12 +1961,23 @@ class CatalogService:
                 recorded_at=request.recorded_at,
                 location=request.location,
                 duration_ms=request.duration_ms,
+                cover_asset_id=request.cover_asset_id,
                 lyrics=lyrics,
                 lyrics_language=lyrics_language,
                 lyrics_translations=lyrics_translations,
+                lyrics_formats=_normalize_rendition_formats(
+                    lyrics,
+                    lyrics_language,
+                    lyrics_translations,
+                    request.lyrics_formats,
+                ),
             )
             session.add(rendition)
             session.flush()
+            self._replace_rendition_credits(session, rendition.id, request.credits)
+            self._replace_rendition_release_placements(
+                session, rendition.id, request.release_placements
+            )
             for item in request.assets:
                 self._add_rendition_asset(session, rendition, item)
             self._append_event(
@@ -1970,14 +2026,46 @@ class CatalogService:
             changes = request.model_dump(exclude_unset=True)
             if not changes:
                 return self._rendition_response(uow.session, rendition)
+            changed_fields = sorted(changes)
             work_language = uow.session.scalar(
                 select(Work.language)
                 .join(Arrangement, Arrangement.work_id == Work.id)
                 .where(Arrangement.id == rendition.arrangement_id)
             )
             _merge_lyrics_patch(rendition, changes, fallback_language=work_language)
+            credits = changes.pop("credits", None)
+            release_placements = changes.pop("release_placements", None)
+            requested_formats = changes.pop("lyrics_formats", None)
+            if "cover_asset_id" in changes and changes["cover_asset_id"] is not None:
+                self._validate_cover_asset(uow.session, changes["cover_asset_id"])
+            format_items = (
+                [
+                    LyricLanguageFormat(language=language, format=format_name)
+                    for language, format_name in _rendition_format_map(rendition).items()
+                ]
+                if requested_formats is None
+                else [LyricLanguageFormat.model_validate(item) for item in requested_formats]
+            )
+            resulting_lyrics = changes.get("lyrics", rendition.lyrics)
+            resulting_language = changes.get("lyrics_language", rendition.lyrics_language)
+            resulting_translations = changes.get(
+                "lyrics_translations", rendition.lyrics_translations
+            )
+            resulting_formats = _normalize_rendition_formats(
+                resulting_lyrics,
+                resulting_language,
+                resulting_translations,
+                format_items,
+            )
             for key, value in changes.items():
                 setattr(rendition, key, value.strip() if isinstance(value, str) else value)
+            rendition.lyrics_formats = resulting_formats
+            if credits is not None:
+                self._replace_rendition_credits(uow.session, rendition.id, credits)
+            if release_placements is not None:
+                self._replace_rendition_release_placements(
+                    uow.session, rendition.id, release_placements
+                )
             rendition.revision += 1
             rendition.updated_at = utc_now()
             work_id = self._work_id_for_arrangement(uow.session, rendition.arrangement_id)
@@ -1989,9 +2077,31 @@ class CatalogService:
                 rendition.revision,
                 "rendition.updated",
                 actor,
-                {"fields": sorted(changes)},
+                {"fields": changed_fields},
             )
             return self._rendition_response(uow.session, rendition)
+
+    def list_releases(self) -> list[ReleaseListItemResponse]:
+        with self.uow_factory() as uow:
+            releases = list(
+                uow.session.scalars(
+                    select(Release)
+                    .where(Release.deleted_at.is_(None))
+                    .order_by(Release.title, Release.id)
+                )
+            )
+            return [
+                ReleaseListItemResponse(
+                    id=item.id,
+                    key=item.key,
+                    title=item.title,
+                    album_artist=item.album_artist,
+                    release_date=item.release_date,
+                    cover_asset_id=item.cover_asset_id,
+                    revision=item.revision,
+                )
+                for item in releases
+            ]
 
     def replace_rendition_lyrics(
         self,
@@ -2151,6 +2261,37 @@ class CatalogService:
             actor,
             operation,
         )
+
+    def remove_rendition_asset(
+        self,
+        rendition_id: str,
+        link_id: str,
+        expected_revision: int,
+        actor: ActorContext,
+    ) -> RenditionResponse:
+        with self.uow_factory() as uow:
+            rendition = self._require_rendition(uow.session, rendition_id)
+            require_revision(rendition.revision, expected_revision)
+            link = uow.session.get(RenditionAsset, link_id)
+            if link is None or link.rendition_id != rendition.id:
+                raise V2NotFound("rendition asset link not found")
+            asset_id = link.asset_id
+            uow.session.delete(link)
+            rendition.revision += 1
+            rendition.updated_at = utc_now()
+            work_id = self._work_id_for_arrangement(uow.session, rendition.arrangement_id)
+            self._append_event(
+                uow.session,
+                work_id,
+                "rendition",
+                rendition.id,
+                rendition.revision,
+                "rendition.asset_removed",
+                actor,
+                {"asset_id": asset_id, "link_id": link_id},
+            )
+            uow.session.flush()
+            return self._rendition_response(uow.session, rendition)
 
     def playback(self, rendition_id: str, prefer: str | None) -> PlaybackResponse:
         with self.uow_factory() as uow:
@@ -2955,11 +3096,23 @@ class CatalogService:
         )
 
     def _rendition_response(self, session: Session, rendition: Rendition) -> RenditionResponse:
-        rows = session.execute(
+        asset_rows = session.execute(
             select(RenditionAsset, Asset)
             .join(Asset, Asset.id == RenditionAsset.asset_id)
             .where(RenditionAsset.rendition_id == rendition.id)
             .order_by(RenditionAsset.role, RenditionAsset.id)
+        ).all()
+        credit_rows = session.execute(
+            select(RenditionCredit, Contributor)
+            .join(Contributor, Contributor.id == RenditionCredit.contributor_id)
+            .where(RenditionCredit.rendition_id == rendition.id)
+            .order_by(RenditionCredit.position, RenditionCredit.id)
+        ).all()
+        release_rows = session.execute(
+            select(ReleaseItem, Release)
+            .join(Release, Release.id == ReleaseItem.release_id)
+            .where(ReleaseItem.rendition_id == rendition.id)
+            .order_by(Release.title, ReleaseItem.display_order, ReleaseItem.id)
         ).all()
         return RenditionResponse(
             id=rendition.id,
@@ -2970,12 +3123,39 @@ class CatalogService:
             recorded_at=rendition.recorded_at,
             location=rendition.location,
             duration_ms=rendition.duration_ms,
+            management_category=_rendition_management_category(rendition.kind),
+            cover_asset_id=rendition.cover_asset_id,
             lyrics=rendition.lyrics,
             lyrics_language=rendition.lyrics_language,
             lyrics_translations=rendition.lyrics_translations,
             lyrics_source_images=self._lyric_source_images_for_owner(
                 session, "rendition", rendition.id
             ),
+            lyrics_formats=[
+                LyricLanguageFormat(language=language, format=format_name)
+                for language, format_name in (rendition.lyrics_formats or {}).items()
+            ],
+            credits=[
+                RenditionCreditResponse(
+                    id=credit.id,
+                    contributor_id=contributor.id,
+                    display_name=contributor.display_name,
+                    role=credit.role,
+                    position=credit.position,
+                )
+                for credit, contributor in credit_rows
+            ],
+            release_placements=[
+                RenditionReleasePlacementResponse(
+                    id=item.id,
+                    release_id=release.id,
+                    release_title=release.title,
+                    disc_no=item.disc_no,
+                    track_no=item.track_no,
+                    display_order=item.display_order,
+                )
+                for item, release in release_rows
+            ],
             revision=rendition.revision,
             assets=[
                 RenditionAssetResponse(
@@ -2988,7 +3168,7 @@ class CatalogService:
                     byte_size=asset.byte_size,
                     media_type=asset.detected_media_type,
                 )
-                for link, asset in rows
+                for link, asset in asset_rows
             ],
         )
 
@@ -3280,6 +3460,84 @@ class CatalogService:
                 raise V2DomainError("primary_musicxml must reference a validated MusicXML asset")
             result.append((item, asset))
         return result
+
+    def _validate_cover_asset(self, session: Session, asset_id: str) -> Asset:
+        asset = self._require_asset(session, asset_id)
+        if asset.state != "ready":
+            raise V2Conflict("cover asset is not ready")
+        if not asset.detected_media_type.startswith("image/"):
+            raise V2DomainError("cover_asset_id must reference a validated image Asset")
+        return asset
+
+    def _replace_rendition_credits(
+        self,
+        session: Session,
+        rendition_id: str,
+        raw_items: list[CreditInput] | list[dict[str, Any]],
+    ) -> None:
+        items = [
+            item if isinstance(item, CreditInput) else CreditInput.model_validate(item)
+            for item in raw_items
+        ]
+        identities = [(item.contributor_id, item.role.strip().casefold()) for item in items]
+        if len(identities) != len(set(identities)):
+            raise V2DomainError("duplicate Rendition credit contributor and role")
+        self._require_contributors(session, [item.contributor_id for item in items])
+        session.execute(
+            delete(RenditionCredit).where(RenditionCredit.rendition_id == rendition_id)
+        )
+        for item in items:
+            session.add(
+                RenditionCredit(
+                    rendition_id=rendition_id,
+                    contributor_id=item.contributor_id,
+                    role=item.role.strip(),
+                    position=item.position,
+                )
+            )
+
+    def _replace_rendition_release_placements(
+        self,
+        session: Session,
+        rendition_id: str,
+        raw_items: list[RenditionReleasePlacementInput] | list[dict[str, Any]],
+    ) -> None:
+        items = [
+            item
+            if isinstance(item, RenditionReleasePlacementInput)
+            else RenditionReleasePlacementInput.model_validate(item)
+            for item in raw_items
+        ]
+        release_ids = [item.release_id for item in items]
+        if len(release_ids) != len(set(release_ids)):
+            raise V2DomainError("a Rendition may appear only once in each Release")
+        session.execute(
+            delete(ReleaseItem).where(ReleaseItem.rendition_id == rendition_id)
+        )
+        session.flush()
+        for item in items:
+            release = session.get(Release, item.release_id)
+            if release is None or release.deleted_at is not None:
+                raise V2NotFound(f"release {item.release_id} not found")
+            occupied = session.scalar(
+                select(ReleaseItem.id).where(
+                    ReleaseItem.release_id == item.release_id,
+                    ReleaseItem.display_order == item.display_order,
+                )
+            )
+            if occupied is not None:
+                raise V2Conflict(
+                    f"release {item.release_id} display_order {item.display_order} is occupied"
+                )
+            session.add(
+                ReleaseItem(
+                    release_id=item.release_id,
+                    rendition_id=rendition_id,
+                    disc_no=item.disc_no,
+                    track_no=item.track_no,
+                    display_order=item.display_order,
+                )
+            )
 
     def _add_rendition_asset(
         self, session: Session, rendition: Rendition, item: RenditionAssetInput

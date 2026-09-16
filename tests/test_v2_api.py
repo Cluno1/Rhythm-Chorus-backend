@@ -25,6 +25,7 @@ from rhythm_metadata_api.infrastructure.db.models import (
     ReleaseItem,
     Rendition,
     RenditionAsset,
+    RenditionCredit,
     Score,
     ScoreRenditionSync,
     ScoreRevision,
@@ -1265,6 +1266,125 @@ def test_private_catalog_end_to_end(client: TestClient) -> None:
         "rendition.created",
         "rendition.created",
     ]
+
+
+def test_rendition_management_projection_and_relationship_updates(
+    client: TestClient,
+) -> None:
+    work = post(client, "/v2/works", "rendition-management-work", {"canonical_title": "Gloria"})
+    arrangement = post(
+        client,
+        f"/v2/works/{work.json()['id']}/arrangements",
+        "rendition-management-arrangement",
+        {"name": "SATB", "voicing": "SATB"},
+    )
+    contributor = post(
+        client,
+        "/v2/contributors",
+        "rendition-management-contributor",
+        {"display_name": "Festival Choir"},
+    ).json()
+    png_header = (
+        b"\x89PNG\r\n\x1a\n"
+        + b"\x00" * 8
+        + (800).to_bytes(4, "big")
+        + (800).to_bytes(4, "big")
+        + b"\x00" * 8
+    )
+    cover = upload_asset(
+        client,
+        key="rendition-management-cover",
+        content=png_header + b"cover",
+        media_type="image/png",
+        filename="cover.png",
+    )
+    audio = upload_asset(
+        client,
+        key="rendition-management-audio",
+        content=b"ID3" + bytes(range(64)),
+        media_type="audio/mpeg",
+        filename="gloria.mp3",
+    )
+    with Session(client.app.state.v2_container.engine) as session, session.begin():
+        release = Release(key="festival-album", title="Festival Album")
+        session.add(release)
+        session.flush()
+        release_id = release.id
+
+    releases = client.get("/v2/releases", headers=AUTH)
+    assert releases.status_code == 200
+    assert releases.json()["items"][0]["id"] == release_id
+
+    created = post(
+        client,
+        f"/v2/arrangements/{arrangement.json()['id']}/renditions",
+        "rendition-management-create",
+        {
+            "label": "Festival performance",
+            "kind": "performance",
+            "ensemble": "Festival Choir",
+            "cover_asset_id": cover["id"],
+            "lyrics": "[00:01.00]Gloria",
+            "lyrics_language": "la",
+            "lyrics_formats": [{"language": "la", "format": "lrc"}],
+            "credits": [
+                {
+                    "contributor_id": contributor["id"],
+                    "role": "performer",
+                    "position": 1,
+                }
+            ],
+            "release_placements": [
+                {
+                    "release_id": release_id,
+                    "disc_no": 1,
+                    "track_no": 2,
+                    "display_order": 2,
+                }
+            ],
+            "assets": [{"asset_id": audio["id"], "role": "master"}],
+        },
+    )
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert body["management_category"] == "finished_audio"
+    assert body["cover_asset_id"] == cover["id"]
+    assert body["lyrics_formats"] == [{"language": "la", "format": "lrc"}]
+    assert body["credits"][0]["display_name"] == "Festival Choir"
+    assert body["release_placements"][0] == {
+        "release_id": release_id,
+        "disc_no": 1,
+        "track_no": 2,
+        "display_order": 2,
+        "id": body["release_placements"][0]["id"],
+        "release_title": "Festival Album",
+    }
+    with Session(client.app.state.v2_container.engine) as session:
+        assert session.query(RenditionCredit).filter_by(rendition_id=body["id"]).count() == 1
+
+    patched = client.patch(
+        f"/v2/renditions/{body['id']}",
+        headers={**AUTH, "If-Match": '"rev-1"'},
+        json={
+            "kind": "reference_audio",
+            "cover_asset_id": None,
+            "credits": [],
+            "release_placements": [],
+        },
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["management_category"] == "reference_resource"
+    assert patched.json()["cover_asset_id"] is None
+    assert patched.json()["credits"] == []
+    assert patched.json()["release_placements"] == []
+
+    link_id = patched.json()["assets"][0]["id"]
+    removed = client.delete(
+        f"/v2/renditions/{body['id']}/assets/{link_id}",
+        headers={**AUTH, "If-Match": '"rev-2"'},
+    )
+    assert removed.status_code == 200, removed.text
+    assert removed.json()["assets"] == []
 
 
 def test_score_admin_list_and_revision_history(client: TestClient) -> None:
