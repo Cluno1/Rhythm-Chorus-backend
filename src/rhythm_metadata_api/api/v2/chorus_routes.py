@@ -13,6 +13,7 @@ from rhythm_metadata_api.api.v2.routes import (
     stored_response,
 )
 from rhythm_metadata_api.application.chorus_service import ChorusService
+from rhythm_metadata_api.application.overview_service import OverviewService
 from rhythm_metadata_api.application.pending_center import PendingCenterService
 from rhythm_metadata_api.domain.v2.chorus import (
     ChorusMixResolveRequest,
@@ -31,6 +32,13 @@ def chorus(request: Request) -> ChorusService:
 
 
 Chorus = Annotated[ChorusService, Depends(chorus)]
+
+
+@router.get("/management/overview")
+def management_overview(service: Chorus, _: Actor) -> Response:
+    pending_tracks = service.moderation_counts()["pending_review"]
+    payload = OverviewService(service.uow_factory).summary(pending_tracks)
+    return JSONResponse(content=payload, headers={"Cache-Control": "no-store"})
 
 
 @router.get("/management/pending")
