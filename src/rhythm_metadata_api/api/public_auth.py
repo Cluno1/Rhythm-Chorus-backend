@@ -8,13 +8,16 @@ from rhythm_metadata_api.api.v2.chorus_routes import _prepare_default_mix
 from rhythm_metadata_api.api.v2.routes import model_response, require_if_match
 from rhythm_metadata_api.application.catalog_service import ActorContext
 from rhythm_metadata_api.application.chorus_service import ChorusService
-from rhythm_metadata_api.application.device_auth import DeviceAuthError, DeviceAuthService
+from rhythm_metadata_api.application.device_auth import DeviceAuthError, DeviceAuthService, _aware
 from rhythm_metadata_api.domain.auth_schemas import (
     AdminDeviceListResponse,
     AdminDeviceResponse,
+    AdminInviteResponse,
     AdministratorChangeResponse,
     AdminSessionRequest,
     AdminSessionResponse,
+    AdminUserListResponse,
+    AdminUserResponse,
     DeviceEnrollRequest,
     DeviceNonceRequest,
     DeviceRefreshRequest,
@@ -31,6 +34,7 @@ from rhythm_metadata_api.domain.v2.chorus import (
     ChorusModerationSettingsPatch,
     ChorusModerationSettingsResponse,
 )
+from rhythm_metadata_api.infrastructure.db.models import utc_now
 
 router = APIRouter(prefix="/v2", tags=["public device authentication"])
 
@@ -189,6 +193,40 @@ def list_devices(request: Request, _: AdminActor) -> AdminDeviceListResponse:
         max_active_devices_per_user_app=(
             service(request).settings.public_max_active_devices_per_user_app
         ),
+    )
+
+
+@router.get("/admin/users", response_model=AdminUserListResponse)
+def list_users(request: Request, _: AdminActor) -> AdminUserListResponse:
+    users, invites = service(request).list_users_and_invites()
+    now = utc_now()
+    return AdminUserListResponse(
+        items=[
+            AdminUserResponse(
+                user_id=user.id,
+                display_name=user.display_name,
+                status=user.status,
+                created_at=_aware(user.created_at).isoformat(),
+            )
+            for user in users
+        ],
+        invites=[
+            AdminInviteResponse(
+                invite_id=invite.id,
+                user_id=invite.user_id,
+                status=(
+                    "consumed" if invite.consumed_at is not None
+                    else "expired" if _aware(invite.expires_at) <= now
+                    else "pending"
+                ),
+                expires_at=_aware(invite.expires_at).isoformat(),
+                consumed_at=_aware(invite.consumed_at).isoformat() if invite.consumed_at else None,
+                consumed_by_device_id=invite.consumed_by_device_id,
+                issued_by=invite.issued_by,
+                created_at=_aware(invite.created_at).isoformat(),
+            )
+            for invite in invites
+        ],
     )
 
 

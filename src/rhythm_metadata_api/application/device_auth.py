@@ -694,6 +694,16 @@ class DeviceAuthService:
                 )
             )
 
+    def list_users_and_invites(self) -> tuple[list[AuthUser], list[DeviceInvite]]:
+        with Session(self.engine) as session:
+            users = list(session.scalars(select(AuthUser).order_by(AuthUser.created_at.desc(), AuthUser.id)))
+            invites = list(
+                session.scalars(
+                    select(DeviceInvite).order_by(DeviceInvite.created_at.desc(), DeviceInvite.id)
+                )
+            )
+            return users, invites
+
     def set_administrator(self, device_id: str, enabled: bool, admin_id: str) -> bool:
         with Session(self.engine) as session:
             device = session.get(RegisteredDevice, device_id)

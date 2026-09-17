@@ -111,6 +111,22 @@ def create_invite(
     return response.json()["inviteCode"]
 
 
+def test_public_admin_user_projection_includes_invite_only_users_without_codes(tmp_path: Path) -> None:
+    app = create_public_app(settings(tmp_path))
+    with TestClient(app) as client:
+        admin = admin_token(client)
+        code = create_invite(client, admin, "new-listener")
+        assert client.get("/v2/admin/users").status_code == 401
+        response = client.get(
+            "/v2/admin/users", headers={"Authorization": f"Bearer {admin}"}
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["items"][0]["userId"] == "new-listener"
+        assert response.json()["invites"][0]["status"] == "pending"
+        assert code not in response.text
+        assert "codeHash" not in response.text
+
+
 def enroll_response(
     client: TestClient,
     invite: str,

@@ -100,6 +100,29 @@ class AdminDeviceListResponse(CamelModel):
     max_active_devices_per_user_app: int
 
 
+class AdminUserResponse(CamelModel):
+    user_id: str
+    display_name: str | None
+    status: str
+    created_at: str
+
+
+class AdminInviteResponse(CamelModel):
+    invite_id: str
+    user_id: str
+    status: str
+    expires_at: str
+    consumed_at: str | None
+    consumed_by_device_id: str | None
+    issued_by: str
+    created_at: str
+
+
+class AdminUserListResponse(CamelModel):
+    items: list[AdminUserResponse]
+    invites: list[AdminInviteResponse]
+
+
 class AdministratorChangeResponse(CamelModel):
     device_id: str
     is_administrator: bool

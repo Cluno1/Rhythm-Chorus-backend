@@ -35,6 +35,28 @@ def test_private_api_accepts_admin_login_without_expanding_catalog_scope(
         )
         assert devices.status_code == 200
 
+        invite = client.post(
+            "/v2/admin/invites",
+            headers={"Authorization": f"Bearer {admin_token}"},
+            json={"userId": "listener-1", "displayName": "Listener One", "replaceExistingDevice": False},
+        )
+        assert invite.status_code == 200, invite.text
+        assert client.get("/v2/admin/users").status_code == 401
+        users = client.get(
+            "/v2/admin/users",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert users.status_code == 200, users.text
+        assert len(users.json()["items"]) == 1
+        assert users.json()["items"][0]["userId"] == "listener-1"
+        assert users.json()["items"][0]["displayName"] == "Listener One"
+        assert users.json()["items"][0]["status"] == "active"
+        assert users.json()["items"][0]["createdAt"]
+        assert users.json()["invites"][0]["status"] == "pending"
+        assert users.json()["invites"][0]["userId"] == "listener-1"
+        assert "inviteCode" not in users.text
+        assert "codeHash" not in users.text
+
         catalog = client.get(
             "/v2/works",
             headers={"Authorization": f"Bearer {admin_token}"},
