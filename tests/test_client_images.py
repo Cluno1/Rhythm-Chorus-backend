@@ -404,6 +404,7 @@ def test_direct_upload_gallery_visibility_delivery_and_delete(tmp_path: Path) ->
         )
         assert shared_original.status_code == 200
         assert shared_original.json()["variant"] == "original"
+        assert "response-content-disposition=" in shared_original.json()["signed_url"]
         assert shared_original.json()["byte_size"] == len(content)
         assert shared_original.json()["suggested_filename"] == "透明图片.png"
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 from datetime import UTC, datetime, timedelta
+from urllib.parse import quote
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
@@ -1011,6 +1012,18 @@ class ClientImageService:
             and self.settings.client_image_preview_host
             else None
         )
+        download_name = self._download_name(image) if variant == "original" else None
+        query_parameters: tuple[tuple[str, str | None], ...] = ()
+        if download_name:
+            extension = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}[
+                image.media_type
+            ]
+            fallback_name = f"image-{image.id}{extension}"
+            encoded_name = quote(download_name, safe="")
+            query_parameters = ((
+                "response-content-disposition",
+                f"attachment; filename=\"{fallback_name}\"; filename*=UTF-8''{encoded_name}",
+            ),)
         url, expires_at = presign_cos_get(
             bucket,
             self.settings.cos_region,
@@ -1018,6 +1031,7 @@ class ClientImageService:
             self.settings.cos_secret_id,
             self.settings.cos_secret_key,
             ttl,
+            query_parameters=query_parameters,
             host=preview_host,
         )
         return ClientImageDelivery(
@@ -1029,7 +1043,7 @@ class ClientImageService:
             stable_cache_key=f"client-image:{image.id}:{content_revision}:{variant}:v2",
             media_type=media_type,
             byte_size=byte_size,
-            suggested_filename=(self._download_name(image) if variant == "original" else None),
+            suggested_filename=download_name,
         )
 
     def _record(self, session: Session, image: ClientImage) -> ClientImageRecord:
