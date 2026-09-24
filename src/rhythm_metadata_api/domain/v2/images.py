@@ -44,17 +44,13 @@ class ClientImageBatchResponse(ImageApiModel):
     updated_at: datetime
 
 
-class ClientImageUploadCreate(ImageApiModel):
-    batch_id: str
-    client_item_id: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9._:-]+$")
-    display_name: str = Field(min_length=1, max_length=500)
+class ClientImageObjectDeclaration(ImageApiModel):
     media_type: Literal["image/png", "image/jpeg", "image/webp"]
     byte_size: int = Field(gt=0, le=32 * 1024 * 1024)
     content_md5: str = Field(min_length=24, max_length=24)
     client_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     width: int = Field(gt=0, le=50_000)
     height: int = Field(gt=0, le=50_000)
-    metadata_sanitized: bool
 
     @field_validator("content_md5")
     @classmethod
@@ -66,6 +62,14 @@ class ClientImageUploadCreate(ImageApiModel):
         if len(decoded) != 16:
             raise ValueError("content_md5 must encode exactly 16 bytes")
         return value
+
+
+class ClientImageUploadCreate(ClientImageObjectDeclaration):
+    batch_id: str
+    client_item_id: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9._:-]+$")
+    display_name: str = Field(min_length=1, max_length=500)
+    metadata_sanitized: bool
+    thumbnail_512: ClientImageObjectDeclaration
 
     @field_validator("display_name")
     @classmethod
@@ -88,6 +92,7 @@ class ClientImageUploadResponse(ImageApiModel):
     image_id: str
     state: Literal["upload_required", "completed", "cancelled", "rejected"]
     upload: ClientImageUploadTarget | None = None
+    thumbnail_upload: ClientImageUploadTarget | None = None
     asset_id: str | None = None
 
 

@@ -49,6 +49,7 @@ from rhythm_metadata_api.infrastructure.storage.base import UploadValidationErro
 from rhythm_metadata_api.infrastructure.storage.cos_images import (
     ClientImageObjectGateway,
     CosImageGatewayError,
+    CosObjectMetadata,
 )
 from rhythm_metadata_api.infrastructure.storage.cos_presign import presign_cos_get, presign_cos_put
 
@@ -57,12 +58,7 @@ _MEDIA_FORMATS = {
     "image/jpeg": "jpeg",
     "image/webp": "webp",
 }
-_FORMAT_MEDIA_TYPES = {"png": "image/png", "jpeg": "image/jpeg", "jpg": "image/jpeg", "webp": "image/webp"}
-_VARIANT_RECIPES: dict[str, tuple[tuple[str, str | None], ...]] = {
-    "thumbnail_512": (("imageMogr2/thumbnail/512x512>", None),),
-    "preview_2048": (("imageMogr2/thumbnail/2048x2048>", None),),
-    "original": (),
-}
+_DELIVERY_VARIANTS = {"thumbnail_512", "preview_2048", "original"}
 
 
 def _aware(value: datetime) -> datetime:
@@ -84,8 +80,6 @@ class ClientImageService:
     def enabled(self) -> bool:
         return bool(
             self.settings.client_image_cos_bucket
-            and self.settings.client_image_preview_host
-            and self.settings.client_image_ci_enabled
             and self.settings.cos_secret_id
             and self.settings.cos_secret_key
         )
@@ -94,10 +88,6 @@ class ClientImageService:
         reason = None
         if not self.settings.client_image_cos_bucket:
             reason = "image_bucket_not_configured"
-        elif not self.settings.client_image_preview_host:
-            reason = "image_preview_host_not_configured"
-        elif not self.settings.client_image_ci_enabled:
-            reason = "image_validation_not_enabled"
         elif not (self.settings.cos_secret_id and self.settings.cos_secret_key):
             reason = "cos_credentials_not_configured"
         return ClientImageCapabilities(
@@ -183,6 +173,7 @@ class ClientImageService:
                     key = self._temporary_object_key(upload)
                     if key:
                         keys.append(key)
+                        keys.append(self._thumbnail_temporary_object_key(key))
                 image.state = "cancelled"
                 image.revision += 1
                 image.updated_at = utc_now()
@@ -260,6 +251,12 @@ class ClientImageService:
                 byte_size=request.byte_size,
                 content_md5=request.content_md5,
                 client_sha256=request.client_sha256,
+                thumbnail_media_type=request.thumbnail_512.media_type,
+                thumbnail_width=request.thumbnail_512.width,
+                thumbnail_height=request.thumbnail_512.height,
+                thumbnail_byte_size=request.thumbnail_512.byte_size,
+                thumbnail_content_md5=request.thumbnail_512.content_md5,
+                thumbnail_client_sha256=request.thumbnail_512.client_sha256,
                 metadata_sanitized=request.metadata_sanitized,
                 state="upload_pending",
             )
@@ -320,6 +317,7 @@ class ClientImageService:
             object_key = self._temporary_object_key(upload)
             if object_key is None:
                 raise V2Conflict("image upload target is invalid")
+            thumbnail_key = self._thumbnail_temporary_object_key(object_key)
             image.state = "verifying"
             image.failure_code = None
             image.updated_at = utc_now()
@@ -328,8 +326,7 @@ class ClientImageService:
 
         try:
             metadata = self.object_gateway.head(object_key)
-            image_info = self.object_gateway.image_info(object_key)
-            file_hash = self.object_gateway.sha256(object_key)
+            thumbnail_metadata = self.object_gateway.head(thumbnail_key)
         except CosImageGatewayError as error:
             with self.uow_factory() as uow:
                 image = self._owned_image_by_upload(uow.session, upload_id, actor)
@@ -337,14 +334,26 @@ class ClientImageService:
                     image.state = "upload_pending"
                     image.failure_code = "verification_unavailable"
                     image.updated_at = utc_now()
-            raise V2Unavailable("COS image verification is temporarily unavailable") from error
+            raise V2Unavailable("COS object verification is temporarily unavailable") from error
 
-        failure = self._inspection_failure(image, metadata, image_info, file_hash)
+        failure = self._metadata_failure(
+            metadata,
+            byte_size=image.byte_size,
+            media_type=image.media_type,
+            content_md5=image.content_md5,
+            label="original",
+        ) or self._metadata_failure(
+            thumbnail_metadata,
+            byte_size=image.thumbnail_byte_size,
+            media_type=image.thumbnail_media_type,
+            content_md5=image.thumbnail_content_md5,
+            label="thumbnail",
+        )
         if failure is not None:
-            self._reject_upload(upload_id, actor, object_key, failure)
+            self._reject_upload(upload_id, actor, (object_key, thumbnail_key), failure)
             raise UploadValidationError(failure)
 
-        # HEAD/imageInfo/filehash are deliberately performed outside a database
+        # Both HEAD calls are deliberately performed outside a database
         # transaction. Re-check the durable state before promoting bytes because
         # the owner may have cancelled or deleted the image while those network
         # calls were running.
@@ -355,11 +364,11 @@ class ClientImageService:
             if current.state != "verifying":
                 raise V2Conflict(f"image upload cannot complete while {current.state}")
 
-        detected_media_type = _FORMAT_MEDIA_TYPES[image_info.image_format]
-        final_key = f"labs/images/assets/{file_hash.sha256[:2]}/{file_hash.sha256}"
+        final_key = f"labs/images/assets/{image.client_sha256[:2]}/{image.client_sha256}"
+        thumbnail_final_key = f"labs/images/thumbnails/{image.id[:2]}/{image.id}/thumbnail_512"
         with self.uow_factory() as uow:
             existing_asset = uow.session.scalar(
-                select(Asset).where(Asset.sha256 == file_hash.sha256)
+                select(Asset).where(Asset.sha256 == image.client_sha256)
             )
             existing_location = (
                 uow.session.scalar(
@@ -372,21 +381,40 @@ class ClientImageService:
                 if existing_asset is not None
                 else None
             )
+            existing_image = (
+                uow.session.scalar(
+                    select(ClientImage).where(
+                        ClientImage.asset_id == existing_asset.id,
+                        ClientImage.state == "ready",
+                    )
+                )
+                if existing_asset is not None
+                else None
+            )
         if existing_asset is not None and (
-            existing_asset.byte_size != image_info.byte_size
-            or existing_asset.detected_media_type != detected_media_type
+            existing_asset.byte_size != image.byte_size
+            or existing_asset.detected_media_type != image.media_type
+            or existing_image is None
+            or existing_image.content_md5 != image.content_md5
+            or existing_image.cos_crc64 != metadata.crc64
         ):
-            self._reject_upload(upload_id, actor, object_key, "verified asset identity conflicts")
+            self._reject_upload(
+                upload_id,
+                actor,
+                (object_key, thumbnail_key),
+                "declared asset identity conflicts with COS-verified metadata",
+            )
             raise UploadValidationError("verified asset identity conflicts")
-        if existing_location is None:
-            try:
+        try:
+            if existing_location is None:
                 self.object_gateway.promote(object_key, final_key)
-            except CosImageGatewayError as error:
-                with self.uow_factory() as uow:
-                    image = self._owned_image_by_upload(uow.session, upload_id, actor)
-                    image.state = "upload_pending"
-                    image.failure_code = "promotion_unavailable"
-                raise V2Unavailable("COS image promotion is temporarily unavailable") from error
+            self.object_gateway.promote(thumbnail_key, thumbnail_final_key)
+        except CosImageGatewayError as error:
+            with self.uow_factory() as uow:
+                image = self._owned_image_by_upload(uow.session, upload_id, actor)
+                image.state = "upload_pending"
+                image.failure_code = "promotion_unavailable"
+            raise V2Unavailable("COS image promotion is temporarily unavailable") from error
 
         final_storage_key = (
             existing_location.storage_key
@@ -403,19 +431,18 @@ class ClientImageService:
             upload = uow.session.get(UploadSession, image.upload_session_id)
             if upload is None:
                 raise V2Conflict("image upload session disappeared")
-            asset = uow.session.scalar(select(Asset).where(Asset.sha256 == file_hash.sha256))
+            asset = uow.session.scalar(select(Asset).where(Asset.sha256 == image.client_sha256))
             if asset is None:
                 asset = Asset(
-                    sha256=file_hash.sha256,
-                    byte_size=image_info.byte_size,
-                    detected_media_type=detected_media_type,
+                    sha256=image.client_sha256,
+                    byte_size=image.byte_size,
+                    detected_media_type=image.media_type,
                     state="ready",
                 )
                 uow.session.add(asset)
                 uow.session.flush()
             else:
-                # Asset identity is content-addressed. A fresh COS/CI verification may safely
-                # revive an otherwise soft-deleted row with the same bytes.
+                # Reuse is allowed only after MD5/CRC64/size/type matched a prior client image.
                 asset.state = "ready"
                 asset.deleted_at = None
                 asset.updated_at = utc_now()
@@ -446,17 +473,19 @@ class ClientImageService:
                 )
             )
             now = utc_now()
-            upload.actual_sha256 = file_hash.sha256
-            upload.actual_size = image_info.byte_size
+            upload.actual_sha256 = image.client_sha256
+            upload.actual_size = image.byte_size
             upload.completed_asset_id = asset.id
             upload.state = "completed"
             upload.updated_at = now
             image.asset_id = asset.id
-            image.media_type = detected_media_type
-            image.image_format = image_info.image_format
-            image.width = image_info.width
-            image.height = image_info.height
-            image.byte_size = image_info.byte_size
+            image.image_format = _MEDIA_FORMATS[image.media_type]
+            image.thumbnail_storage_key = (
+                f"{self.settings.client_image_cos_bucket}/{thumbnail_final_key}"
+            )
+            image.cos_crc64 = metadata.crc64
+            image.thumbnail_cos_crc64 = thumbnail_metadata.crc64
+            image.verification_method = "client_sha256+cos_md5_crc64"
             image.state = "ready"
             image.failure_code = None
             image.revision += 1
@@ -471,11 +500,17 @@ class ClientImageService:
                 "image_upload.completed",
                 image_id=image.id,
                 batch_id=image.batch_id,
-                details={"asset_id": asset.id, "byte_size": image.byte_size},
+                details={
+                    "asset_id": asset.id,
+                    "byte_size": image.byte_size,
+                    "thumbnail_byte_size": image.thumbnail_byte_size,
+                    "verification_method": image.verification_method,
+                },
             )
             uow.session.flush()
             response = self._record(uow.session, image)
         self._delete_best_effort(object_key)
+        self._delete_best_effort(thumbnail_key)
         return response
 
     def cancel_upload(self, upload_id: str, actor: ActorContext) -> ClientImageUploadResponse:
@@ -508,6 +543,7 @@ class ClientImageService:
             response = self._upload_response(uow.session, image)
         if object_key:
             self._delete_best_effort(object_key)
+            self._delete_best_effort(self._thumbnail_temporary_object_key(object_key))
         return response
 
     def list_own(
@@ -606,6 +642,7 @@ class ClientImageService:
             )
         if object_key:
             self._delete_best_effort(object_key)
+            self._delete_best_effort(self._thumbnail_temporary_object_key(object_key))
         return "deleted"
 
     def visibility(self, actor: ActorContext) -> UserImageVisibilityResponse:
@@ -797,7 +834,7 @@ class ClientImageService:
 
     def _require_enabled(self) -> None:
         if not self.enabled:
-            raise V2Unavailable("client image COS/CI capability is not configured")
+            raise V2Unavailable("client image COS capability is not configured")
 
     def _validate_upload_request(self, request: ClientImageUploadCreate) -> None:
         if request.byte_size > self.settings.client_image_max_bytes:
@@ -806,6 +843,11 @@ class ClientImageService:
             raise V2DomainError("image exceeds the configured pixel limit")
         if not request.metadata_sanitized:
             raise V2DomainError("image metadata must be sanitized before upload")
+        thumbnail = request.thumbnail_512
+        if thumbnail.width > 512 or thumbnail.height > 512:
+            raise V2DomainError("thumbnail_512 dimensions must not exceed 512 pixels")
+        if thumbnail.width * thumbnail.height > 512 * 512:
+            raise V2DomainError("thumbnail_512 pixel count is invalid")
 
     def _upload_response(self, session: Session, image: ClientImage) -> ClientImageUploadResponse:
         upload = session.get(UploadSession, image.upload_session_id)
@@ -836,6 +878,7 @@ class ClientImageService:
         key = self._temporary_object_key(upload)
         if key is None:
             raise V2Conflict("image upload target is invalid")
+        thumbnail_key = self._thumbnail_temporary_object_key(key)
         headers = {"Content-Type": image.media_type, "Content-MD5": image.content_md5}
         url, expires_at = presign_cos_put(
             self.settings.client_image_cos_bucket,
@@ -846,6 +889,19 @@ class ClientImageService:
             self.settings.client_image_presign_expires_seconds,
             headers=headers,
         )
+        thumbnail_headers = {
+            "Content-Type": image.thumbnail_media_type,
+            "Content-MD5": image.thumbnail_content_md5,
+        }
+        thumbnail_url, thumbnail_expires_at = presign_cos_put(
+            self.settings.client_image_cos_bucket,
+            self.settings.cos_region,
+            thumbnail_key,
+            self.settings.cos_secret_id,
+            self.settings.cos_secret_key,
+            self.settings.client_image_presign_expires_seconds,
+            headers=thumbnail_headers,
+        )
         return ClientImageUploadResponse(
             upload_id=upload.id,
             image_id=image.id,
@@ -855,32 +911,36 @@ class ClientImageService:
                 expires_at=expires_at,
                 required_headers=headers,
             ),
+            thumbnail_upload=ClientImageUploadTarget(
+                url=thumbnail_url,
+                expires_at=thumbnail_expires_at,
+                required_headers=thumbnail_headers,
+            ),
         )
 
-    def _inspection_failure(self, image, metadata, image_info, file_hash) -> str | None:
-        if metadata.byte_size != image.byte_size or image_info.byte_size != image.byte_size:
-            return "uploaded size does not match the declaration"
-        if file_hash.byte_size is not None and file_hash.byte_size != image.byte_size:
-            return "COS hash result size does not match the declaration"
-        if metadata.content_type != image.media_type:
-            return "uploaded Content-Type does not match the declaration"
-        detected_media_type = _FORMAT_MEDIA_TYPES.get(image_info.image_format)
-        if detected_media_type is None or detected_media_type != image.media_type:
-            return "uploaded object is not a supported static image"
-        if image_info.frame_count != 1:
-            return "animated images are not supported"
-        if image_info.width != image.width or image_info.height != image.height:
-            return "uploaded dimensions do not match the declaration"
-        if image_info.width * image_info.height > self.settings.client_image_max_pixels:
-            return "uploaded image exceeds the configured pixel limit"
-        if image_info.md5_hex != base64.b64decode(image.content_md5).hex():
-            return "uploaded MD5 does not match Content-MD5"
-        if file_hash.sha256 != image.client_sha256:
-            return "uploaded SHA-256 does not match the declaration"
+    @staticmethod
+    def _metadata_failure(
+        metadata: CosObjectMetadata,
+        *,
+        byte_size: int,
+        media_type: str,
+        content_md5: str,
+        label: str,
+    ) -> str | None:
+        if metadata.byte_size != byte_size:
+            return f"{label} size does not match the declaration"
+        if metadata.content_type != media_type:
+            return f"{label} Content-Type does not match the declaration"
+        expected_md5 = base64.b64decode(content_md5).hex()
+        actual_etag = (metadata.etag or "").strip().strip('"').lower()
+        if actual_etag != expected_md5:
+            return f"{label} ETag does not match Content-MD5"
+        if not metadata.crc64 or not metadata.crc64.isdigit():
+            return f"{label} COS CRC64 metadata is missing"
         return None
 
     def _reject_upload(
-        self, upload_id: str, actor: ActorContext, object_key: str, reason: str
+        self, upload_id: str, actor: ActorContext, object_keys: tuple[str, ...], reason: str
     ) -> None:
         with self.uow_factory() as uow:
             image = self._owned_image_by_upload(uow.session, upload_id, actor)
@@ -903,26 +963,38 @@ class ClientImageService:
                 batch_id=image.batch_id,
                 details={"reason": reason},
             )
-        self._delete_best_effort(object_key)
+        for object_key in object_keys:
+            self._delete_best_effort(object_key)
 
     def _delivery(
         self, session: Session, image: ClientImage, variant: str, *, shared: bool
     ) -> ClientImageDelivery:
-        if variant not in _VARIANT_RECIPES:
+        if variant not in _DELIVERY_VARIANTS:
             raise V2DomainError("unsupported image delivery variant")
         asset = session.get(Asset, image.asset_id)
         if asset is None or asset.state != "ready" or asset.deleted_at is not None:
             raise V2NotFound("image Asset was not found")
-        location = session.scalar(
-            select(AssetLocation).where(
-                AssetLocation.asset_id == asset.id,
-                AssetLocation.provider == "cos",
-                AssetLocation.state == "available",
+        use_thumbnail = variant == "thumbnail_512" or shared
+        if use_thumbnail:
+            storage_key = image.thumbnail_storage_key
+            media_type = image.thumbnail_media_type
+            byte_size = image.thumbnail_byte_size
+            content_revision = image.thumbnail_client_sha256
+        else:
+            location = session.scalar(
+                select(AssetLocation).where(
+                    AssetLocation.asset_id == asset.id,
+                    AssetLocation.provider == "cos",
+                    AssetLocation.state == "available",
+                )
             )
-        )
-        if location is None:
-            raise V2Unavailable("image has no available COS location")
-        bucket, separator, key = location.storage_key.partition("/")
+            if location is None:
+                raise V2Unavailable("image has no available COS location")
+            storage_key = location.storage_key
+            media_type = asset.detected_media_type
+            byte_size = asset.byte_size
+            content_revision = asset.sha256
+        bucket, separator, key = (storage_key or "").partition("/")
         if not bucket or not separator or not key:
             raise V2Unavailable("image COS location is invalid")
         ttl = (
@@ -943,7 +1015,6 @@ class ClientImageService:
             self.settings.cos_secret_id,
             self.settings.cos_secret_key,
             ttl,
-            query_parameters=_VARIANT_RECIPES[variant],
             host=preview_host,
         )
         return ClientImageDelivery(
@@ -952,9 +1023,9 @@ class ClientImageService:
             variant=variant,
             signed_url=url,
             expires_at=expires_at,
-            stable_cache_key=f"client-image:{image.id}:{asset.sha256}:{variant}:v1",
-            media_type=asset.detected_media_type,
-            byte_size=asset.byte_size if variant == "original" else None,
+            stable_cache_key=f"client-image:{image.id}:{content_revision}:{variant}:v2",
+            media_type=media_type,
+            byte_size=byte_size,
             suggested_filename=(self._download_name(image) if variant == "original" else None),
         )
 
@@ -1117,6 +1188,13 @@ class ClientImageService:
         return key if separator and key else None
 
     @staticmethod
+    def _thumbnail_temporary_object_key(original_key: str) -> str:
+        prefix, separator, leaf = original_key.rpartition("/")
+        if not separator or leaf != "original":
+            raise V2Conflict("image upload target is invalid")
+        return f"{prefix}/thumbnail_512"
+
+    @staticmethod
     def _assert_same_upload(image: ClientImage, request: ClientImageUploadCreate) -> None:
         supplied = (
             request.display_name,
@@ -1127,6 +1205,12 @@ class ClientImageService:
             request.width,
             request.height,
             request.metadata_sanitized,
+            request.thumbnail_512.media_type,
+            request.thumbnail_512.byte_size,
+            request.thumbnail_512.content_md5,
+            request.thumbnail_512.client_sha256,
+            request.thumbnail_512.width,
+            request.thumbnail_512.height,
         )
         stored = (
             image.display_name,
@@ -1137,6 +1221,12 @@ class ClientImageService:
             image.width,
             image.height,
             image.metadata_sanitized,
+            image.thumbnail_media_type,
+            image.thumbnail_byte_size,
+            image.thumbnail_content_md5,
+            image.thumbnail_client_sha256,
+            image.thumbnail_width,
+            image.thumbnail_height,
         )
         if supplied != stored:
             raise V2Conflict("client_item_id was reused with different image metadata")

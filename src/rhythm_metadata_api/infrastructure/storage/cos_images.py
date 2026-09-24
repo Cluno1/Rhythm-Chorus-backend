@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -11,7 +10,6 @@ from urllib.parse import quote
 from rhythm_metadata_api.core.config import Settings
 from rhythm_metadata_api.infrastructure.storage.cos_presign import (
     presign_cos_delete,
-    presign_cos_get,
     presign_cos_head,
     presign_cos_put,
 )
@@ -29,29 +27,8 @@ class CosObjectMetadata:
     crc64: str | None
 
 
-@dataclass(frozen=True)
-class CosImageInfo:
-    image_format: str
-    width: int
-    height: int
-    byte_size: int
-    md5_hex: str
-    frame_count: int
-
-
-@dataclass(frozen=True)
-class CosFileHash:
-    sha256: str
-    byte_size: int | None
-    etag: str | None
-
-
 class ClientImageObjectGateway(Protocol):
     def head(self, key: str) -> CosObjectMetadata: ...
-
-    def image_info(self, key: str) -> CosImageInfo: ...
-
-    def sha256(self, key: str) -> CosFileHash: ...
 
     def promote(self, source_key: str, destination_key: str) -> None: ...
 
@@ -64,7 +41,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class TencentCosImageGateway:
-    """Small COS/CI control-plane client that never downloads image bytes."""
+    """Small ordinary-COS control-plane client that never downloads image bytes."""
 
     _MAX_METADATA_BODY = 256 * 1024
 
@@ -74,8 +51,8 @@ class TencentCosImageGateway:
         self._opener = urllib.request.build_opener(_NoRedirect())
 
     def _credentials(self) -> tuple[str, str]:
-        if not self.bucket or not self.settings.client_image_ci_enabled:
-            raise CosImageGatewayError("client image COS/CI capability is not enabled")
+        if not self.bucket:
+            raise CosImageGatewayError("client image COS capability is not enabled")
         if not self.settings.cos_secret_id or not self.settings.cos_secret_key:
             raise CosImageGatewayError("COS credentials are not configured")
         return self.settings.cos_secret_id, self.settings.cos_secret_key
@@ -126,58 +103,6 @@ class TencentCosImageGateway:
             etag=headers.get("ETag"),  # type: ignore[attr-defined]
             crc64=headers.get("x-cos-hash-crc64ecma"),  # type: ignore[attr-defined]
         )
-
-    def image_info(self, key: str) -> CosImageInfo:
-        secret_id, secret_key = self._credentials()
-        url, _ = presign_cos_get(
-            self.bucket,
-            self.settings.cos_region,
-            key,
-            secret_id,
-            secret_key,
-            self.settings.client_image_presign_expires_seconds,
-            query_parameters=(("imageInfo", None),),
-        )
-        _, body = self._open(urllib.request.Request(url, method="GET"), read_body=True)
-        try:
-            payload = json.loads(body)
-            return CosImageInfo(
-                image_format=str(payload["format"]).lower(),
-                width=int(payload["width"]),
-                height=int(payload["height"]),
-                byte_size=int(payload["size"]),
-                md5_hex=str(payload["md5"]).lower(),
-                frame_count=int(payload.get("frame_count", "1")),
-            )
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-            raise CosImageGatewayError("COS imageInfo returned an invalid response") from error
-
-    def sha256(self, key: str) -> CosFileHash:
-        secret_id, secret_key = self._credentials()
-        url, _ = presign_cos_get(
-            self.bucket,
-            self.settings.cos_region,
-            key,
-            secret_id,
-            secret_key,
-            self.settings.client_image_presign_expires_seconds,
-            query_parameters=(("ci-process", "filehash"), ("type", "sha256")),
-        )
-        _, body = self._open(urllib.request.Request(url, method="GET"), read_body=True)
-        try:
-            root = ET.fromstring(body)
-            digest = (root.findtext(".//SHA256") or "").strip().lower()
-            size_text = (root.findtext(".//FileSize") or "").strip()
-            etag = (root.findtext(".//Etag") or root.findtext(".//ETag") or "").strip()
-            if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
-                raise ValueError("invalid SHA-256")
-            return CosFileHash(
-                sha256=digest,
-                byte_size=int(size_text) if size_text else None,
-                etag=etag or None,
-            )
-        except (ET.ParseError, ValueError) as error:
-            raise CosImageGatewayError("COS file hash returned an invalid response") from error
 
     def promote(self, source_key: str, destination_key: str) -> None:
         secret_id, secret_key = self._credentials()

@@ -845,6 +845,16 @@ class ClientImage(Base):
     byte_size: Mapped[int] = mapped_column(Integer, nullable=False)
     content_md5: Mapped[str] = mapped_column(String(64), nullable=False)
     client_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    thumbnail_media_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    thumbnail_width: Mapped[int] = mapped_column(Integer, nullable=False)
+    thumbnail_height: Mapped[int] = mapped_column(Integer, nullable=False)
+    thumbnail_byte_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    thumbnail_content_md5: Mapped[str] = mapped_column(String(64), nullable=False)
+    thumbnail_client_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    thumbnail_storage_key: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    cos_crc64: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    thumbnail_cos_crc64: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    verification_method: Mapped[str | None] = mapped_column(String(64), nullable=True)
     metadata_sanitized: Mapped[bool] = mapped_column(Boolean, nullable=False)
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="upload_pending")
     failure_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
@@ -864,6 +874,12 @@ class ClientImage(Base):
             name="uq_v2_client_image_owner_batch_item",
         ),
         CheckConstraint("width > 0 AND height > 0", name="client_image_dimensions"),
+        CheckConstraint(
+            "thumbnail_width > 0 AND thumbnail_height > 0 "
+            "AND thumbnail_width <= 512 AND thumbnail_height <= 512",
+            name="client_image_thumbnail_dimensions",
+        ),
+        CheckConstraint("thumbnail_byte_size > 0", name="client_image_thumbnail_size"),
         CheckConstraint("byte_size > 0", name="client_image_size"),
         CheckConstraint(
             "state IN ('upload_pending', 'verifying', 'ready', 'rejected', 'cancelled', 'deleted')",

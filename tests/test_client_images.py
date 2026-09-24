@@ -22,11 +22,7 @@ from rhythm_metadata_api.application.device_auth import (
 )
 from rhythm_metadata_api.core.config import Settings
 from rhythm_metadata_api.infrastructure.db.models import UploadSession
-from rhythm_metadata_api.infrastructure.storage.cos_images import (
-    CosFileHash,
-    CosImageInfo,
-    CosObjectMetadata,
-)
+from rhythm_metadata_api.infrastructure.storage.cos_images import CosObjectMetadata
 from rhythm_metadata_api.public_main import (
     _public_read_allowed,
     _public_write_allowed,
@@ -37,12 +33,10 @@ DEBUG_CERTIFICATE_SHA256 = "ab" * 32
 
 
 class FakeImageObjectGateway:
-    def __init__(self, content: bytes, media_type: str, width: int, height: int) -> None:
+    def __init__(self, content: bytes, thumbnail: bytes, media_type: str = "image/png") -> None:
         self.content = content
+        self.thumbnail = thumbnail
         self.media_type = media_type
-        self.width = width
-        self.height = height
-        self.frame_count = 1
         self.promotions: list[tuple[str, str]] = []
         self.deletions: list[str] = []
         self.before_head: Callable[[], None] | None = None
@@ -51,23 +45,13 @@ class FakeImageObjectGateway:
         before_head, self.before_head = self.before_head, None
         if before_head is not None:
             before_head()
-        return CosObjectMetadata(len(self.content), self.media_type, '"etag"', "123")
-
-    def image_info(self, key: str) -> CosImageInfo:
-        image_format = {"image/png": "png", "image/jpeg": "jpeg", "image/webp": "webp"}[
-            self.media_type
-        ]
-        return CosImageInfo(
-            image_format=image_format,
-            width=self.width,
-            height=self.height,
-            byte_size=len(self.content),
-            md5_hex=hashlib.md5(self.content, usedforsecurity=False).hexdigest(),
-            frame_count=self.frame_count,
+        content = self.thumbnail if key.endswith("/thumbnail_512") else self.content
+        return CosObjectMetadata(
+            len(content),
+            self.media_type,
+            f'"{hashlib.md5(content, usedforsecurity=False).hexdigest()}"',
+            str(int.from_bytes(hashlib.sha256(content).digest()[:8], "big")),
         )
-
-    def sha256(self, key: str) -> CosFileHash:
-        return CosFileHash(hashlib.sha256(self.content).hexdigest(), len(self.content), '"etag"')
 
     def promote(self, source_key: str, destination_key: str) -> None:
         self.promotions.append((source_key, destination_key))
@@ -92,9 +76,26 @@ def image_settings(tmp_path: Path) -> Settings:
         cos_secret_id="AKID-test",
         cos_secret_key="secret-test",
         client_image_cos_bucket="images-1250000000",
-        client_image_preview_host="images-preview.example.test",
-        client_image_ci_enabled=True,
     )
+
+
+def object_declaration(
+    content: bytes,
+    *,
+    media_type: str = "image/png",
+    width: int = 320,
+    height: int = 240,
+) -> dict[str, Any]:
+    return {
+        "media_type": media_type,
+        "byte_size": len(content),
+        "content_md5": base64.b64encode(
+            hashlib.md5(content, usedforsecurity=False).digest()
+        ).decode(),
+        "client_sha256": hashlib.sha256(content).hexdigest(),
+        "width": width,
+        "height": height,
+    }
 
 
 def admin_token(client: TestClient) -> str:
@@ -219,7 +220,8 @@ def test_public_image_routes_are_narrowly_allowlisted() -> None:
 
 def test_direct_upload_gallery_visibility_delivery_and_delete(tmp_path: Path) -> None:
     content = b"sanitized-png-image"
-    gateway = FakeImageObjectGateway(content, "image/png", 640, 480)
+    thumbnail = b"thumbnail-png-image"
+    gateway = FakeImageObjectGateway(content, thumbnail)
     app = create_public_app(image_settings(tmp_path))
     with TestClient(app) as client:
         client.app.state.v2_container.client_images.object_gateway = gateway
@@ -253,15 +255,9 @@ def test_direct_upload_gallery_visibility_delivery_and_delete(tmp_path: Path) ->
             "batch_id": batch_id,
             "client_item_id": "item-1",
             "display_name": "透明图片.png",
-            "media_type": "image/png",
-            "byte_size": len(content),
-            "content_md5": base64.b64encode(
-                hashlib.md5(content, usedforsecurity=False).digest()
-            ).decode(),
-            "client_sha256": hashlib.sha256(content).hexdigest(),
-            "width": 640,
-            "height": 480,
+            **object_declaration(content, width=640, height=480),
             "metadata_sanitized": True,
+            "thumbnail_512": object_declaration(thumbnail),
         }
         upload = json_request(
             client,
@@ -281,6 +277,9 @@ def test_direct_upload_gallery_visibility_delivery_and_delete(tmp_path: Path) ->
             "Content-MD5": upload_payload["content_md5"],
         }
         assert "q-header-list=content-md5;content-type;host" in upload_body["upload"]["url"]
+        assert upload_body["thumbnail_upload"]["required_headers"]["Content-MD5"] == (
+            upload_payload["thumbnail_512"]["content_md5"]
+        )
         assert "secret-test" not in upload_body["upload"]["url"]
 
         replay = json_request(
@@ -341,8 +340,10 @@ def test_direct_upload_gallery_visibility_delivery_and_delete(tmp_path: Path) ->
             {"image_ids": [image_id], "variant": "thumbnail_512"},
         )
         delivery = thumbnails.json()["items"][0]["delivery"]
-        assert delivery["signed_url"].startswith("https://images-preview.example.test/")
-        assert "&imageMogr2%2Fthumbnail%2F512x512%3E" in delivery["signed_url"]
+        assert delivery["signed_url"].startswith(
+            "https://images-1250000000.cos.ap-guangzhou.myqcloud.com/"
+        )
+        assert "imageMogr2" not in delivery["signed_url"]
         assert "q-sign" not in delivery["stable_cache_key"]
 
         shared_before = client.get(
@@ -394,7 +395,7 @@ def test_direct_upload_gallery_visibility_delivery_and_delete(tmp_path: Path) ->
         )
         assert shared_delivery.status_code == 200
         assert shared_delivery.json()["variant"] == "preview_2048"
-        assert "&imageMogr2%2Fthumbnail%2F2048x2048%3E" in shared_delivery.json()["signed_url"]
+        assert "/thumbnail_512?" in shared_delivery.json()["signed_url"]
 
         disabled = json_request(
             client,
@@ -425,10 +426,10 @@ def test_direct_upload_gallery_visibility_delivery_and_delete(tmp_path: Path) ->
         assert deleted.json()["result"] == "deleted"
 
 
-def test_complete_rejects_animated_webp_without_creating_an_asset(tmp_path: Path) -> None:
-    content = b"animated-webp"
-    gateway = FakeImageObjectGateway(content, "image/webp", 320, 240)
-    gateway.frame_count = 2
+def test_create_rejects_thumbnail_larger_than_512(tmp_path: Path) -> None:
+    content = b"sanitized-webp"
+    thumbnail = b"oversized-thumbnail"
+    gateway = FakeImageObjectGateway(content, thumbnail, "image/webp")
     app = create_public_app(image_settings(tmp_path))
     with TestClient(app) as client:
         client.app.state.v2_container.client_images.object_gateway = gateway
@@ -440,8 +441,8 @@ def test_complete_rejects_animated_webp_without_creating_an_asset(tmp_path: Path
             key,
             "POST",
             "/v2/labs/image-upload-batches",
-            {"client_batch_id": "animated", "total_count": 1, "total_bytes": len(content)},
-            extra_headers={"Idempotency-Key": "animated-batch"},
+            {"client_batch_id": "bad-thumb", "total_count": 1, "total_bytes": len(content)},
+            extra_headers={"Idempotency-Key": "bad-thumb-batch"},
         )
         upload = json_request(
             client,
@@ -451,44 +452,28 @@ def test_complete_rejects_animated_webp_without_creating_an_asset(tmp_path: Path
             "/v2/labs/image-uploads",
             {
                 "batch_id": batch.json()["id"],
-                "client_item_id": "animated-1",
-                "display_name": "animated.webp",
-                "media_type": "image/webp",
-                "byte_size": len(content),
-                "content_md5": base64.b64encode(
-                    hashlib.md5(content, usedforsecurity=False).digest()
-                ).decode(),
-                "client_sha256": hashlib.sha256(content).hexdigest(),
-                "width": 320,
-                "height": 240,
+                "client_item_id": "bad-thumb-1",
+                "display_name": "static.webp",
+                **object_declaration(content, media_type="image/webp"),
                 "metadata_sanitized": True,
+                "thumbnail_512": object_declaration(
+                    thumbnail,
+                    media_type="image/webp",
+                    width=513,
+                    height=100,
+                ),
             },
-            extra_headers={"Idempotency-Key": "animated-upload"},
+            extra_headers={"Idempotency-Key": "bad-thumb-upload"},
         )
-        complete_path = f"/v2/labs/image-uploads/{upload.json()['upload_id']}/complete"
-        response = client.post(
-            complete_path,
-            headers=signed_headers(
-                client, credentials, key, complete_path, method="POST"
-            )
-            | {"Idempotency-Key": "animated-complete"},
-        )
-        assert response.status_code == 422
-        assert "animated images are not supported" in response.json()["detail"]
+        assert upload.status_code == 422
+        assert "thumbnail_512 dimensions" in upload.json()["detail"]
         assert gateway.promotions == []
-        batch_path = f"/v2/labs/image-upload-batches/{batch.json()['id']}"
-        batch_response = client.get(
-            batch_path,
-            headers=signed_headers(client, credentials, key, batch_path),
-        )
-        assert batch_response.status_code == 200
-        assert batch_response.json()["state"] == "partial"
-        assert batch_response.json()["failed_count"] == 1
 
 
 def test_delete_during_cos_inspection_cannot_resurrect_image(tmp_path: Path) -> None:
     content = b"cancel-race-png"
-    gateway = FakeImageObjectGateway(content, "image/png", 320, 240)
+    thumbnail = b"cancel-race-thumbnail"
+    gateway = FakeImageObjectGateway(content, thumbnail)
     app = create_public_app(image_settings(tmp_path))
     with TestClient(app) as client:
         service = client.app.state.v2_container.client_images
@@ -514,15 +499,9 @@ def test_delete_during_cos_inspection_cannot_resurrect_image(tmp_path: Path) -> 
                 "batch_id": batch.json()["id"],
                 "client_item_id": "delete-race-1",
                 "display_name": "delete-race.png",
-                "media_type": "image/png",
-                "byte_size": len(content),
-                "content_md5": base64.b64encode(
-                    hashlib.md5(content, usedforsecurity=False).digest()
-                ).decode(),
-                "client_sha256": hashlib.sha256(content).hexdigest(),
-                "width": 320,
-                "height": 240,
+                **object_declaration(content),
                 "metadata_sanitized": True,
+                "thumbnail_512": object_declaration(thumbnail),
             },
             extra_headers={"Idempotency-Key": "delete-race-upload"},
         )
