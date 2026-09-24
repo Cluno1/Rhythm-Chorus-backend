@@ -342,7 +342,7 @@ def test_direct_upload_gallery_visibility_delivery_and_delete(tmp_path: Path) ->
         )
         delivery = thumbnails.json()["items"][0]["delivery"]
         assert delivery["signed_url"].startswith("https://images-preview.example.test/")
-        assert "imageMogr2%2Fthumbnail%2F512x512%3E=" in delivery["signed_url"]
+        assert "imageMogr2%2Fthumbnail%2F512x512%3E&" in delivery["signed_url"]
         assert "q-sign" not in delivery["stable_cache_key"]
 
         shared_before = client.get(
@@ -394,7 +394,7 @@ def test_direct_upload_gallery_visibility_delivery_and_delete(tmp_path: Path) ->
         )
         assert shared_delivery.status_code == 200
         assert shared_delivery.json()["variant"] == "preview_2048"
-        assert "2048x2048%3E=" in shared_delivery.json()["signed_url"]
+        assert "2048x2048%3E&" in shared_delivery.json()["signed_url"]
 
         disabled = json_request(
             client,

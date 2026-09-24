@@ -210,7 +210,7 @@ def presign_cos_request(
         f"&q-signature={signature}"
     )
     request_query = "&".join(
-        f"{quote(original_name, safe='-_.~')}="
+        f"{quote(original_name, safe='-_.~')}"
         if value is None
         else f"{quote(original_name, safe='-_.~')}={quote(str(value), safe='-_.~')}"
         for original_name, value in request_parameters
