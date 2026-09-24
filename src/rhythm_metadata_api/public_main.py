@@ -92,6 +92,7 @@ _PUBLIC_ADMIN_DEVICE_WRITE_ROUTES = (
     ("PATCH", re.compile(r"^/v2/admin/chorus/moderation-settings$")),
     ("PATCH", re.compile(r"^/v2/admin/chorus/tracks/[^/]+/moderation$")),
     ("POST", re.compile(r"^/v2/admin/shared-images/thumbnail-deliveries$")),
+    ("PATCH", re.compile(r"^/v2/admin/shared-images/settings$")),
 )
 
 

@@ -25,6 +25,7 @@ from rhythm_metadata_api.domain.v2.images import (
     ClientImageCapabilities,
     ClientImageDelivery,
     ClientImageRecord,
+    ClientImageSettingsResponse,
     ClientImageUploadCreate,
     ClientImageUploadResponse,
     ClientImageUploadTarget,
@@ -41,6 +42,7 @@ from rhythm_metadata_api.infrastructure.db.models import (
     ClientImage,
     ClientImageAuditEvent,
     ClientImageBatch,
+    ClientImageSettings,
     UploadSession,
     UserImageAdminVisibility,
     new_id,
@@ -60,6 +62,9 @@ _MEDIA_FORMATS = {
     "image/webp": "webp",
 }
 _DELIVERY_VARIANTS = {"thumbnail_512", "preview_2048", "original"}
+_MIN_IMAGE_BYTES = 1024 * 1024
+_MAX_IMAGE_BYTES = 500 * 1024 * 1024
+_MAX_THUMBNAIL_BYTES = 5 * 1024 * 1024
 
 
 def _aware(value: datetime) -> datetime:
@@ -95,7 +100,7 @@ class ClientImageService:
             enabled=reason is None,
             unavailable_reason=reason,
             supported_media_types=list(_MEDIA_FORMATS),
-            max_image_bytes=self.settings.client_image_max_bytes,
+            max_image_bytes=self._configured_max_image_bytes(),
             max_image_pixels=self.settings.client_image_max_pixels,
             max_batch_items=self.settings.client_image_max_batch_items,
             max_thumbnail_deliveries=self.settings.client_image_max_thumbnail_deliveries,
@@ -110,7 +115,7 @@ class ClientImageService:
         self._require_enabled()
         if request.total_count > self.settings.client_image_max_batch_items:
             raise V2DomainError("image batch exceeds the configured item limit")
-        if request.total_bytes > request.total_count * self.settings.client_image_max_bytes:
+        if request.total_bytes > request.total_count * self._configured_max_image_bytes():
             raise V2DomainError("image batch exceeds the configured byte limit")
         with self.uow_factory() as uow:
             self._ensure_actor_user(uow.session, actor)
@@ -514,6 +519,35 @@ class ClientImageService:
         self._delete_best_effort(thumbnail_key)
         return response
 
+    def admin_settings(self) -> ClientImageSettingsResponse:
+        with self.uow_factory() as uow:
+            item = uow.session.get(ClientImageSettings, "global")
+            return self._settings_response(item)
+
+    def update_admin_settings(
+        self, max_image_bytes: int, actor: ActorContext
+    ) -> ClientImageSettingsResponse:
+        max_allowed = min(_MAX_IMAGE_BYTES, self.settings.client_image_storage_quota_bytes)
+        if not _MIN_IMAGE_BYTES <= max_image_bytes <= max_allowed:
+            raise V2DomainError(
+                f"image size limit must be between {_MIN_IMAGE_BYTES} and {max_allowed} bytes"
+            )
+        with self.uow_factory() as uow:
+            item = uow.session.get(ClientImageSettings, "global")
+            if item is None:
+                item = ClientImageSettings(
+                    id="global",
+                    max_image_bytes=max_image_bytes,
+                    updated_by=actor.actor_id,
+                )
+                uow.session.add(item)
+            else:
+                item.max_image_bytes = max_image_bytes
+                item.updated_by = actor.actor_id
+                item.updated_at = utc_now()
+            uow.session.flush()
+            return self._settings_response(item)
+
     def cancel_upload(self, upload_id: str, actor: ActorContext) -> ClientImageUploadResponse:
         object_key = None
         with self.uow_factory() as uow:
@@ -838,13 +872,15 @@ class ClientImageService:
             raise V2Unavailable("client image COS capability is not configured")
 
     def _validate_upload_request(self, request: ClientImageUploadCreate) -> None:
-        if request.byte_size > self.settings.client_image_max_bytes:
+        if request.byte_size > self._configured_max_image_bytes():
             raise V2DomainError("image exceeds the configured byte limit")
         if request.width * request.height > self.settings.client_image_max_pixels:
             raise V2DomainError("image exceeds the configured pixel limit")
         if not request.metadata_sanitized:
             raise V2DomainError("image metadata must be sanitized before upload")
         thumbnail = request.thumbnail_512
+        if thumbnail.byte_size > _MAX_THUMBNAIL_BYTES:
+            raise V2DomainError("thumbnail_512 exceeds the configured byte limit")
         if thumbnail.width > 512 or thumbnail.height > 512:
             raise V2DomainError("thumbnail_512 dimensions must not exceed 512 pixels")
         if thumbnail.width * thumbnail.height > 512 * 512:
@@ -1251,6 +1287,26 @@ class ClientImageService:
     def _validate_delivery_count(self, image_ids: list[str]) -> None:
         if len(image_ids) > self.settings.client_image_max_thumbnail_deliveries:
             raise V2DomainError("too many thumbnail deliveries were requested")
+
+    def _configured_max_image_bytes(self) -> int:
+        with self.uow_factory() as uow:
+            item = uow.session.get(ClientImageSettings, "global")
+            return item.max_image_bytes if item is not None else self.settings.client_image_max_bytes
+
+    def _settings_response(
+        self, item: ClientImageSettings | None
+    ) -> ClientImageSettingsResponse:
+        return ClientImageSettingsResponse(
+            max_image_bytes=(
+                item.max_image_bytes if item is not None else self.settings.client_image_max_bytes
+            ),
+            min_image_bytes=_MIN_IMAGE_BYTES,
+            max_allowed_image_bytes=min(
+                _MAX_IMAGE_BYTES, self.settings.client_image_storage_quota_bytes
+            ),
+            updated_by=item.updated_by if item is not None else "environment",
+            updated_at=item.updated_at if item is not None else None,
+        )
 
     def _delete_best_effort(self, key: str) -> None:
         try:

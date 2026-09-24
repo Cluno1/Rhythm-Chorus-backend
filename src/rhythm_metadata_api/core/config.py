@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     client_image_ci_enabled: bool = False
     client_image_presign_expires_seconds: int = 10 * 60
     client_image_shared_expires_seconds: int = 60
-    client_image_max_bytes: int = 20 * 1024 * 1024
+    client_image_max_bytes: int = 50 * 1024 * 1024
     client_image_max_pixels: int = 40_000_000
     client_image_max_batch_items: int = 500
     client_image_max_thumbnail_deliveries: int = 30
@@ -107,8 +107,8 @@ class Settings(BaseSettings):
             raise ValueError("client image upload URL TTL must be between 60 and 3600 seconds")
         if not 15 <= self.client_image_shared_expires_seconds <= 60:
             raise ValueError("shared client image URL TTL must be between 15 and 60 seconds")
-        if not 1 <= self.client_image_max_bytes <= 32 * 1024 * 1024:
-            raise ValueError("client image size limit must be between 1 byte and 32 MiB")
+        if not 1024 * 1024 <= self.client_image_max_bytes <= 500 * 1024 * 1024:
+            raise ValueError("client image size limit must be between 1 MiB and 500 MiB")
         if not 1 <= self.client_image_max_pixels <= 250_000_000:
             raise ValueError("client image pixel limit must be between 1 and 250 million")
         if not 200 <= self.client_image_max_batch_items <= 5000:

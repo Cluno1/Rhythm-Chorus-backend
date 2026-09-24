@@ -46,7 +46,7 @@ class ClientImageBatchResponse(ImageApiModel):
 
 class ClientImageObjectDeclaration(ImageApiModel):
     media_type: Literal["image/png", "image/jpeg", "image/webp"]
-    byte_size: int = Field(gt=0, le=32 * 1024 * 1024)
+    byte_size: int = Field(gt=0, le=500 * 1024 * 1024)
     content_md5: str = Field(min_length=24, max_length=24)
     client_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     width: int = Field(gt=0, le=50_000)
@@ -184,6 +184,18 @@ class UserImageVisibilityResponse(ImageApiModel):
     revision: int
     enabled_at: datetime | None
     updated_at: datetime
+
+
+class ClientImageSettingsPatch(ImageApiModel):
+    max_image_bytes: int = Field(ge=1024 * 1024, le=500 * 1024 * 1024)
+
+
+class ClientImageSettingsResponse(ImageApiModel):
+    max_image_bytes: int
+    min_image_bytes: int
+    max_allowed_image_bytes: int
+    updated_by: str
+    updated_at: datetime | None
 
 
 class AdminClientImageDetail(ImageApiModel):

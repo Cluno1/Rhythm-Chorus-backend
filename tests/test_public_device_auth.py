@@ -345,6 +345,24 @@ def test_administrator_device_can_manage_devices_and_issue_invites_without_passw
         assert updated_settings.status_code == 200, updated_settings.text
         assert updated_settings.json()["automatic_approval"] is False
 
+        image_settings_path = "/v2/admin/shared-images/settings"
+        image_settings_body = b'{"max_image_bytes":52428800}'
+        image_settings_headers = signed_headers(
+            client,
+            credentials,
+            key,
+            image_settings_path,
+            method="PATCH",
+            body=image_settings_body,
+        ) | {"Content-Type": "application/json"}
+        updated_image_settings = client.patch(
+            image_settings_path,
+            content=image_settings_body,
+            headers=image_settings_headers,
+        )
+        assert updated_image_settings.status_code == 200, updated_image_settings.text
+        assert updated_image_settings.json()["max_image_bytes"] == 50 * 1024 * 1024
+
         demote_path = f"/v2/admin/devices/{device_id}/administrator"
         demote_headers = signed_headers(
             client, credentials, key, demote_path, method="DELETE"

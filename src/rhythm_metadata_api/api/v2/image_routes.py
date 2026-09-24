@@ -21,6 +21,8 @@ from rhythm_metadata_api.domain.v2.images import (
     ClientImageBulkDeleteResponse,
     ClientImageDeleteItem,
     ClientImageListResponse,
+    ClientImageSettingsPatch,
+    ClientImageSettingsResponse,
     ClientImageUploadCreate,
     ThumbnailDeliveryRequest,
     UserImageVisibilityPatch,
@@ -239,6 +241,20 @@ def list_shared_images(
         created_to,
     )
     return ClientImageListResponse(items=items, next_cursor=next_cursor)
+
+
+@admin_router.get("/settings", response_model=ClientImageSettingsResponse)
+def get_image_settings(service: Images, _: SharedAdmin) -> ClientImageSettingsResponse:
+    return service.admin_settings()
+
+
+@admin_router.patch("/settings", response_model=ClientImageSettingsResponse)
+def patch_image_settings(
+    body: ClientImageSettingsPatch,
+    service: Images,
+    actor: SharedAdmin,
+) -> ClientImageSettingsResponse:
+    return service.update_admin_settings(body.max_image_bytes, actor)
 
 
 @admin_router.post("/thumbnail-deliveries")

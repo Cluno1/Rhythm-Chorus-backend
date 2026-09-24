@@ -907,6 +907,26 @@ class UserImageAdminVisibility(Base):
     )
 
 
+class ClientImageSettings(Base):
+    __tablename__ = "v2_client_image_settings"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default="global")
+    max_image_bytes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=50 * 1024 * 1024, server_default=text("52428800")
+    )
+    updated_by: Mapped[str] = mapped_column(String(100), nullable=False, default="system")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "max_image_bytes >= 1048576 AND max_image_bytes <= 524288000",
+            name="client_image_settings_max_bytes",
+        ),
+    )
+
+
 class ClientImageAuditEvent(Base):
     __tablename__ = "v2_client_image_audit_events"
 
