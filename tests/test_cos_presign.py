@@ -151,9 +151,15 @@ def test_cos_provisioner_signs_bucket_control_plane_request() -> None:
         str(Path(__file__).parents[1] / "scripts" / "provision_client_image_cos.py")
     )
     provisioner_class = script_namespace["CosProvisioner"]
-    url = provisioner_class(settings)._url("HEAD")
+    provisioner = provisioner_class(settings)
+    url = provisioner._url("HEAD")
 
     assert url.startswith(
         "https://images-1250000000.cos.ap-guangzhou.myqcloud.com/"
         "?q-sign-algorithm=sha1"
     )
+
+    with mock.patch.object(provisioner, "_open_ci_feature") as open_ci_feature:
+        provisioner.enable_ci()
+
+    open_ci_feature.assert_called_once_with("file_bucket", "ci_file_processing")

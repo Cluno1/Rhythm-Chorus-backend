@@ -224,7 +224,8 @@ class CosProvisioner:
             raise
 
     def enable_ci(self) -> None:
-        self._open_ci_feature("", "ci_binding")
+        # Tencent's file_bucket API opens file processing and binds an unbound
+        # COS bucket to CI in the same operation. CI has no bucket-root POST.
         self._open_ci_feature("file_bucket", "ci_file_processing")
 
     def smoke_test(self) -> None:
