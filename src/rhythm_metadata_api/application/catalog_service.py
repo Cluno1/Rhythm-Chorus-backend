@@ -53,6 +53,7 @@ from rhythm_metadata_api.domain.v2.schemas import (
     LyricSourceDocumentResponse,
     LyricSourceImageResponse,
     LyricSourceLinkCreate,
+    LyricSourceLinkPatch,
     LyricSourcePageCreate,
     LyricSourcePageResponse,
     LyricsTranslation,
@@ -349,6 +350,8 @@ class CatalogService:
         actor: ActorContext,
     ) -> StoredResponse:
         def operation(session: Session) -> tuple[WorkResponse, int, dict[str, str]]:
+            if request.cover_asset_id is not None:
+                self._validate_cover_asset(session, request.cover_asset_id)
             self._require_contributors(
                 session, [credit.contributor_id for credit in request.credits]
             )
@@ -362,6 +365,7 @@ class CatalogService:
                 canonical_title=request.canonical_title.strip(),
                 language=request.language,
                 status=request.status,
+                cover_asset_id=request.cover_asset_id,
                 lyrics=lyrics,
                 lyrics_language=lyrics_language,
                 lyrics_translations=lyrics_translations,
@@ -432,6 +436,8 @@ class CatalogService:
                     self._require_contributors(
                         uow.session, [credit["contributor_id"] for credit in credits]
                     )
+                if "cover_asset_id" in changes and changes["cover_asset_id"] is not None:
+                    self._validate_cover_asset(uow.session, changes["cover_asset_id"])
                 _merge_lyrics_patch(
                     work,
                     changes,
@@ -974,6 +980,82 @@ class CatalogService:
         return self._attach_lyric_source_page(
             "work", work_id, request, expected_revision, idempotency_key, actor
         )
+
+    def update_work_lyric_source_page(
+        self,
+        work_id: str,
+        link_id: str,
+        request: LyricSourceLinkPatch,
+        expected_revision: int,
+        actor: ActorContext,
+    ) -> LyricSourceImageResponse:
+        with self.uow_factory() as uow:
+            work = self._require_work(uow.session, work_id)
+            require_revision(work.revision, expected_revision)
+            link = uow.session.get(LyricSourceLink, link_id)
+            if link is None or link.work_id != work.id:
+                raise V2NotFound("work lyric source link not found")
+            changes = request.model_dump(exclude_unset=True)
+            if not changes:
+                raise V2DomainError("at least one lyric source field is required")
+            if "display_order" in changes:
+                if changes["display_order"] is None:
+                    raise V2DomainError("display_order cannot be null")
+                link.display_order = changes["display_order"]
+            if "language_relations" in changes:
+                if changes["language_relations"] is None:
+                    raise V2DomainError("language_relations cannot be null")
+                link.language_relations = changes["language_relations"]
+            if "note" in changes:
+                link.note = changes["note"].strip() if changes["note"] else None
+            work.revision += 1
+            work.updated_at = utc_now()
+            self._append_event(
+                uow.session,
+                work.id,
+                "work",
+                work.id,
+                work.revision,
+                "work.lyric_source_page_updated",
+                actor,
+                {"link_id": link.id, "fields": sorted(changes)},
+            )
+            uow.session.flush()
+            return next(
+                item
+                for item in self._lyric_source_images_for_owner(uow.session, "work", work.id)
+                if item.link_id == link.id
+            )
+
+    def remove_work_lyric_source_page(
+        self,
+        work_id: str,
+        link_id: str,
+        expected_revision: int,
+        actor: ActorContext,
+    ) -> WorkResponse:
+        with self.uow_factory() as uow:
+            work = self._require_work(uow.session, work_id)
+            require_revision(work.revision, expected_revision)
+            link = uow.session.get(LyricSourceLink, link_id)
+            if link is None or link.work_id != work.id:
+                raise V2NotFound("work lyric source link not found")
+            source_page_id = link.source_page_id
+            uow.session.delete(link)
+            work.revision += 1
+            work.updated_at = utc_now()
+            self._append_event(
+                uow.session,
+                work.id,
+                "work",
+                work.id,
+                work.revision,
+                "work.lyric_source_page_removed",
+                actor,
+                {"link_id": link_id, "source_page_id": source_page_id},
+            )
+            uow.session.flush()
+            return self._work_response(uow.session, work)
 
     def attach_score_lyric_source_page(
         self,
@@ -3014,6 +3096,7 @@ class CatalogService:
             canonical_title=work.canonical_title,
             language=work.language,
             status=work.status,
+            cover_asset_id=work.cover_asset_id,
             lyrics=work.lyrics,
             lyrics_language=work.lyrics_language,
             lyrics_translations=work.lyrics_translations,

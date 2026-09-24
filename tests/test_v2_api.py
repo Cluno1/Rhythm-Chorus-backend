@@ -1057,6 +1057,107 @@ def test_work_edit_replaces_people_languages_and_external_ids(client: TestClient
     ]
 
 
+def test_work_cover_can_be_created_replaced_and_cleared(client: TestClient) -> None:
+    png_header = (
+        b"\x89PNG\r\n\x1a\n"
+        + b"\x00" * 8
+        + (1200).to_bytes(4, "big")
+        + (1200).to_bytes(4, "big")
+        + b"\x00" * 8
+    )
+    first_cover = upload_asset(
+        client,
+        key="work-cover-first",
+        content=png_header + b"first-cover-image",
+        media_type="image/png",
+        filename="first-cover.png",
+    )
+    second_cover = upload_asset(
+        client,
+        key="work-cover-second",
+        content=png_header + b"second-cover-image",
+        media_type="image/png",
+        filename="second-cover.png",
+    )
+    audio = upload_asset(
+        client,
+        key="work-cover-audio",
+        content=b"ID3" + bytes(range(64)),
+        media_type="audio/mpeg",
+        filename="not-a-cover.mp3",
+    )
+
+    created = post(
+        client,
+        "/v2/works",
+        "work-with-cover",
+        {
+            "canonical_title": "Covered Work",
+            "cover_asset_id": first_cover["id"],
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["cover_asset_id"] == first_cover["id"]
+    work_id = created.json()["id"]
+
+    replaced = client.patch(
+        f"/v2/works/{work_id}",
+        headers={**AUTH, "If-Match": '"rev-1"'},
+        json={"cover_asset_id": second_cover["id"]},
+    )
+    assert replaced.status_code == 200, replaced.text
+    assert replaced.headers["etag"] == '"rev-2"'
+    assert replaced.json()["cover_asset_id"] == second_cover["id"]
+
+    rejected = client.patch(
+        f"/v2/works/{work_id}",
+        headers={**AUTH, "If-Match": '"rev-2"'},
+        json={"cover_asset_id": audio["id"]},
+    )
+    assert rejected.status_code == 422
+    assert "validated image Asset" in rejected.json()["detail"]
+
+    with Session(client.app.state.v2_container.engine) as session:
+        pending_cover = Asset(
+            sha256="f" * 64,
+            byte_size=128,
+            detected_media_type="image/png",
+            state="pending_inspection",
+        )
+        session.add(pending_cover)
+        session.flush()
+        pending_cover_id = pending_cover.id
+        session.commit()
+
+    not_ready = client.patch(
+        f"/v2/works/{work_id}",
+        headers={**AUTH, "If-Match": '"rev-2"'},
+        json={"cover_asset_id": pending_cover_id},
+    )
+    assert not_ready.status_code == 409
+    assert "not ready" in not_ready.json()["detail"]
+
+    missing = client.patch(
+        f"/v2/works/{work_id}",
+        headers={**AUTH, "If-Match": '"rev-2"'},
+        json={"cover_asset_id": "missing-cover-asset"},
+    )
+    assert missing.status_code == 404
+
+    cleared = client.patch(
+        f"/v2/works/{work_id}",
+        headers={**AUTH, "If-Match": '"rev-2"'},
+        json={"cover_asset_id": None},
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.headers["etag"] == '"rev-3"'
+    assert cleared.json()["cover_asset_id"] is None
+
+    with Session(client.app.state.v2_container.engine) as session:
+        assert session.get(Asset, first_cover["id"]) is not None
+        assert session.get(Asset, second_cover["id"]) is not None
+
+
 def test_private_catalog_end_to_end(client: TestClient) -> None:
     contributor = post(
         client,
@@ -1896,3 +1997,39 @@ def test_shared_lyric_source_pages_and_effective_precedence(client: TestClient) 
         ]
         == pages[0]["id"]
     )
+
+    work_before_edit = client.get(f"/v2/works/{work_ids[0]}", headers=AUTH).json()
+    edited_link = client.patch(
+        f"/v2/works/{work_ids[0]}/lyric-source-pages/{second_work_page.json()['link_id']}",
+        headers={**AUTH, "If-Match": f'"rev-{work_before_edit["revision"]}"'},
+        json={
+            "display_order": 4,
+            "language_relations": [{"language": "en", "relation": "printed"}],
+            "note": "Revised source page",
+        },
+    )
+    assert edited_link.status_code == 200, edited_link.text
+    assert edited_link.json()["display_order"] == 4
+    assert edited_link.json()["language_relations"] == [
+        {"language": "en", "relation": "printed", "derived_from_language": None}
+    ]
+    assert edited_link.json()["note"] == "Revised source page"
+
+    stale_removal = client.delete(
+        f"/v2/works/{work_ids[0]}/lyric-source-pages/{second_work_page.json()['link_id']}",
+        headers={**AUTH, "If-Match": f'"rev-{work_before_edit["revision"]}"'},
+    )
+    assert stale_removal.status_code == 412
+
+    removed_link = client.delete(
+        f"/v2/works/{work_ids[0]}/lyric-source-pages/{second_work_page.json()['link_id']}",
+        headers={**AUTH, "If-Match": edited_link.headers["etag"]},
+    )
+    assert removed_link.status_code == 200, removed_link.text
+    assert [item["source_page_id"] for item in removed_link.json()["lyrics_source_images"]] == [
+        pages[0]["id"]
+    ]
+    assert client.get(f"/v2/works/{work_ids[1]}", headers=AUTH).json()[
+        "lyrics_source_images"
+    ][0]["source_page_id"] == pages[0]["id"]
+    assert client.get(f"/v2/lyric-source-documents/{document_id}", headers=AUTH).status_code == 200

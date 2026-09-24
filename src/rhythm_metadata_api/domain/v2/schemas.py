@@ -92,6 +92,14 @@ class LyricSourceLinkCreate(ApiModel):
     note: str | None = Field(default=None, max_length=10_000)
 
 
+class LyricSourceLinkPatch(ApiModel):
+    display_order: int | None = Field(default=None, ge=1)
+    language_relations: list[LyricSourceLanguageRelation] | None = Field(
+        default=None, max_length=100
+    )
+    note: str | None = Field(default=None, max_length=10_000)
+
+
 class LyricSourcePageResponse(ApiModel):
     id: str
     document_id: str
@@ -214,6 +222,7 @@ class WorkCreate(LocalizedLyricsCreate):
     canonical_title: str = Field(min_length=1, max_length=500)
     language: str | None = Field(default=None, max_length=35)
     status: Literal["draft", "active", "archived"] = "active"
+    cover_asset_id: str | None = None
     aliases: list[WorkAliasInput] = Field(default_factory=list)
     credits: list[CreditInput] = Field(default_factory=list)
 
@@ -227,6 +236,7 @@ class WorkPatch(LocalizedLyricsPatch):
     canonical_title: str | None = Field(default=None, min_length=1, max_length=500)
     language: str | None = Field(default=None, max_length=35)
     status: Literal["draft", "active", "archived"] | None = None
+    cover_asset_id: str | None = None
     aliases: list[WorkAliasInput] | None = None
     credits: list[CreditInput] | None = None
 
@@ -249,6 +259,7 @@ class WorkResponse(LocalizedLyricsResponse):
     canonical_title: str
     language: str | None
     status: str
+    cover_asset_id: str | None
     revision: int
     aliases: list[WorkAliasInput]
     credits: list[WorkCreditResponse]
