@@ -91,7 +91,16 @@ class TencentCosImageGateway:
                     raise CosImageGatewayError("COS metadata response is unexpectedly large")
                 return response.headers, body
         except urllib.error.HTTPError as error:
-            raise CosImageGatewayError(f"COS returned HTTP {error.code}") from error
+            service_code = ""
+            try:
+                error_payload = error.read(16 * 1024)
+                service_code = (ET.fromstring(error_payload).findtext(".//Code") or "").strip()
+            except (ET.ParseError, OSError):
+                pass
+            if not service_code.replace("-", "").replace("_", "").isalnum():
+                service_code = ""
+            suffix = f" ({service_code})" if service_code else ""
+            raise CosImageGatewayError(f"COS returned HTTP {error.code}{suffix}") from error
         except urllib.error.URLError as error:
             raise CosImageGatewayError("COS request failed") from error
 
