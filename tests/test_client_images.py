@@ -395,7 +395,17 @@ def test_direct_upload_gallery_visibility_delivery_and_delete(tmp_path: Path) ->
         )
         assert shared_delivery.status_code == 200
         assert shared_delivery.json()["variant"] == "preview_2048"
-        assert "/thumbnail_512?" in shared_delivery.json()["signed_url"]
+        assert "/thumbnail_512?" not in shared_delivery.json()["signed_url"]
+        assert shared_delivery.json()["byte_size"] == len(content)
+
+        shared_original = client.get(
+            f"/v2/admin/shared-images/{image_id}/delivery?variant=original",
+            headers={"Authorization": f"Bearer {admin}"},
+        )
+        assert shared_original.status_code == 200
+        assert shared_original.json()["variant"] == "original"
+        assert shared_original.json()["byte_size"] == len(content)
+        assert shared_original.json()["suggested_filename"] == "透明图片.png"
 
         disabled = json_request(
             client,

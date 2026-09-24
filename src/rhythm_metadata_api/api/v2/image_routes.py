@@ -258,6 +258,8 @@ def shared_delivery(
     image_id: str,
     service: Images,
     _: SharedAdmin,
-    variant: Annotated[Literal["thumbnail_512", "preview_2048"], Query()] = "preview_2048",
+    variant: Annotated[
+        Literal["thumbnail_512", "preview_2048", "original"], Query()
+    ] = "preview_2048",
 ):
     return service.shared_delivery(image_id, variant)

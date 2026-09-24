@@ -790,8 +790,8 @@ class ClientImageService:
             )
 
     def shared_delivery(self, image_id: str, variant: str) -> ClientImageDelivery:
-        if variant not in {"thumbnail_512", "preview_2048"}:
-            raise V2DomainError("shared image delivery only supports preview variants")
+        if variant not in {"thumbnail_512", "preview_2048", "original"}:
+            raise V2DomainError("unsupported shared image delivery variant")
         with self.uow_factory() as uow:
             image = self._shared_ready_image(uow.session, image_id)
             return self._delivery(uow.session, image, variant, shared=True)
@@ -974,7 +974,10 @@ class ClientImageService:
         asset = session.get(Asset, image.asset_id)
         if asset is None or asset.state != "ready" or asset.deleted_at is not None:
             raise V2NotFound("image Asset was not found")
-        use_thumbnail = variant == "thumbnail_512" or shared
+        # Shared access is already gated by the owner's visibility setting. Keep
+        # gallery tiles lightweight, but let authorized administrators open or
+        # download the same original object as the owner.
+        use_thumbnail = variant == "thumbnail_512"
         if use_thumbnail:
             storage_key = image.thumbnail_storage_key
             media_type = image.thumbnail_media_type
