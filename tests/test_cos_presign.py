@@ -1,8 +1,11 @@
+import runpy
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest import mock
 
 import pytest
 
+from rhythm_metadata_api.core.config import Settings
 from rhythm_metadata_api.infrastructure.storage.cos_presign import (
     presign_cos_get,
     presign_cos_post,
@@ -133,3 +136,24 @@ def test_presign_cos_post_supports_ci_control_plane_host() -> None:
         "https://images-1250000000.ci.ap-guangzhou.myqcloud.com/file_bucket?"
     )
     assert "q-header-list=content-type;host" in url
+
+
+def test_cos_provisioner_signs_bucket_control_plane_request() -> None:
+    settings = Settings(
+        cos_secret_id="secret-id",
+        cos_secret_key="secret-key",
+        client_image_cos_bucket="images-1250000000",
+        client_image_preview_host="images.example.test",
+        client_image_ci_enabled=True,
+    )
+
+    script_namespace = runpy.run_path(
+        str(Path(__file__).parents[1] / "scripts" / "provision_client_image_cos.py")
+    )
+    provisioner_class = script_namespace["CosProvisioner"]
+    url = provisioner_class(settings)._url("HEAD")
+
+    assert url.startswith(
+        "https://images-1250000000.cos.ap-guangzhou.myqcloud.com/"
+        "?q-sign-algorithm=sha1"
+    )
