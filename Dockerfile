@@ -7,6 +7,7 @@ RUN apt-get update \
 COPY pyproject.toml README.md ./
 COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/pip pip install .
+COPY scripts/provision_client_image_cos.py ./scripts/provision_client_image_cos.py
 RUN useradd --create-home --uid 10001 rhythm \
     && mkdir -p /data \
     && chown -R rhythm:rhythm /data

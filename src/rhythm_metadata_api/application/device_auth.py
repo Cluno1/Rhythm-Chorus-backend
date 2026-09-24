@@ -355,7 +355,11 @@ class DeviceAuthService:
                 "sub": principal.user_id,
                 "device_id": principal.device_id,
                 "session_id": principal.session_id,
-                "scope": "catalog:read catalog:lyrics:write chorus:read chorus:track:write-own",
+                "scope": (
+                    "catalog:read catalog:lyrics:write chorus:read chorus:track:write-own "
+                    "image:upload-own image:read-own image:download-own image:delete-own "
+                    "image:read-shared"
+                ),
                 "cnf": {"jkt": principal.key_thumbprint},
                 "application_id": principal.application_id,
                 "signing_certificate_sha256": principal.signing_certificate_sha256,

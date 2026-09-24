@@ -33,6 +33,20 @@ class Settings(BaseSettings):
     chorus_ffmpeg_path: str = "ffmpeg"
     chorus_mix_timeout_seconds: int = 10 * 60
 
+    # Issue 91 client-owned images. This is a separate private bucket/control plane
+    # from chorus audio so it can fail closed until COS/CI is explicitly enabled.
+    client_image_cos_bucket: str = ""
+    client_image_preview_host: str = ""
+    client_image_ci_enabled: bool = False
+    client_image_presign_expires_seconds: int = 10 * 60
+    client_image_shared_expires_seconds: int = 60
+    client_image_max_bytes: int = 20 * 1024 * 1024
+    client_image_max_pixels: int = 40_000_000
+    client_image_max_batch_items: int = 500
+    client_image_max_thumbnail_deliveries: int = 30
+    client_image_max_parallel_uploads: int = 3
+    client_image_storage_quota_bytes: int = 5 * 1024 * 1024 * 1024
+
     # Public device gateway (issue 14). These remain optional for the private app;
     # create_public_app validates them before exposing a public listener.
     public_token_secret: str = ""
@@ -79,6 +93,32 @@ class Settings(BaseSettings):
                 "RHYTHM_CHORUS_COS_BUCKET requires RHYTHM_COS_SECRET_ID and "
                 "RHYTHM_COS_SECRET_KEY"
             )
+        if self.client_image_cos_bucket and not (self.cos_secret_id and self.cos_secret_key):
+            raise ValueError(
+                "RHYTHM_CLIENT_IMAGE_COS_BUCKET requires RHYTHM_COS_SECRET_ID and "
+                "RHYTHM_COS_SECRET_KEY"
+            )
+        if self.client_image_preview_host and (
+            "://" in self.client_image_preview_host
+            or any(character in self.client_image_preview_host for character in "/?#@")
+        ):
+            raise ValueError("RHYTHM_CLIENT_IMAGE_PREVIEW_HOST must be a bare HTTPS host")
+        if not 60 <= self.client_image_presign_expires_seconds <= 3600:
+            raise ValueError("client image upload URL TTL must be between 60 and 3600 seconds")
+        if not 15 <= self.client_image_shared_expires_seconds <= 60:
+            raise ValueError("shared client image URL TTL must be between 15 and 60 seconds")
+        if not 1 <= self.client_image_max_bytes <= 32 * 1024 * 1024:
+            raise ValueError("client image size limit must be between 1 byte and 32 MiB")
+        if not 1 <= self.client_image_max_pixels <= 250_000_000:
+            raise ValueError("client image pixel limit must be between 1 and 250 million")
+        if not 200 <= self.client_image_max_batch_items <= 5000:
+            raise ValueError("client image batch limit must be between 200 and 5000")
+        if not 1 <= self.client_image_max_thumbnail_deliveries <= 100:
+            raise ValueError("client image thumbnail delivery limit must be between 1 and 100")
+        if not 1 <= self.client_image_max_parallel_uploads <= 8:
+            raise ValueError("client image upload concurrency must be between 1 and 8")
+        if self.client_image_storage_quota_bytes < self.client_image_max_bytes:
+            raise ValueError("client image storage quota must allow at least one maximum image")
         if not 30 <= self.chorus_mix_timeout_seconds <= 60 * 60:
             raise ValueError("chorus mix timeout must be between 30 and 3600 seconds")
         for name, digest in (

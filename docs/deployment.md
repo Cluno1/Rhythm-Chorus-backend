@@ -58,6 +58,22 @@ sudo docker compose up -d --build
 `chorus track processing failed` 与 `chorus mix rendering failed` 日志。数据库迁移到
 `issue78chorus` 后才可开放客户端入口。
 
+Labs 图片直传上线前，需创建独立的私有 COS 桶，并为 `api`、`public-api` 同时配置：
+
+```text
+RHYTHM_CLIENT_IMAGE_COS_BUCKET=<bucket-appid>
+RHYTHM_CLIENT_IMAGE_PREVIEW_HOST=<bare-https-host>
+RHYTHM_CLIENT_IMAGE_CI_ENABLED=true
+```
+
+生产默认限制为单图 20 MiB/40 MP、单批 500 张、每用户 5 GiB、移动端建议最多 3 个并发。
+图片正文只走设备到 COS；后端仅执行 COS HEAD、CI `imageInfo`、CI SHA-256、COS 内部复制和
+短时签名。必须为该桶绑定数据万象并开启文件处理服务，同时给
+`labs/images/tmp/` 配置短期生命周期清理。桶保持私有读写，不得把 COS 永久密钥下发客户端。
+2024 年后创建的 COS 桶使用默认域名时浏览器不能内联预览；Android 原生客户端验收可先用
+默认 COS HTTPS host，Web 管理端正式验收前仍需完成自定义源站域名、HTTPS 证书、DNS、CORS
+与 Web CSP 配置。
+
 持久数据位于部署目录 `data/`，包含旧 v1 SQLite、`rhythm-v2.sqlite3`、WAL 和内容寻址对象。备份时应同时备份整个 `data/`；SQLite 在线备份应优先使用 SQLite backup API，避免只复制主数据库而遗漏 WAL。
 
 当前 `0.3.0` 已于 `2026-09-03` 部署，运行镜像对应源码提交 `98ea388`，镜像标签为 `rhythm-metadata-api-api:v0.3.0-98ea388`。线上保留 v1 SQLite 及其 WAL，v2 使用独立数据库并已执行 Alembic `25ff14940d0d`；尚未进行 v1 -> v2 业务数据导入。

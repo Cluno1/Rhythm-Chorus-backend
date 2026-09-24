@@ -217,6 +217,18 @@ Sonorus Web 管理台通过 WireGuard 内的管理 API 调用 `/v2/admin/session
 正常请求不会滑动续期；Web 服务重启仍会使其内存会话立即失效。该管理员令牌本身不能读取或修改 Catalog；
 Catalog 仍由 BFF 在服务端使用 bootstrap Token，并通过显式路由白名单代理。
 
+### Labs 用户图片直传
+
+Issue 91 使用独立私有 COS 桶承载用户图片。Android 先通过设备证明请求单对象、短时 PUT
+签名，然后把图片正文直接上传到 COS；后端只通过 COS/CI 元数据校验并登记稳定的
+`imageId`/`assetId`，不会代理图片字节。用户列表、删除、下载和管理员授权均按 owner 与窄
+scope 校验；管理员只能查看用户主动开放的缩略图/预览，不能下载原图或代删。
+
+生产部署必须同时设置 `RHYTHM_CLIENT_IMAGE_COS_BUCKET`、
+`RHYTHM_CLIENT_IMAGE_PREVIEW_HOST`、`RHYTHM_CLIENT_IMAGE_CI_ENABLED=true`，并在 COS 侧绑定
+数据万象、开启文件哈希服务、保持私有 ACL、配置跨域与临时对象生命周期。详细边界见
+`docs/deployment.md`。
+
 ## COS 典型样本导入
 
 `scripts/import_cos_samples.py` 从 GMUSIC Mongo 索引和 COS 导入一组固定的小样本，用来验证多谱、修订、扫描附件、MIDI Rendition、Asset 去重和 Range 播放。当前样本为 `321`、`348`、`528`、`test1`、`110`。

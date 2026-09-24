@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session, aliased
 
 from rhythm_metadata_api.application.catalog_service import CatalogService
 from rhythm_metadata_api.application.chorus_service import ChorusService
+from rhythm_metadata_api.application.client_image_service import ClientImageService
 from rhythm_metadata_api.application.unit_of_work import UnitOfWorkFactory
 from rhythm_metadata_api.core.config import Settings
 from rhythm_metadata_api.infrastructure.db.database import (
@@ -15,6 +16,7 @@ from rhythm_metadata_api.infrastructure.db.database import (
     migrate_v2_database,
 )
 from rhythm_metadata_api.infrastructure.db.models import AssetLocation
+from rhythm_metadata_api.infrastructure.storage.cos_images import TencentCosImageGateway
 from rhythm_metadata_api.infrastructure.storage.local import LocalAssetStorage
 
 
@@ -24,6 +26,7 @@ class V2Container:
     engine: Engine
     catalog: CatalogService
     chorus: ChorusService
+    client_images: ClientImageService
 
     @classmethod
     def build(cls, settings: Settings) -> V2Container:
@@ -52,7 +55,16 @@ class V2Container:
         storage = LocalAssetStorage(settings.local_object_root)
         catalog = CatalogService(UnitOfWorkFactory(sessions), storage, settings)
         chorus = ChorusService(UnitOfWorkFactory(sessions), storage, settings)
-        return cls(settings=settings, engine=engine, catalog=catalog, chorus=chorus)
+        client_images = ClientImageService(
+            UnitOfWorkFactory(sessions), settings, TencentCosImageGateway(settings)
+        )
+        return cls(
+            settings=settings,
+            engine=engine,
+            catalog=catalog,
+            chorus=chorus,
+            client_images=client_images,
+        )
 
     def close(self) -> None:
         self.engine.dispose()

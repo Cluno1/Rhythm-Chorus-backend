@@ -8,6 +8,8 @@ from fastapi.responses import JSONResponse
 from rhythm_metadata_api.api.public_auth import router as public_auth_router
 from rhythm_metadata_api.api.routes import health, tracks
 from rhythm_metadata_api.api.v2.chorus_routes import router as chorus_router
+from rhythm_metadata_api.api.v2.image_routes import admin_router as image_admin_router
+from rhythm_metadata_api.api.v2.image_routes import router as image_router
 from rhythm_metadata_api.api.v2.routes import router as v2_router
 from rhythm_metadata_api.application.container import V2Container
 from rhythm_metadata_api.application.device_auth import DeviceAuthService
@@ -103,6 +105,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(tracks.router, prefix="/v1")
     app.include_router(v2_router)
     app.include_router(chorus_router)
+    app.include_router(image_router)
+    app.include_router(image_admin_router)
     app.include_router(public_auth_router)
     return app
 

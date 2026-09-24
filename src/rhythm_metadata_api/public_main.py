@@ -6,6 +6,7 @@ import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Annotated
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -16,6 +17,8 @@ from rhythm_metadata_api.api.public_updates import UpdateRepository
 from rhythm_metadata_api.api.public_updates import router as public_updates_router
 from rhythm_metadata_api.api.routes import health
 from rhythm_metadata_api.api.v2.chorus_routes import router as chorus_router
+from rhythm_metadata_api.api.v2.image_routes import admin_router as image_admin_router
+from rhythm_metadata_api.api.v2.image_routes import router as image_router
 from rhythm_metadata_api.api.v2.routes import actor_context
 from rhythm_metadata_api.api.v2.routes import router as v2_router
 from rhythm_metadata_api.application.catalog_service import ActorContext
@@ -57,6 +60,12 @@ _PUBLIC_READ_ROUTES = (
     ("HEAD", re.compile(r"^/v2/app-updates/files/\d+/[A-Za-z0-9._-]+\.apk$")),
     ("GET", re.compile(r"^/v2/app-updates/(?:debug|stable)/latest\.apk$")),
     ("HEAD", re.compile(r"^/v2/app-updates/(?:debug|stable)/latest\.apk$")),
+    ("GET", re.compile(r"^/v2/labs/images/capabilities$")),
+    ("GET", re.compile(r"^/v2/labs/image-upload-batches/[^/]+$")),
+    ("GET", re.compile(r"^/v2/labs/images$")),
+    ("GET", re.compile(r"^/v2/labs/images/admin-visibility$")),
+    ("GET", re.compile(r"^/v2/labs/images/[^/]+$")),
+    ("GET", re.compile(r"^/v2/labs/images/[^/]+/delivery$")),
 )
 _PUBLIC_WRITE_ROUTES = (
     ("PUT", re.compile(r"^/v2/renditions/[^/]+/lyrics/[^/]+$")),
@@ -66,6 +75,14 @@ _PUBLIC_WRITE_ROUTES = (
     ("POST", re.compile(r"^/v2/chorus-tracks/[^/]+/submit$")),
     ("DELETE", re.compile(r"^/v2/chorus-tracks/[^/]+$")),
     ("POST", re.compile(r"^/v2/chorus-projects/[^/]+/mixes:resolve$")),
+    ("POST", re.compile(r"^/v2/labs/image-upload-batches$")),
+    ("POST", re.compile(r"^/v2/labs/image-upload-batches/[^/]+/cancel$")),
+    ("POST", re.compile(r"^/v2/labs/image-uploads$")),
+    ("POST", re.compile(r"^/v2/labs/image-uploads/[^/]+/(?:refresh|complete|cancel)$")),
+    ("PATCH", re.compile(r"^/v2/labs/images/admin-visibility$")),
+    ("POST", re.compile(r"^/v2/labs/images/thumbnail-deliveries$")),
+    ("POST", re.compile(r"^/v2/labs/images:batch-delete$")),
+    ("DELETE", re.compile(r"^/v2/labs/images/[^/]+$")),
 )
 _PUBLIC_ADMIN_DEVICE_WRITE_ROUTES = (
     ("POST", re.compile(r"^/v2/admin/invites$")),
@@ -74,6 +91,7 @@ _PUBLIC_ADMIN_DEVICE_WRITE_ROUTES = (
     ("POST", re.compile(r"^/v2/admin/devices/[^/]+/revoke$")),
     ("PATCH", re.compile(r"^/v2/admin/chorus/moderation-settings$")),
     ("PATCH", re.compile(r"^/v2/admin/chorus/tracks/[^/]+/moderation$")),
+    ("POST", re.compile(r"^/v2/admin/shared-images/thumbnail-deliveries$")),
 )
 
 
@@ -176,12 +194,28 @@ def public_actor_context(
             request.url.path,
             request.scope.get("query_string", b"").decode("ascii"),
         )
-        if _public_write_allowed(request.method, request.url.path):
+        required_scope = None
+        if request.url.path.startswith("/v2/labs/"):
+            if request.method == "DELETE" or request.url.path.endswith("images:batch-delete"):
+                required_scope = "image:delete-own"
+            elif request.url.path.endswith("/delivery") and parse_qs(
+                request.scope.get("query_string", b"").decode("ascii")
+            ).get("purpose") == ["download"]:
+                required_scope = "image:download-own"
+            elif request.url.path.startswith((
+                "/v2/labs/image-upload-batches",
+                "/v2/labs/image-uploads",
+            )):
+                required_scope = "image:upload-own"
+            else:
+                required_scope = "image:read-own"
+        elif _public_write_allowed(request.method, request.url.path):
             required_scope = (
                 "catalog:lyrics:write"
                 if request.url.path.startswith("/v2/renditions/")
                 else "chorus:track:write-own"
             )
+        if required_scope is not None:
             request.app.state.device_auth.require_scope(token, required_scope)
     except (DeviceAuthError, UnicodeDecodeError) as error:
         if isinstance(error, DeviceAuthError):
@@ -302,4 +336,6 @@ def create_public_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(public_updates_router)
     app.include_router(v2_router)
     app.include_router(chorus_router)
+    app.include_router(image_router)
+    app.include_router(image_admin_router)
     return app

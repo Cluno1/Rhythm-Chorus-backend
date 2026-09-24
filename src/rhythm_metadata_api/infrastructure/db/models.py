@@ -780,9 +780,133 @@ class UploadSession(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "state IN ('created', 'uploaded', 'completed', 'failed', 'expired')",
+            "state IN ('created', 'uploaded', 'completed', 'failed', 'expired', 'cancelled')",
             name="upload_session_state",
         ),
+    )
+
+
+class ClientImageBatch(Base):
+    __tablename__ = "v2_client_image_batches"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_user_id: Mapped[str] = mapped_column(
+        ForeignKey("auth_users.id", ondelete="CASCADE"), nullable=False
+    )
+    client_batch_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    total_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    total_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    succeeded_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_user_id", "client_batch_id", name="uq_v2_client_image_batch_owner_client"
+        ),
+        CheckConstraint("total_count > 0", name="client_image_batch_count"),
+        CheckConstraint("total_bytes >= 0", name="client_image_batch_bytes"),
+        CheckConstraint(
+            "state IN ('active', 'partial', 'completed', 'cancelled')",
+            name="client_image_batch_state",
+        ),
+        Index("v2_client_image_batches_owner_idx", "owner_user_id", "created_at"),
+    )
+
+
+class ClientImage(Base):
+    __tablename__ = "v2_client_images"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_user_id: Mapped[str] = mapped_column(
+        ForeignKey("auth_users.id", ondelete="CASCADE"), nullable=False
+    )
+    batch_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_client_image_batches.id", ondelete="CASCADE"), nullable=False
+    )
+    client_item_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    upload_session_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_upload_sessions.id", ondelete="RESTRICT"), nullable=False, unique=True
+    )
+    asset_id: Mapped[str | None] = mapped_column(
+        ForeignKey("v2_assets.id", ondelete="RESTRICT"), nullable=True
+    )
+    uploader_device_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    display_name: Mapped[str] = mapped_column(String(500), nullable=False)
+    media_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    image_format: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    width: Mapped[int] = mapped_column(Integer, nullable=False)
+    height: Mapped[int] = mapped_column(Integer, nullable=False)
+    byte_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    content_md5: Mapped[str] = mapped_column(String(64), nullable=False)
+    client_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    metadata_sanitized: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="upload_pending")
+    failure_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+    ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_user_id",
+            "batch_id",
+            "client_item_id",
+            name="uq_v2_client_image_owner_batch_item",
+        ),
+        CheckConstraint("width > 0 AND height > 0", name="client_image_dimensions"),
+        CheckConstraint("byte_size > 0", name="client_image_size"),
+        CheckConstraint(
+            "state IN ('upload_pending', 'verifying', 'ready', 'rejected', 'cancelled', 'deleted')",
+            name="client_image_state",
+        ),
+        Index("v2_client_images_owner_idx", "owner_user_id", "created_at"),
+        Index("v2_client_images_asset_idx", "asset_id"),
+        Index("v2_client_images_state_idx", "state", "created_at"),
+    )
+
+
+class UserImageAdminVisibility(Base):
+    __tablename__ = "v2_user_image_admin_visibility"
+
+    owner_user_id: Mapped[str] = mapped_column(
+        ForeignKey("auth_users.id", ondelete="CASCADE"), primary_key=True
+    )
+    enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    enabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class ClientImageAuditEvent(Base):
+    __tablename__ = "v2_client_image_audit_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_user_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    image_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    batch_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    actor_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    device_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    operation: Mapped[str] = mapped_column(String(100), nullable=False)
+    details_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    __table_args__ = (
+        Index("v2_client_image_audit_owner_idx", "owner_user_id", "created_at"),
+        Index("v2_client_image_audit_image_idx", "image_id", "created_at"),
     )
 
 

@@ -3,7 +3,11 @@ from unittest import mock
 
 import pytest
 
-from rhythm_metadata_api.infrastructure.storage.cos_presign import presign_cos_get, presign_cos_put
+from rhythm_metadata_api.infrastructure.storage.cos_presign import (
+    presign_cos_get,
+    presign_cos_post,
+    presign_cos_put,
+)
 
 
 def test_presign_cos_get_is_deterministic_golden() -> None:
@@ -70,3 +74,62 @@ def test_presign_cos_put_signs_the_exact_object_and_method() -> None:
     )
     assert "q-header-list=host" in put_url
     assert put_url != get_url
+
+
+def test_presign_cos_put_binds_required_content_headers() -> None:
+    first, _ = presign_cos_put(
+        "images-1250000000",
+        "ap-guangzhou",
+        "labs/images/tmp/upload/original",
+        "secret-id",
+        "secret-key",
+        headers={"Content-Type": "image/png", "Content-MD5": "AAAAAAAAAAAAAAAAAAAAAA=="},
+    )
+    changed, _ = presign_cos_put(
+        "images-1250000000",
+        "ap-guangzhou",
+        "labs/images/tmp/upload/original",
+        "secret-id",
+        "secret-key",
+        headers={"Content-Type": "image/png", "Content-MD5": "AQAAAAAAAAAAAAAAAAAAAA=="},
+    )
+
+    assert "q-header-list=content-md5;content-type;host" in first
+    assert first != changed
+
+
+def test_presign_cos_get_double_encodes_signed_ci_recipe_in_parameter_list() -> None:
+    with mock.patch(
+        "rhythm_metadata_api.infrastructure.storage.cos_presign.time.time",
+        return_value=1_700_000_000,
+    ):
+        url, _ = presign_cos_get(
+            "images-1250000000",
+            "ap-guangzhou",
+            "labs/images/assets/a1/digest",
+            "secret-id",
+            "secret-key",
+            query_parameters=(("imageMogr2/thumbnail/512x512>", None),),
+            host="preview.example.test",
+        )
+
+    assert url.startswith("https://preview.example.test/")
+    assert "q-url-param-list=imagemogr2%252fthumbnail%252f512x512%253e" in url
+    assert "imageMogr2%2Fthumbnail%2F512x512%3E=" in url
+
+
+def test_presign_cos_post_supports_ci_control_plane_host() -> None:
+    url, _ = presign_cos_post(
+        "images-1250000000",
+        "ap-guangzhou",
+        "file_bucket",
+        "secret-id",
+        "secret-key",
+        headers={"Content-Type": "application/xml"},
+        host="images-1250000000.ci.ap-guangzhou.myqcloud.com",
+    )
+
+    assert url.startswith(
+        "https://images-1250000000.ci.ap-guangzhou.myqcloud.com/file_bucket?"
+    )
+    assert "q-header-list=content-type;host" in url

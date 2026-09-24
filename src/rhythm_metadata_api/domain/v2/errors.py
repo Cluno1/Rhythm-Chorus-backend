@@ -21,6 +21,12 @@ class V2Conflict(V2DomainError):
     title = "Domain conflict"
 
 
+class V2Unavailable(V2DomainError):
+    status_code = 503
+    problem_type = "capability-unavailable"
+    title = "Capability unavailable"
+
+
 class StaleRevision(V2DomainError):
     status_code = 412
     problem_type = "stale-revision"
