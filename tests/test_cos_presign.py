@@ -118,7 +118,7 @@ def test_presign_cos_get_double_encodes_signed_ci_recipe_in_parameter_list() -> 
 
     assert url.startswith("https://preview.example.test/")
     assert "q-url-param-list=imagemogr2%252fthumbnail%252f512x512%253e" in url
-    assert "imageMogr2%2Fthumbnail%2F512x512%3E&" in url
+    assert "&imageMogr2%2Fthumbnail%2F512x512%3E" in url
 
 
 def test_presign_cos_get_emits_valueless_image_info_parameter() -> None:
@@ -131,7 +131,7 @@ def test_presign_cos_get_emits_valueless_image_info_parameter() -> None:
         query_parameters=(("imageInfo", None),),
     )
 
-    assert "?imageInfo&q-sign-algorithm=" in url
+    assert "&imageInfo" in url
     assert "imageInfo=" not in url
 
 

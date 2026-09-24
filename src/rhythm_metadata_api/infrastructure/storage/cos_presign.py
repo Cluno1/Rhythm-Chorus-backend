@@ -215,6 +215,9 @@ def presign_cos_request(
         else f"{quote(original_name, safe='-_.~')}={quote(str(value), safe='-_.~')}"
         for original_name, value in request_parameters
     )
-    query = "&".join(part for part in (request_query, authorization_query) if part)
+    # Match Tencent's official SDK: authorization fields come first and signed
+    # operation parameters follow them. Some CI image operations are routed by
+    # this layout even though ordinary query parameters are order-independent.
+    query = "&".join(part for part in (authorization_query, request_query) if part)
     url = f"https://{request_host}{encoded_path}?{query}"
     return url, datetime.fromtimestamp(end, tz=UTC)
