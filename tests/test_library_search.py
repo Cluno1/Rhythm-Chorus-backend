@@ -94,6 +94,36 @@ def test_lyrics_number_and_fallback_search(env) -> None:
     ]
 
 
+def test_lyrics_search_matches_associated_song_title(env) -> None:
+    client, _db = env
+    work_id = create_work(
+        client,
+        "song-title-work",
+        {
+            "canonical_title": "詩篇六十三",
+            "language": "zh-Hant",
+            "lyrics": "我的心切慕你，詩篇六十三的歌詞",
+        },
+    )
+    arrangement = client.post(
+        f"/v2/works/{work_id}/arrangements",
+        headers={**AUTH, "Idempotency-Key": "song-title-arrangement"},
+        json={"name": "SATB"},
+    )
+    assert arrangement.status_code == 201, arrangement.text
+    rendition = client.post(
+        f"/v2/arrangements/{arrangement.json()['id']}/renditions",
+        headers={**AUTH, "Idempotency-Key": "song-title-rendition"},
+        json={"label": "诗篇63", "kind": "performance"},
+    )
+    assert rendition.status_code == 201, rendition.text
+
+    result = search(client, "诗篇63", "lyrics")
+    assert [item["work_id"] for item in result["items"]] == [work_id]
+    assert result["items"][0]["match_field"] == "title"
+    assert result["items"][0]["has_lyrics"] is True
+
+
 def test_normalize_handles_compatibility_and_case() -> None:
     assert library_search.normalize("⾄ 水, Lord!") == "至水lord"
     assert library_search.parse_number_query(" 1 05 ") == 105

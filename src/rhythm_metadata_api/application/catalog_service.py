@@ -3337,13 +3337,16 @@ class CatalogService:
         )
 
     def search_library(self, query: str, search_type: str, limit: int) -> LibrarySearchResponse:
-        """issue 107: lyrics/title or songbook-number search over active Works."""
+        """Search active Works by lyrics, Work/song title, or songbook number."""
         query = query.strip()
         with self.uow_factory() as uow:
             works = list(
                 uow.session.scalars(
                     select(Work).where(Work.deleted_at.is_(None), Work.status == "active")
                 )
+            )
+            song_titles = (
+                self._work_song_titles(uow.session) if search_type == "lyrics" else {}
             )
             fallback: str | None = None
             matches: list[tuple[int, Work, dict[str, Any]]] = []
@@ -3356,10 +3359,10 @@ class CatalogService:
                                 matches.append((0, work, {"match_field": "number", "matched_number": item}))
                                 break
             else:
-                matches = self._lyrics_matches(works, query)
+                matches = self._lyrics_matches(works, query, song_titles)
                 if not matches:
                     for label, converted in library_search.opencc_variants(query):
-                        matches = self._lyrics_matches(works, converted)
+                        matches = self._lyrics_matches(works, converted, song_titles)
                         if matches:
                             fallback = label
                             break
@@ -3400,13 +3403,27 @@ class CatalogService:
             )
 
     @staticmethod
-    def _lyrics_matches(works: list[Work], query: str) -> list[tuple[int, Work, dict[str, Any]]]:
+    def _lyrics_matches(
+        works: list[Work],
+        query: str,
+        song_titles: dict[str, list[str]] | None = None,
+    ) -> list[tuple[int, Work, dict[str, Any]]]:
         needle = library_search.normalize(query)
         if not needle:
             return []
+        song_titles = song_titles or {}
         matches = []
         for work in works:
             if library_search.find_match(work.canonical_title, needle) is not None:
+                matches.append((0, work, {"match_field": "title"}))
+                continue
+            if any(
+                library_search.find_match(title, needle) is not None
+                for title in song_titles.get(work.id, [])
+            ):
+                # Rendition.label is the catalog's user-facing song name. Keep the
+                # existing title match shape so older clients can open the Work
+                # lyrics without having to understand a new match_field value.
                 matches.append((0, work, {"match_field": "title"}))
                 continue
             for language, text in library_search.lyric_versions(
@@ -3427,6 +3444,32 @@ class CatalogService:
                     )
                     break
         return matches
+
+    @staticmethod
+    def _work_song_titles(session: Session) -> dict[str, list[str]]:
+        """Return active Rendition labels grouped by their Work.
+
+        A Rendition is the catalog's Song projection. Its label can preserve a
+        user-facing title such as ``诗篇63`` while the canonical Work title uses
+        a different representation such as ``詩篇六十三``.
+        """
+        rows = session.execute(
+            select(Arrangement.work_id, Rendition.label, Rendition.id)
+            .join(Rendition, Rendition.arrangement_id == Arrangement.id)
+            .join(Work, Work.id == Arrangement.work_id)
+            .where(
+                Rendition.deleted_at.is_(None),
+                Arrangement.deleted_at.is_(None),
+                Work.deleted_at.is_(None),
+                Work.status == "active",
+            )
+            .order_by(Arrangement.work_id, Rendition.label, Rendition.id)
+        ).all()
+        result: dict[str, list[str]] = {}
+        for work_id, label, _rendition_id in rows:
+            if label:
+                result.setdefault(work_id, []).append(label)
+        return result
 
     def _default_score_ids(self, session: Session, work_ids: list[str]) -> dict[str, str]:
         if not work_ids:
