@@ -15,6 +15,7 @@ from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
+from rhythm_metadata_api.application import library_search
 from rhythm_metadata_api.application.unit_of_work import UnitOfWorkFactory
 from rhythm_metadata_api.core.config import Settings
 from rhythm_metadata_api.domain.v2.errors import (
@@ -46,6 +47,10 @@ from rhythm_metadata_api.domain.v2.schemas import (
     LibraryAlbumResponse,
     LibraryScoreOptionResponse,
     LibraryScoreWorkResponse,
+    LibrarySearchItem,
+    LibrarySearchResponse,
+    LibrarySearchSong,
+    NumberMetaItem,
     LibrarySongResponse,
     LyricLanguageFormat,
     LyricSourceDocumentCreate,
@@ -3101,6 +3106,9 @@ class CatalogService:
             lyrics_language=work.lyrics_language,
             lyrics_translations=work.lyrics_translations,
             lyrics_source_images=self._lyric_source_images_for_owner(session, "work", work.id),
+            number_meta=[
+                NumberMetaItem(**item) for item in library_search.number_items(work.number_meta)
+            ],
             revision=work.revision,
             aliases=[
                 WorkAliasInput(namespace=item.namespace, external_id=item.external_id)
@@ -3327,6 +3335,132 @@ class CatalogService:
             etag=f'"sha256:{asset.sha256}"',
             supports_range=True,
         )
+
+    def search_library(self, query: str, search_type: str, limit: int) -> LibrarySearchResponse:
+        """issue 107: lyrics/title or songbook-number search over active Works."""
+        query = query.strip()
+        with self.uow_factory() as uow:
+            works = list(
+                uow.session.scalars(
+                    select(Work).where(Work.deleted_at.is_(None), Work.status == "active")
+                )
+            )
+            fallback: str | None = None
+            matches: list[tuple[int, Work, dict[str, Any]]] = []
+            if search_type == "number":
+                number = library_search.parse_number_query(query)
+                if number is not None:
+                    for work in works:
+                        for item in library_search.number_items(work.number_meta):
+                            if str(item["value"]).isdigit() and int(item["value"]) == number:
+                                matches.append((0, work, {"match_field": "number", "matched_number": item}))
+                                break
+            else:
+                matches = self._lyrics_matches(works, query)
+                if not matches:
+                    for label, converted in library_search.opencc_variants(query):
+                        matches = self._lyrics_matches(works, converted)
+                        if matches:
+                            fallback = label
+                            break
+            matches.sort(key=lambda row: (row[0], row[1].canonical_title, row[1].id))
+            matches = matches[:limit]
+            work_ids = [work.id for _, work, _ in matches]
+            default_scores = self._default_score_ids(uow.session, work_ids)
+            songs = self._search_songs(uow.session, work_ids)
+            items = []
+            for _, work, found in matches:
+                versions = library_search.lyric_versions(
+                    work.lyrics, work.lyrics_language, work.lyrics_translations
+                )
+                snippet = found.get("snippet")
+                if snippet is None:
+                    snippet = library_search.head_snippet(work.lyrics)
+                items.append(
+                    LibrarySearchItem(
+                        work_id=work.id,
+                        title=work.canonical_title,
+                        match_field=found["match_field"],
+                        match_language=found.get("match_language"),
+                        snippet=snippet,
+                        matched_number=NumberMetaItem(**found["matched_number"])
+                        if found.get("matched_number")
+                        else None,
+                        numbers=[
+                            NumberMetaItem(**item)
+                            for item in library_search.number_items(work.number_meta)
+                        ],
+                        has_lyrics=bool(versions),
+                        default_score_id=default_scores.get(work.id),
+                        songs=songs.get(work.id, []),
+                    )
+                )
+            return LibrarySearchResponse(
+                query=query, type=search_type, fallback=fallback, items=items
+            )
+
+    @staticmethod
+    def _lyrics_matches(works: list[Work], query: str) -> list[tuple[int, Work, dict[str, Any]]]:
+        needle = library_search.normalize(query)
+        if not needle:
+            return []
+        matches = []
+        for work in works:
+            if library_search.find_match(work.canonical_title, needle) is not None:
+                matches.append((0, work, {"match_field": "title"}))
+                continue
+            for language, text in library_search.lyric_versions(
+                work.lyrics, work.lyrics_language, work.lyrics_translations
+            ):
+                start = library_search.find_match(text, needle)
+                if start is not None:
+                    matches.append(
+                        (
+                            1,
+                            work,
+                            {
+                                "match_field": "lyrics",
+                                "match_language": language,
+                                "snippet": library_search.snippet_around(text, start),
+                            },
+                        )
+                    )
+                    break
+        return matches
+
+    def _default_score_ids(self, session: Session, work_ids: list[str]) -> dict[str, str]:
+        if not work_ids:
+            return {}
+        wanted = set(work_ids)
+        result: dict[str, str] = {}
+        cursor: str | None = None
+        while True:
+            items, cursor = self.list_library_score_works(cursor, 200)
+            for item in items:
+                if item.work_id in wanted:
+                    result[item.work_id] = item.default_score_id
+            if not cursor:
+                return result
+
+    def _search_songs(self, session: Session, work_ids: list[str]) -> dict[str, list[LibrarySearchSong]]:
+        if not work_ids:
+            return {}
+        rows = session.execute(
+            self._library_song_statement()
+            .where(Work.id.in_(work_ids))
+            .order_by(Release.key, ReleaseItem.display_order, ReleaseItem.id)
+        ).all()
+        songs: dict[str, list[LibrarySearchSong]] = {}
+        for item, release, rendition, _arrangement, work in rows:
+            songs.setdefault(work.id, []).append(
+                LibrarySearchSong(
+                    rendition_id=rendition.id,
+                    album_id=release.id,
+                    title=rendition.label,
+                    track_no=item.track_no,
+                )
+            )
+        return songs
 
     def _library_song_statement(self):
         return (

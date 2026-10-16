@@ -274,7 +274,7 @@ def test_multilingual_lyrics_migration_backfills_existing_rows(tmp_path: Path) -
     }
     connection.close()
 
-    assert version == "issue91clientimages"
+    assert version == "issue107numbermeta"
     assert lyric_source_tables == {
         "v2_lyric_source_documents",
         "v2_lyric_source_pages",

@@ -254,6 +254,13 @@ class WorkCreditResponse(ApiModel):
     position: int
 
 
+class NumberMetaItem(ApiModel):
+    """issue 107：作品在各歌本中的编号，如 {"key": "ihope_num", "value": 256}。"""
+
+    key: str
+    value: int | str
+
+
 class WorkResponse(LocalizedLyricsResponse):
     id: str
     canonical_title: str
@@ -263,6 +270,7 @@ class WorkResponse(LocalizedLyricsResponse):
     revision: int
     aliases: list[WorkAliasInput]
     credits: list[WorkCreditResponse]
+    number_meta: list[NumberMetaItem] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 
@@ -718,6 +726,33 @@ class LibraryScoreWorkResponse(ApiModel):
 class ArrangementBundle(ArrangementResponse):
     scores: list[ScoreResponse]
     renditions: list[RenditionResponse]
+
+
+class LibrarySearchSong(ApiModel):
+    rendition_id: str
+    album_id: str
+    title: str
+    track_no: int | None = None
+
+
+class LibrarySearchItem(ApiModel):
+    work_id: str
+    title: str
+    match_field: str
+    match_language: str | None = None
+    snippet: str | None = None
+    matched_number: NumberMetaItem | None = None
+    numbers: list[NumberMetaItem] = Field(default_factory=list)
+    has_lyrics: bool = False
+    default_score_id: str | None = None
+    songs: list[LibrarySearchSong] = Field(default_factory=list)
+
+
+class LibrarySearchResponse(ApiModel):
+    query: str
+    type: str
+    fallback: str | None = None
+    items: list[LibrarySearchItem]
 
 
 class WorkBundleResponse(ApiModel):

@@ -709,6 +709,17 @@ def list_library_score_works(
     }
 
 
+@router.get("/library/search")
+def search_library(
+    service: Catalog,
+    _: Actor,
+    q: Annotated[str, Query(min_length=1, max_length=100)],
+    type: Annotated[str, Query(pattern="^(lyrics|number)$")],
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+) -> dict[str, Any]:
+    return service.search_library(q, type, limit).model_dump(mode="json")
+
+
 @router.get("/library/albums/{album_id}")
 def get_library_album(album_id: str, service: Catalog, _: Actor) -> Response:
     return model_response(service.get_library_album(album_id))

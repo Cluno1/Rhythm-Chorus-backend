@@ -16,6 +16,7 @@ dependencies = [
   "cryptography>=45,<47",
   "pydantic-settings>=2.10,<3",
   "uvicorn>=0.35,<1",
+  "opencc-python-reimplemented>=0.1.7,<1",
 ]
 
 [project.optional-dependencies]

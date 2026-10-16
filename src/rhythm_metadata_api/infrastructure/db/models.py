@@ -60,6 +60,10 @@ class Work(RevisionedMixin, Base):
     lyrics_translations: Mapped[list[dict[str, str]]] = mapped_column(
         JSON, nullable=False, default=list, server_default=text("'[]'")
     )
+    # issue 105/107：各歌本编号，如 [{"ihope_num": 256}, {"heavenSong_num": 352}]
+    number_meta: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list, server_default=text("'[]'")
+    )
 
     __table_args__ = (
         CheckConstraint("status IN ('draft', 'active', 'archived')", name="work_status"),
