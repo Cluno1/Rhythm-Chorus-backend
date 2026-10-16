@@ -2483,34 +2483,10 @@ class CatalogService:
     def list_library_score_works(
         self, cursor: str | None, limit: int
     ) -> tuple[list[LibraryScoreWorkResponse], str | None]:
-        deliverable_providers = ["local"]
-        if self.settings.cos_secret_id and self.settings.cos_secret_key:
-            deliverable_providers.append("cos")
-        musicxml_types = {
-            "application/vnd.recordare.musicxml+xml",
-            "application/vnd.recordare.musicxml",
-            "application/xml",
-            "text/xml",
-        }
+        deliverable_providers, musicxml_types = self._library_score_delivery_config()
         with self.uow_factory() as uow:
-            eligible_asset = (
-                select(ScoreRevisionAsset.asset_id)
-                .join(Asset, Asset.id == ScoreRevisionAsset.asset_id)
-                .where(
-                    ScoreRevisionAsset.score_revision_id == Score.published_revision_id,
-                    ScoreRevisionAsset.role == "primary_musicxml",
-                    Asset.state == "ready",
-                    Asset.deleted_at.is_(None),
-                    Asset.detected_media_type.in_(musicxml_types),
-                    select(AssetLocation.id)
-                    .where(
-                        AssetLocation.asset_id == Asset.id,
-                        AssetLocation.state == "available",
-                        AssetLocation.provider.in_(deliverable_providers),
-                    )
-                    .exists(),
-                )
-                .exists()
+            eligible_asset = self._published_score_asset_exists(
+                deliverable_providers, musicxml_types
             )
             work_statement = (
                 select(Work)
@@ -2543,6 +2519,41 @@ class CatalogService:
                 for work in works
             ]
             return responses, works[-1].id if has_more and works else None
+
+    def _library_score_delivery_config(self) -> tuple[list[str], set[str]]:
+        deliverable_providers = ["local"]
+        if self.settings.cos_secret_id and self.settings.cos_secret_key:
+            deliverable_providers.append("cos")
+        return deliverable_providers, {
+            "application/vnd.recordare.musicxml+xml",
+            "application/vnd.recordare.musicxml",
+            "application/xml",
+            "text/xml",
+        }
+
+    @staticmethod
+    def _published_score_asset_exists(
+        deliverable_providers: list[str], musicxml_types: set[str]
+    ):
+        return (
+            select(ScoreRevisionAsset.asset_id)
+            .join(Asset, Asset.id == ScoreRevisionAsset.asset_id)
+            .where(
+                ScoreRevisionAsset.score_revision_id == Score.published_revision_id,
+                ScoreRevisionAsset.role == "primary_musicxml",
+                Asset.state == "ready",
+                Asset.deleted_at.is_(None),
+                Asset.detected_media_type.in_(musicxml_types),
+                select(AssetLocation.id)
+                .where(
+                    AssetLocation.asset_id == Asset.id,
+                    AssetLocation.state == "available",
+                    AssetLocation.provider.in_(deliverable_providers),
+                )
+                .exists(),
+            )
+            .exists()
+        )
 
     def _library_score_work_response(
         self,
@@ -3337,7 +3348,7 @@ class CatalogService:
         )
 
     def search_library(self, query: str, search_type: str, limit: int) -> LibrarySearchResponse:
-        """Search active Works by lyrics, Work/song title, or songbook number."""
+        """Search active Works by lyrics, score title, or songbook number."""
         query = query.strip()
         with self.uow_factory() as uow:
             works = list(
@@ -3358,14 +3369,20 @@ class CatalogService:
                             if str(item["value"]).isdigit() and int(item["value"]) == number:
                                 matches.append((0, work, {"match_field": "number", "matched_number": item}))
                                 break
+            elif search_type == "scores":
+                matches = self._score_matches(uow.session, works, query)
             else:
                 matches = self._lyrics_matches(works, query, song_titles)
-                if not matches:
-                    for label, converted in library_search.opencc_variants(query):
-                        matches = self._lyrics_matches(works, converted, song_titles)
-                        if matches:
-                            fallback = label
-                            break
+            if not matches and search_type in {"lyrics", "scores"}:
+                for label, converted in library_search.opencc_variants(query):
+                    matches = (
+                        self._score_matches(uow.session, works, converted)
+                        if search_type == "scores"
+                        else self._lyrics_matches(works, converted, song_titles)
+                    )
+                    if matches:
+                        fallback = label
+                        break
             matches.sort(key=lambda row: (row[0], row[1].canonical_title, row[1].id))
             matches = matches[:limit]
             work_ids = [work.id for _, work, _ in matches]
@@ -3401,6 +3418,91 @@ class CatalogService:
             return LibrarySearchResponse(
                 query=query, type=search_type, fallback=fallback, items=items
             )
+
+    def _score_matches(
+        self,
+        session: Session,
+        works: list[Work],
+        query: str,
+    ) -> list[tuple[int, Work, dict[str, Any]]]:
+        """Match score-library fields on Works with a deliverable published score."""
+        needle = library_search.normalize(query)
+        if not needle or not works:
+            return []
+
+        deliverable_providers, musicxml_types = self._library_score_delivery_config()
+        eligible_asset = self._published_score_asset_exists(
+            deliverable_providers, musicxml_types
+        )
+        work_ids = [work.id for work in works]
+        eligible_work_ids = set(
+            session.scalars(
+                select(Work.id).where(
+                    Work.id.in_(work_ids),
+                    select(Score.id)
+                    .join(Arrangement, Arrangement.id == Score.arrangement_id)
+                    .where(
+                        Arrangement.work_id == Work.id,
+                        Arrangement.deleted_at.is_(None),
+                        Score.deleted_at.is_(None),
+                        Score.published_revision_id.is_not(None),
+                        eligible_asset,
+                    )
+                    .exists(),
+                )
+            )
+        )
+        if not eligible_work_ids:
+            return []
+
+        rows = session.execute(
+            select(Work.id, Arrangement.name, Score.label, Rendition.label)
+            .join(Arrangement, Arrangement.work_id == Work.id)
+            .join(Score, Score.arrangement_id == Arrangement.id)
+            .outerjoin(
+                Rendition,
+                and_(
+                    Rendition.arrangement_id == Arrangement.id,
+                    Rendition.deleted_at.is_(None),
+                ),
+            )
+            .where(
+                Work.id.in_(eligible_work_ids),
+                Arrangement.deleted_at.is_(None),
+                Score.deleted_at.is_(None),
+                Score.published_revision_id.is_not(None),
+                eligible_asset,
+            )
+            .order_by(Work.id, Arrangement.id, Score.id, Rendition.id)
+        ).all()
+        title_fields: dict[str, list[str]] = {
+            work.id: [work.canonical_title] for work in works if work.id in eligible_work_ids
+        }
+        score_fields: dict[str, list[str]] = {work_id: [] for work_id in eligible_work_ids}
+        for work_id, arrangement_name, score_label, rendition_label in rows:
+            if rendition_label:
+                title_fields[work_id].append(rendition_label)
+            if score_label:
+                score_fields[work_id].append(score_label)
+            if arrangement_name:
+                score_fields[work_id].append(arrangement_name)
+
+        matches: list[tuple[int, Work, dict[str, Any]]] = []
+        for work in works:
+            if work.id not in eligible_work_ids:
+                continue
+            if any(
+                library_search.find_match(value, needle) is not None
+                for value in title_fields[work.id]
+            ):
+                matches.append((0, work, {"match_field": "title"}))
+                continue
+            if any(
+                library_search.find_match(value, needle) is not None
+                for value in score_fields[work.id]
+            ):
+                matches.append((1, work, {"match_field": "score"}))
+        return matches
 
     @staticmethod
     def _lyrics_matches(

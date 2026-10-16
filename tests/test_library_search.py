@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -38,6 +39,36 @@ def search(client: TestClient, q: str, kind: str) -> dict:
     response = client.get("/v2/library/search", headers=AUTH, params={"q": q, "type": kind})
     assert response.status_code == 200, response.text
     return response.json()
+
+
+def upload_musicxml(client: TestClient, key: str) -> str:
+    content = b"<score-partwise version='4.0'><part-list/></score-partwise>"
+    created = client.post(
+        "/v2/uploads",
+        headers={**AUTH, "Idempotency-Key": f"{key}-create"},
+        json={
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "byte_size": len(content),
+            "media_type": "application/vnd.recordare.musicxml+xml",
+            "original_filename": f"{key}.musicxml",
+            "source": "test",
+        },
+    )
+    assert created.status_code == 201, created.text
+    upload_id = created.json()["upload"]["id"]
+    written = client.put(
+        f"/v2/uploads/{upload_id}/content",
+        headers={**AUTH, "Content-Type": "application/octet-stream"},
+        content=content,
+    )
+    assert written.status_code == 200, written.text
+    completed = client.post(
+        f"/v2/uploads/{upload_id}/complete",
+        headers={**AUTH, "Idempotency-Key": f"{key}-complete"},
+        json={},
+    )
+    assert completed.status_code == 200, completed.text
+    return completed.json()["asset"]["id"]
 
 
 def test_lyrics_number_and_fallback_search(env) -> None:
@@ -122,6 +153,59 @@ def test_lyrics_search_matches_associated_song_title(env) -> None:
     assert [item["work_id"] for item in result["items"]] == [work_id]
     assert result["items"][0]["match_field"] == "title"
     assert result["items"][0]["has_lyrics"] is True
+
+
+def test_score_search_matches_song_and_score_fields_and_excludes_no_score_work(env) -> None:
+    client, _db = env
+    work_id = create_work(
+        client,
+        "score-search-work",
+        {"canonical_title": "詩篇六十三", "language": "zh-Hant"},
+    )
+    no_score_work_id = create_work(
+        client,
+        "score-search-no-score-work",
+        {"canonical_title": "诗篇无谱", "language": "zh-Hans"},
+    )
+    arrangement = client.post(
+        f"/v2/works/{work_id}/arrangements",
+        headers={**AUTH, "Idempotency-Key": "score-search-arrangement"},
+        json={"name": "SATB"},
+    )
+    assert arrangement.status_code == 201, arrangement.text
+    rendition = client.post(
+        f"/v2/arrangements/{arrangement.json()['id']}/renditions",
+        headers={**AUTH, "Idempotency-Key": "score-search-rendition"},
+        json={"label": "诗篇63", "kind": "performance"},
+    )
+    assert rendition.status_code == 201, rendition.text
+    asset_id = upload_musicxml(client, "score-search-musicxml")
+    score = client.post(
+        f"/v2/arrangements/{arrangement.json()['id']}/scores-with-revision",
+        headers={**AUTH, "Idempotency-Key": "score-search-score"},
+        json={
+            "label": "精校谱",
+            "origin": "external_import",
+            "assets": [{"asset_id": asset_id, "role": "primary_musicxml"}],
+            "publish": True,
+            "preferred": True,
+        },
+    )
+    assert score.status_code == 201, score.text
+    score_id = score.json()["score"]["id"]
+
+    by_song_title = search(client, "诗篇", "scores")
+    assert [item["work_id"] for item in by_song_title["items"]] == [work_id]
+    assert by_song_title["items"][0]["match_field"] == "title"
+    assert by_song_title["items"][0]["default_score_id"] == score_id
+    assert search(client, "精校谱", "scores")["items"][0]["match_field"] == "score"
+    assert search(client, "SATB", "scores")["items"][0]["match_field"] == "score"
+
+    converted = search(client, "诗篇六十三", "scores")
+    assert [item["work_id"] for item in converted["items"]] == [work_id]
+    assert converted["fallback"] == "opencc_s2t"
+    assert search(client, "无谱", "scores")["items"] == []
+    assert no_score_work_id not in {item["work_id"] for item in by_song_title["items"]}
 
 
 def test_normalize_handles_compatibility_and_case() -> None:

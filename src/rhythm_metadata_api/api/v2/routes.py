@@ -714,7 +714,7 @@ def search_library(
     service: Catalog,
     _: Actor,
     q: Annotated[str, Query(min_length=1, max_length=100)],
-    type: Annotated[str, Query(pattern="^(lyrics|number)$")],
+    type: Annotated[str, Query(pattern="^(lyrics|number|scores)$")],
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
 ) -> dict[str, Any]:
     return service.search_library(q, type, limit).model_dump(mode="json")
