@@ -3467,8 +3467,8 @@ class CatalogService:
         self, raw_tag: str, cursor: str | None, limit: int
     ) -> LibraryTagWorksResponse:
         key = tag_key(raw_tag)
-        if not 1 <= len(key) <= 40:
-            raise V2DomainError("tag must contain 1 to 40 characters")
+        if not key:
+            raise V2DomainError("tag must not be blank")
         after = decode_tag_cursor(cursor, key) if cursor else None
         with self.uow_factory() as uow:
             works = list(

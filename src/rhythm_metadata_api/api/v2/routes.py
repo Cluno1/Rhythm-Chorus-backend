@@ -724,7 +724,7 @@ def search_library(
 def list_tag_works(
     service: Catalog,
     _: Actor,
-    tag: Annotated[str, Query(min_length=1, max_length=100)],
+    tag: Annotated[str, Query(min_length=1, max_length=200)],
     cursor: str | None = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
 ) -> dict[str, Any]:

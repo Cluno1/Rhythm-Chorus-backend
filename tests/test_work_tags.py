@@ -114,3 +114,13 @@ def test_tag_patch_revisions_and_validation(client: TestClient) -> None:
 def test_tag_list_is_public_device_read_only() -> None:
     assert _public_read_allowed("GET", "/v2/library/tag-works")
     assert not _public_read_allowed("POST", "/v2/library/tag-works")
+
+
+def test_casefold_expansion_keeps_long_tag_keys_openable(client: TestClient) -> None:
+    label = "ß" * 40
+    work = create_work(client, "tag-casefold", "Long key", tags=[label])
+    response = client.get(
+        "/v2/library/tag-works", headers=AUTH, params={"tag": "ss" * 40}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["items"][0]["work_id"] == work["id"]
