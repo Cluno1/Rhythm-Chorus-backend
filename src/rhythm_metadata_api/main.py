@@ -44,6 +44,19 @@ def problem_response(
     )
 
 
+def serializable_validation_errors(error: RequestValidationError) -> list[dict[str, object]]:
+    """Pydantic puts exception objects in ctx for custom validators."""
+    result: list[dict[str, object]] = []
+    for item in error.errors():
+        if "ctx" in item:
+            item = {
+                **item,
+                "ctx": {key: str(value) for key, value in item["ctx"].items()},
+            }
+        result.append(item)
+    return result
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved_settings = settings or get_settings()
 
@@ -98,7 +111,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "request-validation",
             "Request validation failed",
             "One or more request values are invalid",
-            errors=error.errors(),
+            errors=serializable_validation_errors(error),
         )
 
     app.include_router(health.router)

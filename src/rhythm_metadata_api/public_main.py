@@ -35,7 +35,7 @@ from rhythm_metadata_api.infrastructure.storage.base import (
     UploadTooLargeError,
     UploadValidationError,
 )
-from rhythm_metadata_api.main import problem_response
+from rhythm_metadata_api.main import problem_response, serializable_validation_errors
 
 _EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 _PUBLIC_READ_ROUTES = (
@@ -317,7 +317,7 @@ def create_public_app(settings: Settings | None = None) -> FastAPI:
             "request-validation",
             "Request validation failed",
             "One or more request values are invalid",
-            errors=error.errors(),
+            errors=serializable_validation_errors(error),
         )
 
     @app.exception_handler(UploadValidationError)
