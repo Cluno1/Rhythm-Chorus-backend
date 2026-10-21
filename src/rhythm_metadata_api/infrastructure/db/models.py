@@ -64,6 +64,9 @@ class Work(RevisionedMixin, Base):
     number_meta: Mapped[list[dict[str, Any]]] = mapped_column(
         JSON, nullable=False, default=list, server_default=text("'[]'")
     )
+    tags: Mapped[list[str]] = mapped_column(
+        JSON, nullable=False, default=list, server_default=text("'[]'")
+    )
 
     __table_args__ = (
         CheckConstraint("status IN ('draft', 'active', 'archived')", name="work_status"),

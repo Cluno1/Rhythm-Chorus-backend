@@ -6,6 +6,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from rhythm_metadata_api.domain.v2.lyrics import normalize_language_tag
+from rhythm_metadata_api.domain.v2.tags import normalize_work_tags
 
 
 class ApiModel(BaseModel):
@@ -225,11 +226,17 @@ class WorkCreate(LocalizedLyricsCreate):
     cover_asset_id: str | None = None
     aliases: list[WorkAliasInput] = Field(default_factory=list)
     credits: list[CreditInput] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list, max_length=50)
 
     @field_validator("language")
     @classmethod
     def validate_language(cls, value: str | None) -> str | None:
         return normalize_language_tag(value) if value is not None else None
+
+    @field_validator("tags")
+    @classmethod
+    def validate_tags(cls, value: list[str]) -> list[str]:
+        return normalize_work_tags(value)
 
 
 class WorkPatch(LocalizedLyricsPatch):
@@ -239,11 +246,19 @@ class WorkPatch(LocalizedLyricsPatch):
     cover_asset_id: str | None = None
     aliases: list[WorkAliasInput] | None = None
     credits: list[CreditInput] | None = None
+    tags: list[str] | None = Field(default=None, max_length=50)
 
     @field_validator("language")
     @classmethod
     def validate_language(cls, value: str | None) -> str | None:
         return normalize_language_tag(value) if value is not None else None
+
+    @field_validator("tags")
+    @classmethod
+    def validate_tags(cls, value: list[str] | None) -> list[str]:
+        if value is None:
+            raise ValueError("tags must be an array")
+        return normalize_work_tags(value)
 
 
 class WorkCreditResponse(ApiModel):
@@ -271,6 +286,7 @@ class WorkResponse(LocalizedLyricsResponse):
     aliases: list[WorkAliasInput]
     credits: list[WorkCreditResponse]
     number_meta: list[NumberMetaItem] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 
@@ -748,11 +764,24 @@ class LibrarySearchItem(ApiModel):
     songs: list[LibrarySearchSong] = Field(default_factory=list)
 
 
+class LibraryTagItem(ApiModel):
+    tag_key: str
+    label: str
+    work_count: int
+
+
 class LibrarySearchResponse(ApiModel):
     query: str
     type: str
     fallback: str | None = None
     items: list[LibrarySearchItem]
+    tag_items: list[LibraryTagItem] = Field(default_factory=list)
+
+
+class LibraryTagWorksResponse(ApiModel):
+    tag: LibraryTagItem
+    items: list[LibrarySearchItem]
+    next_cursor: str | None
 
 
 class WorkBundleResponse(ApiModel):

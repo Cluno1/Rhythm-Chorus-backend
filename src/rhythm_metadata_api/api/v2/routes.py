@@ -714,10 +714,21 @@ def search_library(
     service: Catalog,
     _: Actor,
     q: Annotated[str, Query(min_length=1, max_length=100)],
-    type: Annotated[str, Query(pattern="^(lyrics|number|scores)$")],
+    type: Annotated[str, Query(pattern="^(lyrics|number|scores|tags)$")],
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
 ) -> dict[str, Any]:
     return service.search_library(q, type, limit).model_dump(mode="json")
+
+
+@router.get("/library/tag-works")
+def list_tag_works(
+    service: Catalog,
+    _: Actor,
+    tag: Annotated[str, Query(min_length=1, max_length=100)],
+    cursor: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+) -> dict[str, Any]:
+    return service.list_tag_works(tag, cursor, limit).model_dump(mode="json")
 
 
 @router.get("/library/albums/{album_id}")

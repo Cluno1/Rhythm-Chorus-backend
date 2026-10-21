@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import json
 import re
@@ -50,6 +51,8 @@ from rhythm_metadata_api.domain.v2.schemas import (
     LibrarySearchItem,
     LibrarySearchResponse,
     LibrarySearchSong,
+    LibraryTagItem,
+    LibraryTagWorksResponse,
     NumberMetaItem,
     LibrarySongResponse,
     LyricLanguageFormat,
@@ -101,6 +104,7 @@ from rhythm_metadata_api.domain.v2.schemas import (
     WorkResolveResponse,
     WorkResponse,
 )
+from rhythm_metadata_api.domain.v2.tags import tag_key
 from rhythm_metadata_api.infrastructure.db.models import (
     Arrangement,
     Asset,
@@ -374,6 +378,7 @@ class CatalogService:
                 lyrics=lyrics,
                 lyrics_language=lyrics_language,
                 lyrics_translations=lyrics_translations,
+                tags=request.tags,
             )
             session.add(work)
             session.flush()
@@ -3120,6 +3125,7 @@ class CatalogService:
             number_meta=[
                 NumberMetaItem(**item) for item in library_search.number_items(work.number_meta)
             ],
+            tags=work.tags,
             revision=work.revision,
             aliases=[
                 WorkAliasInput(namespace=item.namespace, external_id=item.external_id)
@@ -3348,7 +3354,7 @@ class CatalogService:
         )
 
     def search_library(self, query: str, search_type: str, limit: int) -> LibrarySearchResponse:
-        """Search active Works by lyrics, score title, or songbook number."""
+        """Search active Works or discover their tags."""
         query = query.strip()
         with self.uow_factory() as uow:
             works = list(
@@ -3356,6 +3362,23 @@ class CatalogService:
                     select(Work).where(Work.deleted_at.is_(None), Work.status == "active")
                 )
             )
+            if search_type == "tags":
+                catalog = self._tag_catalog(works)
+                tag_items = self._matching_tag_items(catalog, query, limit)
+                fallback = None
+                if not tag_items:
+                    for label, converted in library_search.opencc_variants(query):
+                        tag_items = self._matching_tag_items(catalog, converted, limit)
+                        if tag_items:
+                            fallback = label
+                            break
+                return LibrarySearchResponse(
+                    query=query,
+                    type=search_type,
+                    fallback=fallback,
+                    items=[],
+                    tag_items=tag_items,
+                )
             song_titles = (
                 self._work_song_titles(uow.session) if search_type == "lyrics" else {}
             )
@@ -3385,39 +3408,134 @@ class CatalogService:
                         break
             matches.sort(key=lambda row: (row[0], row[1].canonical_title, row[1].id))
             matches = matches[:limit]
-            work_ids = [work.id for _, work, _ in matches]
-            default_scores = self._default_score_ids(uow.session, work_ids)
-            songs = self._search_songs(uow.session, work_ids)
-            items = []
-            for _, work, found in matches:
-                versions = library_search.lyric_versions(
-                    work.lyrics, work.lyrics_language, work.lyrics_translations
-                )
-                snippet = found.get("snippet")
-                if snippet is None:
-                    snippet = library_search.head_snippet(work.lyrics)
-                items.append(
-                    LibrarySearchItem(
-                        work_id=work.id,
-                        title=work.canonical_title,
-                        match_field=found["match_field"],
-                        match_language=found.get("match_language"),
-                        snippet=snippet,
-                        matched_number=NumberMetaItem(**found["matched_number"])
-                        if found.get("matched_number")
-                        else None,
-                        numbers=[
-                            NumberMetaItem(**item)
-                            for item in library_search.number_items(work.number_meta)
-                        ],
-                        has_lyrics=bool(versions),
-                        default_score_id=default_scores.get(work.id),
-                        songs=songs.get(work.id, []),
-                    )
-                )
             return LibrarySearchResponse(
-                query=query, type=search_type, fallback=fallback, items=items
+                query=query,
+                type=search_type,
+                fallback=fallback,
+                items=self._search_work_items(
+                    uow.session, [(work, found) for _, work, found in matches]
+                ),
             )
+
+    @staticmethod
+    def _tag_catalog(works: list[Work]) -> dict[str, LibraryTagItem]:
+        entries: dict[str, tuple[str, int, str]] = {}
+        for work in works:
+            seen: set[str] = set()
+            for label in work.tags or []:
+                key = tag_key(label)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                previous = entries.get(key)
+                if previous is None:
+                    entries[key] = (label, 1, work.id)
+                else:
+                    entries[key] = (
+                        label if work.id < previous[2] else previous[0],
+                        previous[1] + 1,
+                        min(work.id, previous[2]),
+                    )
+        return {
+            key: LibraryTagItem(tag_key=key, label=label, work_count=count)
+            for key, (label, count, _work_id) in entries.items()
+        }
+
+    @staticmethod
+    def _matching_tag_items(
+        catalog: dict[str, LibraryTagItem], query: str, limit: int
+    ) -> list[LibraryTagItem]:
+        needle = library_search.normalize(query)
+        if not needle:
+            return []
+        matches = [
+            item for item in catalog.values()
+            if needle in library_search.normalize(item.label)
+        ]
+        matches.sort(
+            key=lambda item: (
+                0 if library_search.normalize(item.label) == needle
+                else 1 if library_search.normalize(item.label).startswith(needle) else 2,
+                -item.work_count,
+                item.label,
+                item.tag_key,
+            )
+        )
+        return matches[:limit]
+
+    def list_tag_works(
+        self, raw_tag: str, cursor: str | None, limit: int
+    ) -> LibraryTagWorksResponse:
+        key = tag_key(raw_tag)
+        if not 1 <= len(key) <= 40:
+            raise V2DomainError("tag must contain 1 to 40 characters")
+        after = decode_tag_cursor(cursor, key) if cursor else None
+        with self.uow_factory() as uow:
+            works = list(
+                uow.session.scalars(
+                    select(Work).where(Work.deleted_at.is_(None), Work.status == "active")
+                )
+            )
+            catalog = self._tag_catalog(works)
+            matches = sorted(
+                (work for work in works if key in {tag_key(label) for label in work.tags or []}),
+                key=lambda work: (work.canonical_title, work.id),
+            )
+            if after is not None:
+                matches = [
+                    work for work in matches if (work.canonical_title, work.id) > after
+                ]
+            page = matches[:limit + 1]
+            has_more = len(page) > limit
+            page = page[:limit]
+            next_cursor = (
+                encode_tag_cursor(key, page[-1].canonical_title, page[-1].id)
+                if has_more and page else None
+            )
+            return LibraryTagWorksResponse(
+                tag=catalog.get(
+                    key, LibraryTagItem(tag_key=key, label=key, work_count=0)
+                ),
+                items=self._search_work_items(
+                    uow.session, [(work, {"match_field": "tag"}) for work in page]
+                ),
+                next_cursor=next_cursor,
+            )
+
+    def _search_work_items(
+        self, session: Session, matches: list[tuple[Work, dict[str, Any]]]
+    ) -> list[LibrarySearchItem]:
+        work_ids = [work.id for work, _ in matches]
+        default_scores = self._default_score_ids(session, work_ids)
+        songs = self._search_songs(session, work_ids)
+        items = []
+        for work, found in matches:
+            versions = library_search.lyric_versions(
+                work.lyrics, work.lyrics_language, work.lyrics_translations
+            )
+            snippet = found.get("snippet")
+            if snippet is None and found["match_field"] != "tag":
+                snippet = library_search.head_snippet(work.lyrics)
+            items.append(
+                LibrarySearchItem(
+                    work_id=work.id,
+                    title=work.canonical_title,
+                    match_field=found["match_field"],
+                    match_language=found.get("match_language"),
+                    snippet=snippet,
+                    matched_number=NumberMetaItem(**found["matched_number"])
+                    if found.get("matched_number")
+                    else None,
+                    numbers=[
+                        NumberMetaItem(**item)
+                        for item in library_search.number_items(work.number_meta)
+                    ],
+                    has_lyrics=bool(versions),
+                    default_score_id=default_scores.get(work.id),
+                    songs=songs.get(work.id, []),
+                )
+            )
+        return items
 
     def _score_matches(
         self,
@@ -4008,6 +4126,25 @@ def etag(revision: int) -> str:
 def encode_song_cursor(release_key: str, display_order: int, item_id: str) -> str:
     payload = json.dumps([release_key, display_order, item_id], separators=(",", ":")).encode()
     return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def encode_tag_cursor(tag: str, title: str, work_id: str) -> str:
+    payload = json.dumps([tag, title, work_id], ensure_ascii=False, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def decode_tag_cursor(cursor: str, tag: str) -> tuple[str, str]:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        value = json.loads(base64.urlsafe_b64decode(padded).decode())
+        if (
+            not isinstance(value, list) or len(value) != 3 or value[0] != tag
+            or not isinstance(value[1], str) or not isinstance(value[2], str)
+        ):
+            raise ValueError
+        return value[1], value[2]
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError, binascii.Error) as error:
+        raise V2DomainError("invalid tag cursor") from error
 
 
 def decode_song_cursor(cursor: str) -> tuple[str, int, str]:
