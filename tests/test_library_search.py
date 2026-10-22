@@ -155,6 +155,46 @@ def test_lyrics_search_matches_associated_song_title(env) -> None:
     assert result["items"][0]["has_lyrics"] is True
 
 
+def test_lyrics_search_matches_title_translations_and_shows_matched_alias(env) -> None:
+    client, _db = env
+    work_id = create_work(
+        client,
+        "title-translations-work",
+        {
+            "canonical_title": "祂的慈爱永远长存",
+            "language": "zh-Hans",
+            "title_translations": [
+                {"language": "en", "title": "His Love Endures Forever"},
+                {"language": "zh-Hant", "title": "祂的慈愛永遠長存"},
+            ],
+        },
+    )
+    other_work = create_work(
+        client,
+        "title-translations-other",
+        {"canonical_title": "完全不相关的标题", "language": "zh-Hans"},
+    )
+
+    by_canonical = search(client, "祂的慈爱永远长存", "lyrics")
+    assert [item["work_id"] for item in by_canonical["items"]] == [work_id]
+    assert by_canonical["items"][0]["title"] == "祂的慈爱永远长存"
+    assert by_canonical["items"][0]["match_field"] == "title"
+    assert by_canonical["items"][0]["match_language"] is None
+
+    by_english_alias = search(client, "His Love Endures", "lyrics")
+    assert [item["work_id"] for item in by_english_alias["items"]] == [work_id]
+    assert by_english_alias["items"][0]["title"] == "His Love Endures Forever"
+    assert by_english_alias["items"][0]["match_field"] == "title"
+    assert by_english_alias["items"][0]["match_language"] == "en"
+
+    by_traditional_alias = search(client, "祂的慈愛永遠長存", "lyrics")
+    assert [item["work_id"] for item in by_traditional_alias["items"]] == [work_id]
+    assert by_traditional_alias["items"][0]["title"] == "祂的慈愛永遠長存"
+    assert by_traditional_alias["items"][0]["match_language"] == "zh-Hant"
+
+    assert other_work not in [item["work_id"] for item in by_english_alias["items"]]
+
+
 def test_score_search_matches_song_and_score_fields_and_excludes_no_score_work(env) -> None:
     client, _db = env
     work_id = create_work(

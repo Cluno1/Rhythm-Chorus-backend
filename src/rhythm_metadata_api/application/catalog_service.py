@@ -3559,7 +3559,7 @@ class CatalogService:
             items.append(
                 LibrarySearchItem(
                     work_id=work.id,
-                    title=work.canonical_title,
+                    title=found.get("matched_title", work.canonical_title),
                     match_field=found["match_field"],
                     match_language=found.get("match_language"),
                     snippet=snippet,
@@ -3685,6 +3685,29 @@ class CatalogService:
                 # existing title match shape so older clients can open the Work
                 # lyrics without having to understand a new match_field value.
                 matches.append((0, work, {"match_field": "title"}))
+                continue
+            title_hit = next(
+                (
+                    item for item in work.title_translations
+                    if library_search.find_match(item["title"], needle) is not None
+                ),
+                None,
+            )
+            if title_hit is not None:
+                # Same multi-version pattern as lyrics: title_translations holds
+                # alternate-language Work names (issue 112). Show the matched
+                # alias instead of canonical_title so the hit text makes sense.
+                matches.append(
+                    (
+                        0,
+                        work,
+                        {
+                            "match_field": "title",
+                            "match_language": title_hit["language"],
+                            "matched_title": title_hit["title"],
+                        },
+                    )
+                )
                 continue
             for language, text in library_search.lyric_versions(
                 work.lyrics, work.lyrics_language, work.lyrics_translations
