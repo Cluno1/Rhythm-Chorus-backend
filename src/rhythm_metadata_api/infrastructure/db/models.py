@@ -60,6 +60,11 @@ class Work(RevisionedMixin, Base):
     lyrics_translations: Mapped[list[dict[str, str]]] = mapped_column(
         JSON, nullable=False, default=list, server_default=text("'[]'")
     )
+    # canonical_title/language 保持默认语言的规范标题；其他语言的官方/别名标题
+    # 以结构化 JSON 数组保存，结构同 lyrics_translations：[{"language": ..., "title": ...}]
+    title_translations: Mapped[list[dict[str, str]]] = mapped_column(
+        JSON, nullable=False, default=list, server_default=text("'[]'")
+    )
     # issue 105/107：各歌本编号，如 [{"ihope_num": 256}, {"heavenSong_num": 352}]
     number_meta: Mapped[list[dict[str, Any]]] = mapped_column(
         JSON, nullable=False, default=list, server_default=text("'[]'")

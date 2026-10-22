@@ -1783,6 +1783,88 @@ def test_multilingual_lyrics_crud_and_validation(client: TestClient) -> None:
     assert invalid_translation_without_primary.status_code == 422
 
 
+def test_multilingual_titles_crud_and_validation(client: TestClient) -> None:
+    work = post(
+        client,
+        "/v2/works",
+        "multilingual-title-work",
+        {
+            "canonical_title": "祂的慈爱永远长存",
+            "language": "zh-hans",
+            "title_translations": [
+                {"language": "en", "title": "His Love Endures Forever"},
+                {"language": "zh_hant", "title": "祂的慈愛永遠長存"},
+            ],
+        },
+    )
+    assert work.status_code == 201, work.text
+    assert work.json()["canonical_title"] == "祂的慈爱永远长存"
+    assert work.json()["title_translations"] == [
+        {"language": "en", "title": "His Love Endures Forever"},
+        {"language": "zh-Hant", "title": "祂的慈愛永遠長存"},
+    ]
+    work_id = work.json()["id"]
+
+    patched = client.patch(
+        f"/v2/works/{work_id}",
+        headers={**AUTH, "If-Match": '"rev-1"'},
+        json={
+            "title_translations": [
+                {"language": "en", "title": "His Love Endures Forever"},
+                {"language": "yue-Hant", "title": "祂嘅慈愛永遠長存"},
+            ]
+        },
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["title_translations"] == [
+        {"language": "en", "title": "His Love Endures Forever"},
+        {"language": "yue-Hant", "title": "祂嘅慈愛永遠長存"},
+    ]
+
+    stored = client.get(f"/v2/works/{work_id}", headers=AUTH)
+    assert stored.json()["title_translations"] == [
+        {"language": "en", "title": "His Love Endures Forever"},
+        {"language": "yue-Hant", "title": "祂嘅慈愛永遠長存"},
+    ]
+
+    duplicate_default_language = post(
+        client,
+        "/v2/works",
+        "invalid-title-duplicate-default",
+        {
+            "canonical_title": "Duplicate default language",
+            "language": "en",
+            "title_translations": [{"language": "EN", "title": "Same language as default"}],
+        },
+    )
+    assert duplicate_default_language.status_code == 422
+
+    duplicate_translation_language = post(
+        client,
+        "/v2/works",
+        "invalid-title-duplicate-translation",
+        {
+            "canonical_title": "Duplicate translation language",
+            "title_translations": [
+                {"language": "en", "title": "First"},
+                {"language": "EN", "title": "Second"},
+            ],
+        },
+    )
+    assert duplicate_translation_language.status_code == 422
+
+    blank_title = post(
+        client,
+        "/v2/works",
+        "invalid-title-blank",
+        {
+            "canonical_title": "Blank translated title",
+            "title_translations": [{"language": "en", "title": "   "}],
+        },
+    )
+    assert blank_title.status_code == 422
+
+
 def test_rejects_invalid_musicxml_at_completion(client: TestClient) -> None:
     invalid = b"<not-a-score/>"
     digest = hashlib.sha256(invalid).hexdigest()

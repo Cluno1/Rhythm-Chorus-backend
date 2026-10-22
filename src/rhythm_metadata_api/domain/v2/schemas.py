@@ -31,6 +31,24 @@ class LyricsTranslation(ApiModel):
         return normalized
 
 
+class TitleTranslation(ApiModel):
+    language: str = Field(min_length=2, max_length=35)
+    title: str = Field(min_length=1, max_length=500)
+
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: str) -> str:
+        return normalize_language_tag(value)
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("title must not be blank")
+        return normalized
+
+
 class LocalizedLyricsCreate(ApiModel):
     lyrics: str | None = Field(default=None, max_length=2 * 1024 * 1024)
     lyrics_language: str | None = Field(default=None, min_length=2, max_length=35)
@@ -227,6 +245,7 @@ class WorkCreate(LocalizedLyricsCreate):
     aliases: list[WorkAliasInput] = Field(default_factory=list)
     credits: list[CreditInput] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list, max_length=50)
+    title_translations: list[TitleTranslation] = Field(default_factory=list, max_length=100)
 
     @field_validator("language")
     @classmethod
@@ -247,6 +266,7 @@ class WorkPatch(LocalizedLyricsPatch):
     aliases: list[WorkAliasInput] | None = None
     credits: list[CreditInput] | None = None
     tags: list[str] | None = Field(default=None, max_length=50)
+    title_translations: list[TitleTranslation] | None = Field(default=None, max_length=100)
 
     @field_validator("language")
     @classmethod
@@ -287,6 +307,7 @@ class WorkResponse(LocalizedLyricsResponse):
     credits: list[WorkCreditResponse]
     number_meta: list[NumberMetaItem] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
+    title_translations: list[TitleTranslation] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 

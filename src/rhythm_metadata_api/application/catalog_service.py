@@ -30,6 +30,7 @@ from rhythm_metadata_api.domain.v2.lyrics import (
     merge_lyrics_sources,
     normalize_language_tag,
     normalize_lyrics_bundle,
+    normalize_title_translations,
 )
 from rhythm_metadata_api.domain.v2.schemas import (
     ArrangementBundle,
@@ -90,6 +91,7 @@ from rhythm_metadata_api.domain.v2.schemas import (
     ScoreRevisionResponse,
     ScoreWithRevisionCreate,
     ScoreWithRevisionResponse,
+    TitleTranslation,
     UploadCreate,
     UploadCreateResponse,
     UploadStatusResponse,
@@ -233,6 +235,27 @@ def _translation_dicts(
     ]
 
 
+def _title_translation_dicts(
+    items: list[TitleTranslation] | list[dict[str, str]],
+) -> list[dict[str, str]]:
+    return [
+        item.model_dump() if isinstance(item, TitleTranslation) else dict(item) for item in items
+    ]
+
+
+def _normalize_titles_or_error(
+    title_translations: list[TitleTranslation] | list[dict[str, str]],
+    default_language: str | None,
+) -> list[dict[str, str]]:
+    try:
+        return normalize_title_translations(
+            _title_translation_dicts(title_translations),
+            default_language=default_language,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise V2DomainError(str(error)) from error
+
+
 def _normalize_lyrics_or_error(
     lyrics: str | None,
     lyrics_language: str | None,
@@ -269,6 +292,15 @@ def _merge_lyrics_patch(
         lyrics=lyrics,
         lyrics_language=language,
         lyrics_translations=translations,
+    )
+
+
+def _merge_title_patch(work: Work, changes: dict[str, Any]) -> None:
+    if "title_translations" not in changes:
+        return
+    changes["title_translations"] = _normalize_titles_or_error(
+        changes["title_translations"] or [],
+        changes.get("language", work.language),
     )
 
 
@@ -370,6 +402,9 @@ class CatalogService:
                 request.lyrics_translations,
                 fallback_language=request.language,
             )
+            title_translations = _normalize_titles_or_error(
+                request.title_translations, request.language
+            )
             work = Work(
                 canonical_title=request.canonical_title.strip(),
                 language=request.language,
@@ -378,6 +413,7 @@ class CatalogService:
                 lyrics=lyrics,
                 lyrics_language=lyrics_language,
                 lyrics_translations=lyrics_translations,
+                title_translations=title_translations,
                 tags=request.tags,
             )
             session.add(work)
@@ -453,6 +489,7 @@ class CatalogService:
                     changes,
                     fallback_language=changes.get("language", work.language),
                 )
+                _merge_title_patch(work, changes)
                 for key, value in changes.items():
                     setattr(work, key, value.strip() if isinstance(value, str) else value)
                 if aliases is not None:
@@ -3126,6 +3163,9 @@ class CatalogService:
                 NumberMetaItem(**item) for item in library_search.number_items(work.number_meta)
             ],
             tags=work.tags,
+            title_translations=[
+                TitleTranslation(**item) for item in work.title_translations
+            ],
             revision=work.revision,
             aliases=[
                 WorkAliasInput(namespace=item.namespace, external_id=item.external_id)

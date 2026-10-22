@@ -95,3 +95,32 @@ def merge_lyrics_sources(
         if key != default_key
     ]
     return default_entry[1], default_language, translations
+
+
+def normalize_title_translations(
+    translations: Iterable[dict[str, str]],
+    *,
+    default_language: str | None,
+) -> list[dict[str, str]]:
+    """Normalize a Work's alternate-language title variants.
+
+    Unlike lyrics, a Work's ``canonical_title`` is always required, so there is
+    no "translations require a primary" check here — only language validity,
+    no duplicate languages, and no repeat of the Work's own ``language``.
+    """
+    default_key = normalize_language_tag(default_language).casefold() if default_language else None
+    normalized: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in translations:
+        language = normalize_language_tag(item["language"])
+        title = item["title"].strip()
+        if not title:
+            raise ValueError("translated title must not be empty")
+        folded = language.casefold()
+        if default_key is not None and folded == default_key:
+            raise ValueError("title_translations must not repeat the work's own language")
+        if folded in seen:
+            raise ValueError("title_translations contains a duplicate language")
+        seen.add(folded)
+        normalized.append({"language": language, "title": title})
+    return normalized
