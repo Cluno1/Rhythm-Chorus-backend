@@ -53,6 +53,7 @@ from rhythm_metadata_api.domain.v2.schemas import (
     LibrarySearchResponse,
     LibrarySearchSong,
     LibraryTagItem,
+    LibraryTagListResponse,
     LibraryTagWorksResponse,
     NumberMetaItem,
     LibrarySongResponse,
@@ -3534,6 +3535,23 @@ class CatalogService:
             )
         )
         return matches[:limit]
+
+    def list_tags(self, limit: int) -> LibraryTagListResponse:
+        """issue 121：active 作品上的全部标签，按使用作品数降序、名称升序。
+
+        与标签搜索共用 _tag_catalog，标签键、展示名和计数规则一致；不需要关键字。
+        """
+        with self.uow_factory() as uow:
+            works = list(
+                uow.session.scalars(
+                    select(Work).where(Work.deleted_at.is_(None), Work.status == "active")
+                )
+            )
+            items = sorted(
+                self._tag_catalog(works).values(),
+                key=lambda item: (-item.work_count, item.label, item.tag_key),
+            )
+            return LibraryTagListResponse(items=items[:limit])
 
     def list_tag_works(
         self, raw_tag: str, cursor: str | None, limit: int

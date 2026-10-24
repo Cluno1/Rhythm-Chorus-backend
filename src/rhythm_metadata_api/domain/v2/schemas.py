@@ -814,6 +814,12 @@ class LibrarySearchResponse(ApiModel):
     tag_items: list[LibraryTagItem] = Field(default_factory=list)
 
 
+class LibraryTagListResponse(ApiModel):
+    """issue 121：全库已有标签，供歌词页标签选择器挑选。"""
+
+    items: list[LibraryTagItem]
+
+
 class LibraryTagWorksResponse(ApiModel):
     tag: LibraryTagItem
     items: list[LibrarySearchItem]

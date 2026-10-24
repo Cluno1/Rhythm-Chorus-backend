@@ -734,6 +734,16 @@ def search_library(
     return service.search_library(q, type, limit).model_dump(mode="json")
 
 
+@router.get("/library/tags")
+def list_library_tags(
+    service: Catalog,
+    _: Actor,
+    limit: Annotated[int, Query(ge=1, le=1000)] = 500,
+) -> dict[str, Any]:
+    """issue 121：全库已有标签（按使用作品数排序），供客户端标签选择器使用。"""
+    return service.list_tags(limit).model_dump(mode="json")
+
+
 @router.get("/library/tag-works")
 def list_tag_works(
     service: Catalog,

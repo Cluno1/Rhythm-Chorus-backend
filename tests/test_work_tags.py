@@ -124,3 +124,33 @@ def test_casefold_expansion_keeps_long_tag_keys_openable(client: TestClient) -> 
     )
     assert response.status_code == 200, response.text
     assert response.json()["items"][0]["work_id"] == work["id"]
+
+
+def test_library_tag_list_counts_active_works_and_orders_by_usage(client: TestClient) -> None:
+    """issue 121：标签选择器的全库标签列表。"""
+    assert client.get("/v2/library/tags", headers=AUTH).json() == {"items": []}
+    create_work(client, "list-a", "A", tags=["赞美", "多声部"])
+    create_work(client, "list-b", "B", tags=["赞美", "Duet"])
+    create_work(client, "list-c", "C", tags=["赞美", "duet "])
+    create_work(client, "list-archived", "D", tags=["只在归档里"], status="archived")
+
+    response = client.get("/v2/library/tags", headers=AUTH)
+    assert response.status_code == 200, response.text
+    items = response.json()["items"]
+    # 按使用作品数降序；大小写不同的同一标签合并计数；归档作品不计入。
+    assert (items[0]["label"], items[0]["work_count"]) == ("赞美", 3)
+    assert [item["tag_key"] for item in items] == ["赞美", "duet", "多声部"]
+    assert {item["tag_key"]: item["work_count"] for item in items} == {
+        "赞美": 3,
+        "duet": 2,
+        "多声部": 1,
+    }
+    limited = client.get("/v2/library/tags", headers=AUTH, params={"limit": 1}).json()["items"]
+    assert [item["tag_key"] for item in limited] == ["赞美"]
+    assert client.get("/v2/library/tags", headers=AUTH, params={"limit": 0}).status_code == 422
+
+
+def test_library_tag_list_is_public_device_read_only() -> None:
+    assert _public_read_allowed("GET", "/v2/library/tags")
+    assert not _public_read_allowed("POST", "/v2/library/tags")
+

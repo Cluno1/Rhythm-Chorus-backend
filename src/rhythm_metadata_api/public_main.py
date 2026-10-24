@@ -46,6 +46,7 @@ _PUBLIC_READ_ROUTES = (
     ("GET", re.compile(r"^/v2/library/score-works$")),
     ("GET", re.compile(r"^/v2/library/search$")),
     ("GET", re.compile(r"^/v2/library/tag-works$")),
+    ("GET", re.compile(r"^/v2/library/tags$")),
     ("GET", re.compile(r"^/v2/works/[^/]+/bundle$")),
     ("GET", re.compile(r"^/v2/score-revisions/[^/]+$")),
     ("GET", re.compile(r"^/v2/renditions/[^/]+/playback$")),
