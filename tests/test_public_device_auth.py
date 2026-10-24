@@ -456,6 +456,71 @@ def test_signed_rendition_lyric_write_hash_scope_revision_and_audit(tmp_path: Pa
         assert client.patch(f"/v2/renditions/{rendition_id}", json={}).status_code == 404
 
 
+def test_signed_work_tag_write_is_narrow_direct_and_versioned(tmp_path: Path) -> None:
+    """issue 116：普通登记设备只能经标签窄接口直接改作品标签。"""
+    app = create_public_app(settings(tmp_path))
+    with TestClient(app) as client:
+        admin = admin_token(client)
+        key = ec.generate_private_key(ec.SECP256R1())
+        credentials = enroll(client, create_invite(client, admin), key)
+        with Session(client.app.state.v2_container.engine) as session, session.begin():
+            work = Work(canonical_title="Tag write", language="zh-Hans", tags=["旧标签"])
+            archived = Work(canonical_title="Archived", language="zh-Hans", status="archived")
+            session.add_all([work, archived])
+            session.flush()
+            work_id, archived_id = work.id, archived.id
+
+        def patch(path: str, payload: dict[str, Any], if_match: str) -> Any:
+            body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+            headers = signed_headers(client, credentials, key, path, method="PATCH", body=body) | {
+                "Content-Type": "application/json",
+                "If-Match": if_match,
+            }
+            return client.patch(path, content=body, headers=headers)
+
+        path = f"/v2/works/{work_id}/tags"
+        response = patch(path, {"tags": ["  庄严  ", "多声部", "庄严"]}, '"rev-1"')
+        assert response.status_code == 200, response.text
+        assert response.json()["tags"] == ["庄严", "多声部"]
+        assert response.json()["revision"] == 2
+        assert response.headers["ETag"] == '"rev-2"'
+
+        # 过期版本不能静默覆盖别人的修改。
+        assert patch(path, {"tags": []}, '"rev-1"').status_code == 412
+        # 只允许 tags 字段。
+        assert patch(path, {"tags": [], "canonicalTitle": "改名"}, '"rev-2"').status_code == 422
+        # 只接受 active 作品。
+        assert patch(f"/v2/works/{archived_id}/tags", {"tags": ["x"]}, '"rev-1"').status_code == 409
+        # 清空也是合法的整组替换。
+        cleared = patch(path, {"tags": []}, '"rev-2"')
+        assert cleared.status_code == 200, cleared.text
+        assert cleared.json()["tags"] == []
+
+        with Session(client.app.state.v2_container.engine) as session:
+            stored = session.get(Work, work_id)
+            assert stored is not None
+            assert stored.tags == []
+            assert stored.revision == 3
+            assert stored.canonical_title == "Tag write"
+            events = (
+                session.query(ChangeEvent)
+                .filter(ChangeEvent.entity_id == work_id)
+                .order_by(ChangeEvent.sequence)
+                .all()
+            )
+            # 每次实际修改恰好一条事件，失败的请求不写事件。
+            assert [event.operation for event in events] == ["work.updated", "work.updated"]
+            assert all(event.payload_json == {"fields": ["tags"]} for event in events)
+            assert {event.actor_id for event in events} == {"user-1"}
+            assert {event.device_id for event in events} == {credentials["deviceId"]}
+
+        # 通用 Work 写接口仍不对设备开放。
+        assert client.patch(f"/v2/works/{work_id}", json={"tags": ["x"]}).status_code == 404
+    assert _public_write_allowed("PATCH", "/v2/works/w1/tags")
+    assert not _public_write_allowed("PATCH", "/v2/works/w1")
+    assert not _public_write_allowed("PUT", "/v2/works/w1/tags")
+
+
 def test_invite_is_single_use_and_active_device_capacity_defaults_to_two(
     tmp_path: Path,
 ) -> None:

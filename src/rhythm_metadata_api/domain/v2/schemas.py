@@ -281,6 +281,21 @@ class WorkPatch(LocalizedLyricsPatch):
         return normalize_work_tags(value)
 
 
+class WorkTagsPatch(ApiModel):
+    """issue 116：已登记设备直接维护当前作品的标签。
+
+    只允许 tags 一个字段（extra=forbid 拒绝夹带其他 Work 字段）；必传，整组替换，[] 清空。
+    规范化、去重和上限沿用 Issue 109 的 normalize_work_tags。
+    """
+
+    tags: list[str] = Field(max_length=50)
+
+    @field_validator("tags")
+    @classmethod
+    def validate_tags(cls, value: list[str]) -> list[str]:
+        return normalize_work_tags(value)
+
+
 class WorkCreditResponse(ApiModel):
     id: str
     contributor_id: str

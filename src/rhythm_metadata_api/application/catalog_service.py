@@ -101,6 +101,7 @@ from rhythm_metadata_api.domain.v2.schemas import (
     WorkCreate,
     WorkCreditResponse,
     WorkPatch,
+    WorkTagsPatch,
     WorkResolveCandidate,
     WorkResolveRequest,
     WorkResolveResponse,
@@ -536,6 +537,37 @@ class CatalogService:
                 return self._work_response(uow.session, work)
         except IntegrityError as error:
             raise V2Conflict("a supplied alias or credit is already in use") from error
+
+    def patch_work_tags(
+        self, work_id: str, request: WorkTagsPatch, expected_revision: int, actor: ActorContext
+    ) -> WorkResponse:
+        """issue 116：只改标签的窄写入，供普通已登记设备直接入库。
+
+        与管理员 patch_work 共用 revision / ChangeEvent，两条入口并发时由 If-Match 拦截。
+        只接受 active 作品；内容未变时幂等返回，不递增 revision、不写事件。
+        """
+        with self.uow_factory() as uow:
+            work = self._require_work(uow.session, work_id)
+            if work.status != "active":
+                raise V2Conflict("only active works accept tag edits")
+            require_revision(work.revision, expected_revision)
+            if list(work.tags or []) == request.tags:
+                return self._work_response(uow.session, work)
+            work.tags = request.tags
+            work.revision += 1
+            work.updated_at = utc_now()
+            self._append_event(
+                uow.session,
+                work.id,
+                "work",
+                work.id,
+                work.revision,
+                "work.updated",
+                actor,
+                {"fields": ["tags"]},
+            )
+            uow.session.flush()
+            return self._work_response(uow.session, work)
 
     def resolve_work(self, request: WorkResolveRequest) -> WorkResolveResponse:
         with self.uow_factory() as uow:

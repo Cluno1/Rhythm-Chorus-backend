@@ -356,7 +356,8 @@ class DeviceAuthService:
                 "device_id": principal.device_id,
                 "session_id": principal.session_id,
                 "scope": (
-                    "catalog:read catalog:lyrics:write chorus:read chorus:track:write-own "
+                    "catalog:read catalog:lyrics:write catalog:work-tags:write "
+                    "chorus:read chorus:track:write-own "
                     "image:upload-own image:read-own image:download-own image:delete-own "
                     "image:read-shared"
                 ),

@@ -44,6 +44,7 @@ from rhythm_metadata_api.domain.v2.schemas import (
     WorkListResponse,
     WorkPatch,
     WorkResolveRequest,
+    WorkTagsPatch,
 )
 
 router = APIRouter(prefix="/v2", tags=["work catalog v2"])
@@ -179,6 +180,19 @@ def patch_work(
     if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> Response:
     item = service.patch_work(work_id, body, require_if_match(if_match), actor)
+    return model_response(item, headers={"ETag": etag(item.revision)})
+
+
+@router.patch("/works/{work_id}/tags")
+def patch_work_tags(
+    work_id: str,
+    body: WorkTagsPatch,
+    service: Catalog,
+    actor: Actor,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> Response:
+    """issue 116：只改作品标签；公网仅此路径对普通登记设备开放写入（scope catalog:work-tags:write）。"""
+    item = service.patch_work_tags(work_id, body, require_if_match(if_match), actor)
     return model_response(item, headers={"ETag": etag(item.revision)})
 
 

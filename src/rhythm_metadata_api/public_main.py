@@ -71,6 +71,8 @@ _PUBLIC_READ_ROUTES = (
 )
 _PUBLIC_WRITE_ROUTES = (
     ("PUT", re.compile(r"^/v2/renditions/[^/]+/lyrics/[^/]+$")),
+    # issue 116：只开放标签窄接口，通用 PATCH /v2/works/{id} 仍不对设备开放。
+    ("PATCH", re.compile(r"^/v2/works/[^/]+/tags$")),
     ("POST", re.compile(r"^/v2/chorus-projects/[^/]+/tracks$")),
     ("POST", re.compile(r"^/v2/chorus-tracks/[^/]+/complete$")),
     ("PATCH", re.compile(r"^/v2/chorus-tracks/[^/]+/alignment$")),
@@ -213,11 +215,12 @@ def public_actor_context(
             else:
                 required_scope = "image:read-own"
         elif _public_write_allowed(request.method, request.url.path):
-            required_scope = (
-                "catalog:lyrics:write"
-                if request.url.path.startswith("/v2/renditions/")
-                else "chorus:track:write-own"
-            )
+            if request.url.path.startswith("/v2/renditions/"):
+                required_scope = "catalog:lyrics:write"
+            elif request.url.path.startswith("/v2/works/"):
+                required_scope = "catalog:work-tags:write"
+            else:
+                required_scope = "chorus:track:write-own"
         if required_scope is not None:
             request.app.state.device_auth.require_scope(token, required_scope)
     except (DeviceAuthError, UnicodeDecodeError) as error:
