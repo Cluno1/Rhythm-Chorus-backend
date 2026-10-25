@@ -3592,6 +3592,12 @@ class CatalogService:
                 next_cursor=next_cursor,
             )
 
+    def search_items_for_works(
+        self, session: Session, works: list[Work]
+    ) -> list[LibrarySearchItem]:
+        """issue 124: the same search row for each Work as number/tag results (room song lists)."""
+        return self._search_work_items(session, [(work, {"match_field": "room"}) for work in works])
+
     def _search_work_items(
         self, session: Session, matches: list[tuple[Work, dict[str, Any]]]
     ) -> list[LibrarySearchItem]:

@@ -19,6 +19,7 @@ from rhythm_metadata_api.api.routes import health
 from rhythm_metadata_api.api.v2.chorus_routes import router as chorus_router
 from rhythm_metadata_api.api.v2.image_routes import admin_router as image_admin_router
 from rhythm_metadata_api.api.v2.image_routes import router as image_router
+from rhythm_metadata_api.api.v2.room_routes import router as room_router
 from rhythm_metadata_api.api.v2.routes import actor_context
 from rhythm_metadata_api.api.v2.routes import router as v2_router
 from rhythm_metadata_api.application.catalog_service import ActorContext
@@ -58,6 +59,9 @@ _PUBLIC_READ_ROUTES = (
     ("GET", re.compile(r"^/v2/works/[^/]+/chorus$")),
     ("GET", re.compile(r"^/v2/chorus-projects/[^/]+$")),
     ("GET", re.compile(r"^/v2/chorus-mixes/[^/]+$")),
+    # issue 124：房间列表与详情。
+    ("GET", re.compile(r"^/v2/rooms$")),
+    ("GET", re.compile(r"^/v2/rooms/[^/]+$")),
     ("GET", re.compile(r"^/v2/app-updates/latest$")),
     ("GET", re.compile(r"^/v2/app-updates/files/\d+/[A-Za-z0-9._-]+\.apk$")),
     ("HEAD", re.compile(r"^/v2/app-updates/files/\d+/[A-Za-z0-9._-]+\.apk$")),
@@ -74,6 +78,12 @@ _PUBLIC_WRITE_ROUTES = (
     ("PUT", re.compile(r"^/v2/renditions/[^/]+/lyrics/[^/]+$")),
     # issue 116：只开放标签窄接口，通用 PATCH /v2/works/{id} 仍不对设备开放。
     ("PATCH", re.compile(r"^/v2/works/[^/]+/tags$")),
+    # issue 124：房间写入（scope rooms:write）。
+    ("POST", re.compile(r"^/v2/rooms$")),
+    ("DELETE", re.compile(r"^/v2/rooms/[^/]+$")),
+    ("POST", re.compile(r"^/v2/rooms/[^/]+/items$")),
+    ("DELETE", re.compile(r"^/v2/rooms/[^/]+/items/[^/]+$")),
+    ("PUT", re.compile(r"^/v2/rooms/[^/]+/order$")),
     ("POST", re.compile(r"^/v2/chorus-projects/[^/]+/tracks$")),
     ("POST", re.compile(r"^/v2/chorus-tracks/[^/]+/complete$")),
     ("PATCH", re.compile(r"^/v2/chorus-tracks/[^/]+/alignment$")),
@@ -220,6 +230,8 @@ def public_actor_context(
                 required_scope = "catalog:lyrics:write"
             elif request.url.path.startswith("/v2/works/"):
                 required_scope = "catalog:work-tags:write"
+            elif request.url.path.startswith("/v2/rooms"):
+                required_scope = "rooms:write"
             else:
                 required_scope = "chorus:track:write-own"
         if required_scope is not None:
@@ -343,6 +355,7 @@ def create_public_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(public_updates_router)
     app.include_router(v2_router)
     app.include_router(chorus_router)
+    app.include_router(room_router)
     app.include_router(image_router)
     app.include_router(image_admin_router)
     return app

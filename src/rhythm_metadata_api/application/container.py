@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session, aliased
 from rhythm_metadata_api.application.catalog_service import CatalogService
 from rhythm_metadata_api.application.chorus_service import ChorusService
 from rhythm_metadata_api.application.client_image_service import ClientImageService
+from rhythm_metadata_api.application.room_service import RoomService
 from rhythm_metadata_api.application.unit_of_work import UnitOfWorkFactory
 from rhythm_metadata_api.core.config import Settings
 from rhythm_metadata_api.infrastructure.db.database import (
@@ -27,6 +28,7 @@ class V2Container:
     catalog: CatalogService
     chorus: ChorusService
     client_images: ClientImageService
+    rooms: RoomService
 
     @classmethod
     def build(cls, settings: Settings) -> V2Container:
@@ -58,12 +60,20 @@ class V2Container:
         client_images = ClientImageService(
             UnitOfWorkFactory(sessions), settings, TencentCosImageGateway(settings)
         )
+        # issue 124: rooms reuse the catalog's search rows and idempotency records.
+        rooms = RoomService(
+            UnitOfWorkFactory(sessions),
+            settings,
+            work_items=catalog.search_items_for_works,
+            idempotent=catalog._idempotent,
+        )
         return cls(
             settings=settings,
             engine=engine,
             catalog=catalog,
             chorus=chorus,
             client_images=client_images,
+            rooms=rooms,
         )
 
     def close(self) -> None:

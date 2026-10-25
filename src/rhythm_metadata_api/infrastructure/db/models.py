@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 from sqlalchemy import (
     JSON,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -1116,4 +1117,67 @@ class AuthAuditEvent(Base):
 
     __table_args__ = (
         Index("auth_audit_event_lookup_idx", "event_type", "source_ip", "created_at"),
+    )
+
+
+# issue 124: rooms where several people pick and order the songs for one gathering.
+# Every item belongs to a section from the start (one unnamed default section today), so
+# admin room templates, named sections and section assignees later only add data.
+class Room(Base):
+    __tablename__ = "v2_rooms"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(60), nullable=False)
+    service_date: Mapped[date] = mapped_column(Date, nullable=False)
+    # Start of the day after service_date (UTC+8); lazily purged once passed.
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_by_user_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    # Reserved for room templates (issue 124 phase 2); always null today.
+    template_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+    __table_args__ = (Index("v2_rooms_expiry_idx", "expires_at"),)
+
+
+class RoomSection(Base):
+    __tablename__ = "v2_room_sections"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    room_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_rooms.id", ondelete="CASCADE"), nullable=False
+    )
+    # Null for the default section; template sections carry names such as "开场".
+    name: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Reserved for section assignees (issue 124 phase 2); always null today.
+    assignee_user_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+    __table_args__ = (Index("v2_room_sections_room_idx", "room_id", "position"),)
+
+
+class RoomItem(Base):
+    __tablename__ = "v2_room_items"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    room_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_rooms.id", ondelete="CASCADE"), nullable=False
+    )
+    section_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_room_sections.id", ondelete="CASCADE"), nullable=False
+    )
+    work_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_works.id", ondelete="CASCADE"), nullable=False
+    )
+    # 1-based and contiguous within its section.
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    added_by_user_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    __table_args__ = (
+        UniqueConstraint("room_id", "work_id", name="v2_room_items_one_work_per_room"),
+        Index("v2_room_items_section_idx", "section_id", "position"),
     )
