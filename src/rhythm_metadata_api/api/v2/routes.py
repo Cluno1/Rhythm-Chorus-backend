@@ -42,6 +42,7 @@ from rhythm_metadata_api.domain.v2.schemas import (
     WorkBundleResponse,
     WorkCreate,
     WorkListResponse,
+    WorkLyricReplace,
     WorkPatch,
     WorkResolveRequest,
     WorkTagsPatch,
@@ -193,6 +194,20 @@ def patch_work_tags(
 ) -> Response:
     """issue 116：只改作品标签；公网仅此路径对普通登记设备开放写入（scope catalog:work-tags:write）。"""
     item = service.patch_work_tags(work_id, body, require_if_match(if_match), actor)
+    return model_response(item, headers={"ETag": etag(item.revision)})
+
+
+@router.put("/works/{work_id}/lyrics/{language}")
+def replace_work_lyrics(
+    work_id: str,
+    language: str,
+    body: WorkLyricReplace,
+    service: Catalog,
+    actor: Actor,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> Response:
+    """issue 125：只改作品某一语言的纯文本歌词；公网对登记设备开放（scope catalog:lyrics:write）。"""
+    item = service.replace_work_lyrics(work_id, language, body, require_if_match(if_match), actor)
     return model_response(item, headers={"ETag": etag(item.revision)})
 
 

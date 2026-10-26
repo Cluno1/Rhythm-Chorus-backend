@@ -78,6 +78,8 @@ _PUBLIC_WRITE_ROUTES = (
     ("PUT", re.compile(r"^/v2/renditions/[^/]+/lyrics/[^/]+$")),
     # issue 116：只开放标签窄接口，通用 PATCH /v2/works/{id} 仍不对设备开放。
     ("PATCH", re.compile(r"^/v2/works/[^/]+/tags$")),
+    # issue 125：作品某一语言的纯文本歌词。
+    ("PUT", re.compile(r"^/v2/works/[^/]+/lyrics/[^/]+$")),
     # issue 124：房间写入（scope rooms:write）。
     ("POST", re.compile(r"^/v2/rooms$")),
     ("DELETE", re.compile(r"^/v2/rooms/[^/]+$")),
@@ -226,7 +228,9 @@ def public_actor_context(
             else:
                 required_scope = "image:read-own"
         elif _public_write_allowed(request.method, request.url.path):
-            if request.url.path.startswith("/v2/renditions/"):
+            if request.url.path.startswith("/v2/renditions/") or re.fullmatch(
+                r"/v2/works/[^/]+/lyrics/[^/]+", request.url.path
+            ):
                 required_scope = "catalog:lyrics:write"
             elif request.url.path.startswith("/v2/works/"):
                 required_scope = "catalog:work-tags:write"

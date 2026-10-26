@@ -4,6 +4,7 @@ import base64
 import binascii
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -102,6 +103,7 @@ from rhythm_metadata_api.domain.v2.schemas import (
     WorkCreate,
     WorkCreditResponse,
     WorkPatch,
+    WorkLyricReplace,
     WorkTagsPatch,
     WorkResolveCandidate,
     WorkResolveRequest,
@@ -161,6 +163,8 @@ class StoredResponse:
     headers: dict[str, str]
     replayed: bool = False
 
+
+LOGGER = logging.getLogger(__name__)
 
 _LYRICS_FIELDS = frozenset({"lyrics", "lyrics_language", "lyrics_translations"})
 _LYRIC_FORMATS = frozenset({"plain", "lrc", "enhanced_lrc", "ttml", "word_by_word_json"})
@@ -568,6 +572,93 @@ class CatalogService:
                 {"fields": ["tags"]},
             )
             uow.session.flush()
+            return self._work_response(uow.session, work)
+
+    def replace_work_lyrics(
+        self,
+        work_id: str,
+        language: str,
+        request: WorkLyricReplace,
+        expected_revision: int,
+        actor: ActorContext,
+    ) -> WorkResponse:
+        """issue 125：只改作品某一语言纯文本歌词的窄写入，供普通已登记设备直接入库。
+
+        - 语言是作品的默认语言（或作品还没有默认歌词）时改 ``lyrics``；否则替换或新增
+          ``lyrics_translations`` 里的那一项。还没有默认歌词、默认语言是 und 时，以这次的语言
+          作为默认语言。
+        - 与 patch_work / patch_work_tags 共用 revision 与 ChangeEvent：并发由 If-Match 拦截，
+          旧版本号返回 412，不会静默覆盖别人刚保存的歌词。
+        - 只接受 active 作品；内容没变时原样返回，不递增 revision、不写事件。
+        """
+        try:
+            tag = normalize_language_tag(language)
+        except ValueError as error:
+            raise V2DomainError(str(error)) from error
+        text = request.lyrics.strip()
+        with self.uow_factory() as uow:
+            work = self._require_work(uow.session, work_id)
+            if work.status != "active":
+                raise V2Conflict("only active works accept lyrics edits")
+            try:
+                require_revision(work.revision, expected_revision)
+            except StaleRevision:
+                LOGGER.warning(
+                    "work lyrics edit rejected as stale: work=%s by=%s expected=%s current=%s",
+                    work.id, actor.actor_id, expected_revision, work.revision,
+                )
+                raise
+            current_language = work.lyrics_language or "und"
+            translations = [dict(item) for item in (work.lyrics_translations or [])]
+            has_default = bool((work.lyrics or "").strip())
+            if not has_default or current_language == "und" or current_language.casefold() == tag.casefold():
+                default_language = tag if (not has_default or current_language == "und") else current_language
+                lyrics = text
+                translations = [
+                    item for item in translations
+                    if normalize_language_tag(item["language"]).casefold() != default_language.casefold()
+                ]
+                field = "lyrics"
+            else:
+                default_language = current_language
+                lyrics = work.lyrics
+                replaced = False
+                for item in translations:
+                    if normalize_language_tag(item["language"]).casefold() == tag.casefold():
+                        item["lyrics"] = text
+                        replaced = True
+                if not replaced:
+                    translations.append({"language": tag, "lyrics": text})
+                field = "lyrics_translations"
+            lyrics, default_language, translations = _normalize_lyrics_or_error(
+                lyrics, default_language, translations, fallback_language=work.language
+            )
+            if (
+                lyrics == work.lyrics
+                and default_language == work.lyrics_language
+                and translations == list(work.lyrics_translations or [])
+            ):
+                return self._work_response(uow.session, work)
+            work.lyrics = lyrics
+            work.lyrics_language = default_language
+            work.lyrics_translations = translations
+            work.revision += 1
+            work.updated_at = utc_now()
+            self._append_event(
+                uow.session,
+                work.id,
+                "work",
+                work.id,
+                work.revision,
+                "work.updated",
+                actor,
+                {"fields": [field], "language": tag},
+            )
+            uow.session.flush()
+            LOGGER.info(
+                "work lyrics edited: work=%s language=%s field=%s by=%s revision=%s",
+                work.id, tag, field, actor.actor_id, work.revision,
+            )
             return self._work_response(uow.session, work)
 
     def resolve_work(self, request: WorkResolveRequest) -> WorkResolveResponse:

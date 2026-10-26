@@ -281,6 +281,24 @@ class WorkPatch(LocalizedLyricsPatch):
         return normalize_work_tags(value)
 
 
+class WorkLyricReplace(ApiModel):
+    """issue 125：已登记设备直接修改作品某一语言的纯文本歌词。
+
+    只收 lyrics 一个字段（extra=forbid）；语言在路径里。作品歌词只是纯文本，
+    带时间轴的同步歌词仍按录音（rendition）编辑。
+    """
+
+    lyrics: str = Field(min_length=1, max_length=2 * 1024 * 1024)
+
+    @field_validator("lyrics")
+    @classmethod
+    def validate_lyrics(cls, value: str) -> str:
+        normalized = value.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n")
+        if not normalized.strip():
+            raise ValueError("lyrics must not be blank")
+        return normalized
+
+
 class WorkTagsPatch(ApiModel):
     """issue 116：已登记设备直接维护当前作品的标签。
 
