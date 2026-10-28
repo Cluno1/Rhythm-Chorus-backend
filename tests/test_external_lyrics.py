@@ -192,6 +192,30 @@ def test_单首歌词去掉标签署名与开头歌名行(env):
     assert sum(1 for path, _ in provider.calls if path == "/lyric") == 1
 
 
+def test_单首歌词另带平台原文供完整模式显示与复制(env):
+    client, provider = env
+    provider.lyric = {
+        "lyric": "[ti:旅人]\r\n[00:00.00] 作词 : 刘凤瑶\r\n[00:13.73]In your eyes\r\n",
+        "tlyric": "[00:13.73]在你眼中\n",
+    }
+    body = client.get("/v2/library/external-lyrics/netease/2067068109", headers=AUTH).json()
+    assert body["raw_lrc"] == "[ti:旅人]\n[00:00.00] 作词 : 刘凤瑶\n[00:13.73]In your eyes"
+    assert body["raw_translation"] == "[00:13.73]在你眼中"
+    assert body["lyrics"] == "In your eyes"
+
+
+def test_匹配接口不带平台原文(env):
+    client, _ = env
+    response = client.get(
+        "/v2/library/external-lyrics/match",
+        headers=AUTH,
+        params={"title": "旅人", "artist": "罗云熙"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["items"]
+    assert all("raw_lrc" not in item for item in response.json()["items"])
+
+
 def test_平台上没有歌词时返回404(env):
     client, provider = env
     provider.lyric = {"lyric": "[00:00.00] 作词 : 某人\n", "tlyric": ""}

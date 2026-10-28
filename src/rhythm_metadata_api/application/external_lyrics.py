@@ -11,6 +11,9 @@ Invariants
 * ``match`` serves the Android LRCLIB-style source (auto match, manual pick): candidates carry
   their lyrics, like LRCLIB ``/api/search``. Scoring stays on the client, with the same matcher
   as LRCLIB, so both sources are judged by one rule; the backend only pre-ranks.
+* The single-song endpoint also returns ``raw_lrc`` / ``raw_translation``: the platform text as
+  received (tags, credits, timestamps) for the client's "full" view and copy. Matching and the
+  plain view keep using the cleaned text; ``match`` never carries the raw text.
 
 Why this way
 ------------
@@ -382,7 +385,14 @@ class ExternalLyricsService:
             "synced_lrc": synced,
             "translation": translation or None,
             "synced_translation": translation_synced or None,
+            "raw_lrc": _raw(data.get("lyric")),
+            "raw_translation": _raw(data.get("tlyric")) or None,
         }
+
+
+def _raw(value: Any) -> str:
+    """Platform LRC as received, only with unified line endings and outer blank lines trimmed."""
+    return str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
 def _prefilter_score(
