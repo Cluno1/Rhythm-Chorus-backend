@@ -19,7 +19,13 @@ AUTH = {"Authorization": f"Bearer {TOKEN}", "X-Device-ID": "android-test-device"
 
 
 def hit(
-    source: str, external_id: str, title: str, artist: str, *, snippet: str | None = None
+    source: str,
+    external_id: str,
+    title: str,
+    artist: str,
+    *,
+    snippet: str | None = None,
+    duration_ms: int = 253783,
 ) -> dict:
     return {
         "source": source,
@@ -27,7 +33,7 @@ def hit(
         "title": title,
         "artists": [artist],
         "album": "专辑",
-        "duration_ms": 253783,
+        "duration_ms": duration_ms,
         "snippet": snippet,
     }
 
@@ -52,6 +58,10 @@ class FakeProvider:
                     snippet="你掌心的温度 我就会觉得幸福",
                 )
             ],
+            ("kugou", "title"): [
+                hit("kugou", "8ae73bc9d344e00f3a083aa3abdeb3c2", "旅人", "罗云熙"),
+                hit("kugou", "aaaa0000bbbb1111cccc2222dddd3333", "旅人 (DJ版)", "DJ先森"),
+            ],
             ("tencent", "title"): [
                 hit("tencent", "004BzmAS3gqK1T", "旅人", "王铮亮"),
                 hit("tencent", "002DBLd50RMYKG", "旅人", "罗云熙"),
@@ -63,6 +73,8 @@ class FakeProvider:
             "tlyric": "",
         }
 
+        self.lyrics_by_id: dict[str, dict] = {}
+
     def __call__(self, url: str, timeout: float) -> dict:
         parts = urlsplit(url)
         params = {key: values[0] for key, values in parse_qs(parts.query).items()}
@@ -71,7 +83,7 @@ class FakeProvider:
             raise URLError("provider down")
         if parts.path == "/search":
             return {"items": self.search_items.get((params["server"], params["type"]), [])}
-        return self.lyric
+        return self.lyrics_by_id.get(params["id"], self.lyric)
 
 
 @pytest.fixture
@@ -212,3 +224,73 @@ def test_公网网关放行两个只读接口():
     assert allowed("/v2/library/external-lyrics/tencent/004BzmAS3gqK1T")
     assert not allowed("/v2/library/external-lyrics/kuwo/1")
     assert not allowed("/v2/library/external-lyrics/netease/../x")
+
+
+def match(client: TestClient, **params: object):
+    return client.get("/v2/library/external-lyrics/match", headers=AUTH, params=params)
+
+
+def test_匹配接口最像的候选排第一且直接带歌词(env):
+    client, _ = env
+    response = match(client, title="旅人", artist="罗云熙", duration=254)
+    assert response.status_code == 200, response.text
+    first = response.json()["items"][0]
+    assert (first["title"], first["artists"]) == ("旅人", ["罗云熙"])
+    assert first["lyrics"] == "In your eyes\n心正在通往 探索的征帆"
+    assert first["synced_lrc"].startswith("[00:13.73]")
+    assert "match_field" not in first and "snippet" not in first
+
+
+def test_匹配接口跳过平台上没有歌词的候选(env):
+    client, provider = env
+    provider.lyrics_by_id["2067068109"] = {"lyric": "[00:00.00] 作词 : 刘凤瑶\n", "tlyric": ""}
+    ids = [
+        item["external_id"] for item in match(client, title="旅人", artist="罗云熙").json()["items"]
+    ]
+    assert "2067068109" not in ids
+    assert ids, "other candidates still have lyrics"
+
+
+def test_匹配接口包含酷狗且单个平台失败仍返回(env):
+    client, provider = env
+    provider.failing = {"tencent"}
+    body = match(client, title="旅人", artist="罗云熙", limit=10).json()
+    assert body["unavailable_sources"] == ["tencent"]
+    assert {item["source"] for item in body["items"]} == {"netease", "kugou"}
+    assert ("kugou", "title") in {
+        (p["server"], p["type"]) for path, p in provider.calls if path == "/search"
+    }
+
+
+def test_匹配接口每首候选的歌词恰好只取一次且受limit限制(env):
+    client, provider = env
+    match(client, title="旅人", artist="罗云熙", limit=2)
+    match(client, title="旅人", artist="罗云熙", limit=2)
+    fetched = [p["id"] for path, p in provider.calls if path == "/lyric"]
+    assert len(fetched) == 2
+    assert len(set(fetched)) == 2
+
+
+def test_匹配接口全部平台失败返回503(env):
+    client, provider = env
+    provider.failing = {"netease", "tencent", "kugou"}
+    assert match(client, title="旅人").status_code == 503
+
+
+def test_公网网关放行匹配接口():
+    assert any(
+        method == "GET" and pattern.fullmatch("/v2/library/external-lyrics/match")
+        for method, pattern in _PUBLIC_READ_ROUTES
+    )
+
+
+def test_匹配接口歌名歌手相同时时长更接近的排第一(env):
+    client, provider = env
+    provider.search_items = {
+        ("netease", "title"): [
+            hit("netease", "111", "旅人", "罗云熙", duration_ms=180000),
+            hit("netease", "222", "旅人", "罗云熙", duration_ms=253783),
+        ],
+    }
+    body = match(client, title="旅人", artist="罗云熙", duration=254).json()
+    assert [item["external_id"] for item in body["items"]][:2] == ["222", "111"]

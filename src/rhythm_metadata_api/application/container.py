@@ -77,6 +77,11 @@ class V2Container:
             sources=tuple(
                 part.strip() for part in settings.external_lyrics_sources.split(",") if part.strip()
             ),
+            match_sources=tuple(
+                part.strip()
+                for part in settings.external_lyrics_match_sources.split(",")
+                if part.strip()
+            ),
             timeout_seconds=settings.external_lyrics_timeout_seconds,
         )
         return cls(

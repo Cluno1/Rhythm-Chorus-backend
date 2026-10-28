@@ -8,6 +8,9 @@ Invariants
   ``library_search.normalize``) is a ``title`` hit and sorts before ``lyrics`` hits.
 * One failing platform never fails the request; it is listed in ``unavailable_sources`` and
   logged once per call. Only "provider not configured" or "every source failed" is a 503.
+* ``match`` serves the Android LRCLIB-style source (auto match, manual pick): candidates carry
+  their lyrics, like LRCLIB ``/api/search``. Scoring stays on the client, with the same matcher
+  as LRCLIB, so both sources are judged by one rule; the backend only pre-ranks.
 
 Why this way
 ------------
@@ -162,12 +165,15 @@ class ExternalLyricsService:
         base_url: str,
         *,
         sources: tuple[str, ...] = ("netease", "tencent"),
+        match_sources: tuple[str, ...] = ("netease", "tencent", "kugou"),
         timeout_seconds: float = 4.0,
         fetch: Callable[[str, float], Any] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.sources = sources
+        # Kugou's lyric index is built for "this exact song" lookups, so it joins matching only.
+        self.match_sources = match_sources
         self.timeout = timeout_seconds
         self._fetch = fetch or self._http_get
         self._cache = _TtlCache(clock)
@@ -259,6 +265,78 @@ class ExternalLyricsService:
             "unavailable_sources": unavailable,
         }
 
+    def match(
+        self,
+        title: str,
+        artist: str | None = None,
+        album: str | None = None,
+        duration_seconds: int | None = None,
+        limit: int = 5,
+    ) -> dict[str, Any]:
+        """Candidates *with lyrics* for one known song, like LRCLIB's ``/api/search``.
+
+        The client scores them with the same matcher it uses for LRCLIB; this only
+        pre-ranks so lyrics are fetched for the few plausible songs, not every hit.
+        """
+        if not self.enabled:
+            raise V2Unavailable("external lyrics provider is not configured")
+        title = title.strip()
+        artist = (artist or "").strip()
+        query = f"{title} {artist}".strip()
+        futures = {
+            source: self._pool.submit(self._source_search, source, query, "title", 10)
+            for source in self.match_sources
+        }
+        answered: dict[str, list[dict[str, Any]]] = {}
+        failed: list[str] = []
+        for source, future in futures.items():
+            try:
+                answered[source] = future.result()
+            except (HTTPError, URLError, TimeoutError, OSError, ValueError, TypeError) as error:
+                failed.append(source)
+                log.warning(
+                    "external lyrics match search failed source=%s error=%s",
+                    source,
+                    type(error).__name__,
+                )
+        if not answered:
+            raise V2Unavailable(
+                "no external lyrics source answered", unavailable_sources=sorted(failed)
+            )
+        title_norm, artist_norm = normalize(title), normalize(artist)
+        duration_ms = duration_seconds * 1000 if duration_seconds else None
+        hits: dict[tuple[str, str], SearchHit] = {}
+        for source in self.match_sources:
+            for raw in answered.get(source, []):
+                hit = _to_hit(raw, title_norm)
+                if hit is not None:
+                    hits.setdefault((hit.source, hit.external_id), hit)
+        ranked = sorted(
+            hits.values(),
+            key=lambda hit: -_prefilter_score(hit, title_norm, artist_norm, duration_ms),
+        )[:limit]
+        lyric_jobs = {
+            hit: self._pool.submit(self.lyrics, hit.source, hit.external_id, hit.title)
+            for hit in ranked
+        }
+        items: list[dict[str, Any]] = []
+        for hit, future in lyric_jobs.items():
+            try:
+                lyrics = future.result()
+            except V2DomainError:
+                continue  # no lyrics on that platform, or it did not answer: not a candidate
+            entry = hit.to_json()
+            entry.pop("match_field")
+            entry.pop("snippet")
+            entry.update(
+                lyrics=lyrics["lyrics"],
+                synced_lrc=lyrics["synced_lrc"] or None,
+                translation=lyrics["translation"],
+                synced_translation=lyrics["synced_translation"],
+            )
+            items.append(entry)
+        return {"items": items, "unavailable_sources": sorted(failed)}
+
     def lyrics(self, source: str, external_id: str, title: str | None = None) -> dict[str, Any]:
         if source not in SUPPORTED_SOURCES:
             raise V2NotFound(f"unknown lyrics source {source}")
@@ -293,6 +371,26 @@ class ExternalLyricsService:
             "translation": translation or None,
             "synced_translation": translation_synced or None,
         }
+
+
+def _prefilter_score(
+    hit: SearchHit, title_norm: str, artist_norm: str, duration_ms: int | None
+) -> float:
+    score = 0.0
+    hit_title = normalize(hit.title)
+    if hit_title == title_norm:
+        score += 3
+    elif title_norm and (title_norm in hit_title or hit_title in title_norm):
+        score += 1.5
+    if artist_norm and any(
+        name and (name in artist_norm or artist_norm in name)
+        for name in (normalize(artist) for artist in hit.artists)
+    ):
+        score += 2
+    if duration_ms and hit.duration_ms:
+        difference = abs(duration_ms - hit.duration_ms) / 1000
+        score += 1 if difference <= 3 else 0.5 if difference <= 10 else 0
+    return score
 
 
 def _to_hit(raw: Any, needle: str) -> SearchHit | None:

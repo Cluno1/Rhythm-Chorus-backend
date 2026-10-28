@@ -67,6 +67,8 @@ class Settings(BaseSettings):
     # Empty disables the external lyrics endpoints (503), e.g. in tests and local runs.
     external_lyrics_provider_url: str = ""
     external_lyrics_sources: str = "netease,tencent"
+    # Matching one known song (LRCLIB-style auto match / manual pick) also asks Kugou.
+    external_lyrics_match_sources: str = "netease,tencent,kugou"
     external_lyrics_timeout_seconds: float = 4.0
 
     @model_validator(mode="after")
@@ -77,11 +79,15 @@ class Settings(BaseSettings):
             raise ValueError("RHYTHM_COS_SECRET_ID and RHYTHM_COS_SECRET_KEY must be set together")
         if not 60 <= self.cos_presign_expires_seconds <= 3600:
             raise ValueError("RHYTHM_COS_PRESIGN_EXPIRES_SECONDS must be between 60 and 3600")
-        sources = [part.strip() for part in self.external_lyrics_sources.split(",") if part.strip()]
-        if not sources or not set(sources) <= {"netease", "tencent", "kugou"}:
-            raise ValueError(
-                "RHYTHM_EXTERNAL_LYRICS_SOURCES must list netease, tencent and/or kugou"
-            )
+        for name, value in (
+            ("SOURCES", self.external_lyrics_sources),
+            ("MATCH_SOURCES", self.external_lyrics_match_sources),
+        ):
+            sources = [part.strip() for part in value.split(",") if part.strip()]
+            if not sources or not set(sources) <= {"netease", "tencent", "kugou"}:
+                raise ValueError(
+                    f"RHYTHM_EXTERNAL_LYRICS_{name} must list netease, tencent and/or kugou"
+                )
         if not 1 <= self.external_lyrics_timeout_seconds <= 10:
             raise ValueError("RHYTHM_EXTERNAL_LYRICS_TIMEOUT_SECONDS must be between 1 and 10")
         if not 60 <= self.public_access_token_ttl_seconds <= 3600:

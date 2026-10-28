@@ -48,6 +48,7 @@ _PUBLIC_READ_ROUTES = (
     ("GET", re.compile(r"^/v2/library/search$")),
     # issue 127：网络中文歌词搜索与单首歌词。
     ("GET", re.compile(r"^/v2/library/external-lyrics/search$")),
+    ("GET", re.compile(r"^/v2/library/external-lyrics/match$")),
     (
         "GET",
         re.compile(r"^/v2/library/external-lyrics/(?:netease|tencent|kugou)/[A-Za-z0-9]{1,64}$"),

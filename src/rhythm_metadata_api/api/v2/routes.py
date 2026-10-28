@@ -764,6 +764,24 @@ def search_external_lyrics(
     return service.search(q, limit)
 
 
+@router.get("/library/external-lyrics/match")
+def match_external_lyrics(
+    service: ExternalLyrics,
+    _: Actor,
+    title: Annotated[str, Query(min_length=1, max_length=200)],
+    artist: Annotated[str | None, Query(max_length=200)] = None,
+    album: Annotated[str | None, Query(max_length=200)] = None,
+    duration: Annotated[int | None, Query(ge=1, le=86400)] = None,
+    limit: Annotated[int, Query(ge=1, le=10)] = 5,
+) -> dict[str, Any]:
+    """issue 127: lyrics candidates for one known song, the LRCLIB `/api/search` equivalent."""
+    if not title.strip():
+        from rhythm_metadata_api.domain.v2.errors import V2DomainError
+
+        raise V2DomainError("title must not be blank")
+    return service.match(title, artist, album, duration, limit)
+
+
 @router.get("/library/external-lyrics/{source}/{external_id}")
 def get_external_lyrics(
     source: str,
