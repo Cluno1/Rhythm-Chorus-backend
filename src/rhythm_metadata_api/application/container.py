@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session, aliased
 from rhythm_metadata_api.application.catalog_service import CatalogService
 from rhythm_metadata_api.application.chorus_service import ChorusService
 from rhythm_metadata_api.application.client_image_service import ClientImageService
+from rhythm_metadata_api.application.external_lyrics import ExternalLyricsService
 from rhythm_metadata_api.application.room_service import RoomService
 from rhythm_metadata_api.application.unit_of_work import UnitOfWorkFactory
 from rhythm_metadata_api.core.config import Settings
@@ -29,6 +30,7 @@ class V2Container:
     chorus: ChorusService
     client_images: ClientImageService
     rooms: RoomService
+    external_lyrics: ExternalLyricsService
 
     @classmethod
     def build(cls, settings: Settings) -> V2Container:
@@ -52,7 +54,9 @@ class V2Container:
             )
         if cos_only_locations and not (settings.cos_secret_id and settings.cos_secret_key):
             engine.dispose()
-            raise ValueError("COS credentials are required when the catalog has COS asset locations")
+            raise ValueError(
+                "COS credentials are required when the catalog has COS asset locations"
+            )
         sessions = create_session_factory(engine)
         storage = LocalAssetStorage(settings.local_object_root)
         catalog = CatalogService(UnitOfWorkFactory(sessions), storage, settings)
@@ -67,6 +71,14 @@ class V2Container:
             work_items=catalog.search_items_for_works,
             idempotent=catalog._idempotent,
         )
+        # issue 127: Chinese lyrics from public platforms through the internal Meting provider.
+        external_lyrics = ExternalLyricsService(
+            settings.external_lyrics_provider_url,
+            sources=tuple(
+                part.strip() for part in settings.external_lyrics_sources.split(",") if part.strip()
+            ),
+            timeout_seconds=settings.external_lyrics_timeout_seconds,
+        )
         return cls(
             settings=settings,
             engine=engine,
@@ -74,6 +86,7 @@ class V2Container:
             chorus=chorus,
             client_images=client_images,
             rooms=rooms,
+            external_lyrics=external_lyrics,
         )
 
     def close(self) -> None:

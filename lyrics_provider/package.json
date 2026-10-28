@@ -1,0 +1,19 @@
+{
+  "name": "rhythm-lyrics-provider",
+  "version": "0.1.0",
+  "private": true,
+  "description": "issue 127: internal search/lyric provider for Rhythm-Chorus-backend, wrapping @meting/core",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@meting/core": "1.6.2"
+  }
+}

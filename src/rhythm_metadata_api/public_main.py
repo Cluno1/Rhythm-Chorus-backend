@@ -46,6 +46,12 @@ _PUBLIC_READ_ROUTES = (
     ("GET", re.compile(r"^/v2/library/albums/[^/]+$")),
     ("GET", re.compile(r"^/v2/library/score-works$")),
     ("GET", re.compile(r"^/v2/library/search$")),
+    # issue 127：网络中文歌词搜索与单首歌词。
+    ("GET", re.compile(r"^/v2/library/external-lyrics/search$")),
+    (
+        "GET",
+        re.compile(r"^/v2/library/external-lyrics/(?:netease|tencent|kugou)/[A-Za-z0-9]{1,64}$"),
+    ),
     ("GET", re.compile(r"^/v2/library/tag-works$")),
     ("GET", re.compile(r"^/v2/library/tags$")),
     ("GET", re.compile(r"^/v2/works/[^/]+/bundle$")),
@@ -220,10 +226,12 @@ def public_actor_context(
                 request.scope.get("query_string", b"").decode("ascii")
             ).get("purpose") == ["download"]:
                 required_scope = "image:download-own"
-            elif request.url.path.startswith((
-                "/v2/labs/image-upload-batches",
-                "/v2/labs/image-uploads",
-            )):
+            elif request.url.path.startswith(
+                (
+                    "/v2/labs/image-upload-batches",
+                    "/v2/labs/image-uploads",
+                )
+            ):
                 required_scope = "image:upload-own"
             else:
                 required_scope = "image:read-own"

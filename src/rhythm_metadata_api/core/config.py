@@ -63,6 +63,12 @@ class Settings(BaseSettings):
     sonorus_debug_certificate_sha256: str = ""
     sonorus_stable_certificate_sha256: str = ""
 
+    # issue 127: internal Meting provider (lyrics_provider/) for Chinese lyrics search.
+    # Empty disables the external lyrics endpoints (503), e.g. in tests and local runs.
+    external_lyrics_provider_url: str = ""
+    external_lyrics_sources: str = "netease,tencent"
+    external_lyrics_timeout_seconds: float = 4.0
+
     @model_validator(mode="after")
     def reject_default_production_token(self) -> "Settings":
         if self.environment == "production" and self.bootstrap_token == "change-me-in-development":
@@ -71,6 +77,13 @@ class Settings(BaseSettings):
             raise ValueError("RHYTHM_COS_SECRET_ID and RHYTHM_COS_SECRET_KEY must be set together")
         if not 60 <= self.cos_presign_expires_seconds <= 3600:
             raise ValueError("RHYTHM_COS_PRESIGN_EXPIRES_SECONDS must be between 60 and 3600")
+        sources = [part.strip() for part in self.external_lyrics_sources.split(",") if part.strip()]
+        if not sources or not set(sources) <= {"netease", "tencent", "kugou"}:
+            raise ValueError(
+                "RHYTHM_EXTERNAL_LYRICS_SOURCES must list netease, tencent and/or kugou"
+            )
+        if not 1 <= self.external_lyrics_timeout_seconds <= 10:
+            raise ValueError("RHYTHM_EXTERNAL_LYRICS_TIMEOUT_SECONDS must be between 1 and 10")
         if not 60 <= self.public_access_token_ttl_seconds <= 3600:
             raise ValueError("public access token TTL must be between 60 and 3600 seconds")
         if not 60 <= self.public_admin_token_ttl_seconds <= PUBLIC_ADMIN_TOKEN_TTL_SECONDS:
@@ -90,8 +103,7 @@ class Settings(BaseSettings):
             )
         if self.chorus_cos_bucket and not (self.cos_secret_id and self.cos_secret_key):
             raise ValueError(
-                "RHYTHM_CHORUS_COS_BUCKET requires RHYTHM_COS_SECRET_ID and "
-                "RHYTHM_COS_SECRET_KEY"
+                "RHYTHM_CHORUS_COS_BUCKET requires RHYTHM_COS_SECRET_ID and RHYTHM_COS_SECRET_KEY"
             )
         if self.client_image_cos_bucket and not (self.cos_secret_id and self.cos_secret_key):
             raise ValueError(
@@ -126,7 +138,9 @@ class Settings(BaseSettings):
             ("RHYTHM_SONORUS_STABLE_CERTIFICATE_SHA256", self.sonorus_stable_certificate_sha256),
         ):
             normalized = digest.replace(":", "").lower()
-            if digest and (len(normalized) != 64 or any(c not in "0123456789abcdef" for c in normalized)):
+            if digest and (
+                len(normalized) != 64 or any(c not in "0123456789abcdef" for c in normalized)
+            ):
                 raise ValueError(f"{name} must be a SHA-256 fingerprint")
         return self
 

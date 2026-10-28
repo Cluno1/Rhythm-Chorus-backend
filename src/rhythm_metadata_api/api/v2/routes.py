@@ -14,6 +14,7 @@ from rhythm_metadata_api.application.catalog_service import (
     etag,
     parse_etag,
 )
+from rhythm_metadata_api.application.external_lyrics import ExternalLyricsService
 from rhythm_metadata_api.domain.v2.schemas import (
     ArrangementCreate,
     ArrangementPatch,
@@ -356,9 +357,7 @@ def create_lyric_source_document(
 
 
 @router.get("/lyric-source-documents", response_model=LyricSourceDocumentListResponse)
-def list_lyric_source_documents(
-    service: Catalog, _: Actor
-) -> LyricSourceDocumentListResponse:
+def list_lyric_source_documents(service: Catalog, _: Actor) -> LyricSourceDocumentListResponse:
     return service.list_lyric_source_documents()
 
 
@@ -412,9 +411,7 @@ def update_work_lyric_source_page(
     if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> Response:
     revision = require_if_match(if_match)
-    item = service.update_work_lyric_source_page(
-        work_id, link_id, body, revision, actor
-    )
+    item = service.update_work_lyric_source_page(work_id, link_id, body, revision, actor)
     return model_response(item, headers={"ETag": etag(revision + 1)})
 
 
@@ -505,9 +502,7 @@ def delete_score(
     actor: Actor,
     if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> Response:
-    return model_response(
-        service.delete_score(score_id, require_if_match(if_match), actor)
-    )
+    return model_response(service.delete_score(score_id, require_if_match(if_match), actor))
 
 
 @router.post("/scores/{score_id}/lyric-source-pages")
@@ -551,9 +546,7 @@ def create_score_revision(
 
 
 @router.get("/scores/{score_id}/revisions", response_model=ScoreRevisionListResponse)
-def list_score_revisions(
-    score_id: str, service: Catalog, _: Actor
-) -> ScoreRevisionListResponse:
+def list_score_revisions(score_id: str, service: Catalog, _: Actor) -> ScoreRevisionListResponse:
     return ScoreRevisionListResponse(items=service.list_score_revisions(score_id))
 
 
@@ -747,6 +740,39 @@ def search_library(
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
 ) -> dict[str, Any]:
     return service.search_library(q, type, limit).model_dump(mode="json")
+
+
+def external_lyrics(request: Request) -> ExternalLyricsService:
+    return request.app.state.v2_container.external_lyrics
+
+
+ExternalLyrics = Annotated[ExternalLyricsService, Depends(external_lyrics)]
+
+
+@router.get("/library/external-lyrics/search")
+def search_external_lyrics(
+    service: ExternalLyrics,
+    _: Actor,
+    q: Annotated[str, Query(min_length=1, max_length=100)],
+    limit: Annotated[int, Query(ge=1, le=50)] = 20,
+) -> dict[str, Any]:
+    """issue 127: same query rules as `/library/search?type=lyrics`, answered by public platforms."""
+    if not q.strip():
+        from rhythm_metadata_api.domain.v2.errors import V2DomainError
+
+        raise V2DomainError("q must not be blank")
+    return service.search(q, limit)
+
+
+@router.get("/library/external-lyrics/{source}/{external_id}")
+def get_external_lyrics(
+    source: str,
+    external_id: str,
+    service: ExternalLyrics,
+    _: Actor,
+    title: Annotated[str | None, Query(max_length=200)] = None,
+) -> dict[str, Any]:
+    return service.lyrics(source, external_id, title)
 
 
 @router.get("/library/tags")
