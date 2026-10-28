@@ -68,6 +68,17 @@ _CREDIT = re.compile(
     r"[^:：]{0,12}(?:录音师|工程师|制作|监制|编写))\s*[:：]",
     re.IGNORECASE,
 )
+# Before the first lyric line any short "label: value" line is a credit ("吉他/Bass：Juno Heo",
+# "合声：周杰伦", "Written by：Adele Adkins"); later lines with a colon are lyrics.
+_HEADER_CREDIT = re.compile(r"^[^:：]{1,24}[:：]")
+_INSTRUMENTAL_MARKERS = ("纯音乐", "純音樂", "没有填词", "沒有填詞", "instrumental")
+
+
+def is_instrumental(plain: str) -> bool:
+    """A placeholder such as "纯音乐，请欣赏" instead of lyrics (LRCLIB's ``instrumental``)."""
+    lines = [line for line in plain.splitlines() if line.strip()]
+    lowered = plain.casefold()
+    return len(lines) <= 2 and any(marker in lowered for marker in _INSTRUMENTAL_MARKERS)
 
 
 @dataclass(frozen=True)
@@ -137,7 +148,8 @@ def clean_lrc(lrc: str, title: str | None = None) -> tuple[str, str]:
         text = _TIMESTAMP.sub("", line).strip()
         if not stamps:
             continue
-        if _CREDIT.match(text):
+        in_header = not any(kept for _, kept in timed)
+        if _CREDIT.match(text) or (in_header and _HEADER_CREDIT.match(text)):
             continue
         # QQ/Kugou start with "旅人 - 王铮亮" at 00:00; NetEase with "作词 : …" (handled above).
         if (
@@ -360,7 +372,7 @@ class ExternalLyricsService:
                 raise V2Unavailable("malformed provider lyrics response", source=source)
             self._cache.put(key, data, LYRICS_TTL_SECONDS)
         synced, plain = clean_lrc(str(data.get("lyric") or ""), title)
-        if not plain:
+        if not plain or is_instrumental(plain):
             raise V2NotFound("this song has no lyrics on the source platform")
         translation_synced, translation = clean_lrc(str(data.get("tlyric") or ""), title)
         return {

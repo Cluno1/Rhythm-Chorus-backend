@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from fastapi.testclient import TestClient
 
-from rhythm_metadata_api.application.external_lyrics import clean_lrc
+from rhythm_metadata_api.application.external_lyrics import clean_lrc, is_instrumental
 from rhythm_metadata_api.core.config import Settings
 from rhythm_metadata_api.main import create_app
 from rhythm_metadata_api.public_main import _PUBLIC_READ_ROUTES
@@ -294,3 +294,30 @@ def test_匹配接口歌名歌手相同时时长更接近的排第一(env):
     }
     body = match(client, title="旅人", artist="罗云熙", duration=254).json()
     assert [item["external_id"] for item in body["items"]][:2] == ["222", "111"]
+
+
+def test_歌词开头的各类署名行都去掉但正文里带冒号的句子保留():
+    _, plain = clean_lrc(
+        "[00:00.00]吉他/Bass：Juno Heo @Finn music\n[00:01.00]合声：周杰伦\n"
+        "[00:02.00]Written by：Adele Adkins/Greg Kurstin\n[00:10.00]故事的小黄花\n[00:20.00]她说：别走\n"
+    )
+    assert plain == "故事的小黄花\n她说：别走"
+
+
+def test_纯音乐占位文字不算歌词():
+    assert is_instrumental("纯音乐，请欣赏")
+    assert is_instrumental("此歌曲为没有填词的纯音乐，请您欣赏")
+    assert not is_instrumental("纯音乐也能\n打动人心\n第三行歌词")
+
+
+def test_纯音乐版本在单首接口返回404且不进匹配结果(env):
+    client, provider = env
+    provider.lyrics_by_id["2067068109"] = {"lyric": "[00:00.00]纯音乐，请欣赏\n", "tlyric": ""}
+    assert (
+        client.get("/v2/library/external-lyrics/netease/2067068109", headers=AUTH).status_code
+        == 404
+    )
+    ids = [
+        item["external_id"] for item in match(client, title="旅人", artist="罗云熙").json()["items"]
+    ]
+    assert "2067068109" not in ids
