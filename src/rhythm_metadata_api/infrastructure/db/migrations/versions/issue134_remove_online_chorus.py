@@ -29,7 +29,7 @@ def upgrade() -> None:
     op.execute("""
         INSERT OR IGNORE INTO issue134_uploads
         SELECT upload_session_id FROM v2_chorus_tracks WHERE upload_session_id IS NOT NULL
-        UNION SELECT id FROM v2_upload_sessions WHERE source = 'chorus_track'
+        UNION SELECT id FROM v2_upload_sessions WHERE substr(source, 1, 7) = 'chorus_'
     """)
     op.execute("CREATE TEMP TABLE issue134_assets (id TEXT PRIMARY KEY)")
     op.execute("""
@@ -72,7 +72,7 @@ def upgrade() -> None:
         DELETE FROM v2_upload_sessions WHERE id IN (SELECT id FROM issue134_uploads)
         AND NOT EXISTS (SELECT 1 FROM v2_client_images WHERE upload_session_id = v2_upload_sessions.id)
     """)
-    op.execute("DELETE FROM v2_asset_sources WHERE source = 'chorus_track'")
+    op.execute("DELETE FROM v2_asset_sources WHERE substr(source, 1, 7) = 'chorus_'")
     # Keep any asset still used by another feature, including images and active uploads.
     op.execute("""
         CREATE TEMP TABLE issue134_exclusive_assets AS
