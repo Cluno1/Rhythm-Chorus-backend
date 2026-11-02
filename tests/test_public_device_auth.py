@@ -45,15 +45,6 @@ def test_effective_lyric_sources_is_public_read_only() -> None:
     assert not _public_read_allowed("POST", path)
 
 
-def test_chorus_public_routes_keep_audio_bytes_on_cos() -> None:
-    project_id = "00000000-0000-4000-8000-000000000001"
-    track_id = "00000000-0000-4000-8000-000000000002"
-    assert _public_read_allowed("GET", f"/v2/chorus-projects/{project_id}")
-    assert _public_write_allowed("POST", f"/v2/chorus-projects/{project_id}/tracks")
-    assert _public_write_allowed("POST", f"/v2/chorus-tracks/{track_id}/complete")
-    assert not _public_write_allowed("PUT", f"/v2/chorus-tracks/{track_id}/content")
-
-
 def test_latest_apk_browser_downloads_are_public_read_only() -> None:
     for channel in ("debug", "stable"):
         path = f"/v2/app-updates/{channel}/latest.apk"
@@ -323,27 +314,6 @@ def test_administrator_device_can_manage_devices_and_issue_invites_without_passw
         invitation = client.post(invite_path, content=invite_body, headers=invite_headers)
         assert invitation.status_code == 200, invitation.text
         assert invitation.json()["userId"] == "invited-by-device"
-
-        settings_path = "/v2/admin/chorus/moderation-settings"
-        settings_headers = signed_headers(client, credentials, key, settings_path)
-        moderation_settings = client.get(settings_path, headers=settings_headers)
-        assert moderation_settings.status_code == 200, moderation_settings.text
-        assert moderation_settings.json()["automatic_approval"] is True
-
-        settings_body = b'{"automatic_approval":false}'
-        settings_patch_headers = signed_headers(
-            client,
-            credentials,
-            key,
-            settings_path,
-            method="PATCH",
-            body=settings_body,
-        ) | {"Content-Type": "application/json"}
-        updated_settings = client.patch(
-            settings_path, content=settings_body, headers=settings_patch_headers
-        )
-        assert updated_settings.status_code == 200, updated_settings.text
-        assert updated_settings.json()["automatic_approval"] is False
 
         image_settings_path = "/v2/admin/shared-images/settings"
         image_settings_body = b'{"max_image_bytes":52428800}'

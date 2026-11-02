@@ -57,8 +57,6 @@ def test_pending_center_aggregates_without_mutating_catalog(tmp_path: Path) -> N
         assert response.status_code == 200, response.text
         assert response.headers["cache-control"] == "no-store"
         body = response.json()
-        assert body["tracks"] == {"items": [], "total": 0}
-        assert body["track_counts"] == {"pending_review": 0, "published": 0, "rejected": 0}
         assert body["unpublished_scores"]["total"] == 1
         assert body["unpublished_scores"]["items"][0]["label"] == "Unpublished"
         assert body["failed_uploads"]["total"] == 2
@@ -66,12 +64,3 @@ def test_pending_center_aggregates_without_mutating_catalog(tmp_path: Path) -> N
         assert body["failed_assets"]["total"] == 2
         assert {item["state"] for item in body["failed_assets"]["items"]} == {"rejected", "location_missing"}
         assert body["pending_assets"]["total"] == 1
-
-        updated = client.patch(
-            "/v2/management/chorus-moderation-settings",
-            headers={"Authorization": "Bearer pending-test-token"},
-            json={"automatic_approval": False},
-        )
-        assert updated.status_code == 200, updated.text
-        assert updated.json()["automatic_approval"] is False
-        assert client.get(path, headers={"Authorization": "Bearer pending-test-token"}).json()["moderation_settings"]["automatic_approval"] is False

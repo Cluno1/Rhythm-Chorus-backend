@@ -29,12 +29,8 @@ class Settings(BaseSettings):
     cos_secret_key: str = ""
     cos_region: str = "ap-guangzhou"
     cos_presign_expires_seconds: int = 900
-    chorus_cos_bucket: str = ""
-    chorus_ffmpeg_path: str = "ffmpeg"
-    chorus_mix_timeout_seconds: int = 10 * 60
 
     # Issue 91 client-owned images. This is a separate private bucket/control plane
-    # from chorus audio so it can fail closed until COS/CI is explicitly enabled.
     client_image_cos_bucket: str = ""
     client_image_preview_host: str = ""
     client_image_ci_enabled: bool = False
@@ -107,10 +103,6 @@ class Settings(BaseSettings):
                 "RHYTHM_SONORUS_UPDATES_COS_BUCKET requires RHYTHM_COS_SECRET_ID and "
                 "RHYTHM_COS_SECRET_KEY"
             )
-        if self.chorus_cos_bucket and not (self.cos_secret_id and self.cos_secret_key):
-            raise ValueError(
-                "RHYTHM_CHORUS_COS_BUCKET requires RHYTHM_COS_SECRET_ID and RHYTHM_COS_SECRET_KEY"
-            )
         if self.client_image_cos_bucket and not (self.cos_secret_id and self.cos_secret_key):
             raise ValueError(
                 "RHYTHM_CLIENT_IMAGE_COS_BUCKET requires RHYTHM_COS_SECRET_ID and "
@@ -137,8 +129,6 @@ class Settings(BaseSettings):
             raise ValueError("client image upload concurrency must be between 1 and 8")
         if self.client_image_storage_quota_bytes < self.client_image_max_bytes:
             raise ValueError("client image storage quota must allow at least one maximum image")
-        if not 30 <= self.chorus_mix_timeout_seconds <= 60 * 60:
-            raise ValueError("chorus mix timeout must be between 30 and 3600 seconds")
         for name, digest in (
             ("RHYTHM_SONORUS_DEBUG_CERTIFICATE_SHA256", self.sonorus_debug_certificate_sha256),
             ("RHYTHM_SONORUS_STABLE_CERTIFICATE_SHA256", self.sonorus_stable_certificate_sha256),

@@ -16,7 +16,7 @@ from rhythm_metadata_api.api.public_auth import router as public_auth_router
 from rhythm_metadata_api.api.public_updates import UpdateRepository
 from rhythm_metadata_api.api.public_updates import router as public_updates_router
 from rhythm_metadata_api.api.routes import health
-from rhythm_metadata_api.api.v2.chorus_routes import router as chorus_router
+from rhythm_metadata_api.api.v2.management_routes import router as management_router
 from rhythm_metadata_api.api.v2.image_routes import admin_router as image_admin_router
 from rhythm_metadata_api.api.v2.image_routes import router as image_router
 from rhythm_metadata_api.api.v2.room_routes import router as room_router
@@ -63,9 +63,6 @@ _PUBLIC_READ_ROUTES = (
     ("GET", re.compile(r"^/v2/assets/[^/]+/content$")),
     ("HEAD", re.compile(r"^/v2/assets/[^/]+/content$")),
     ("GET", re.compile(r"^/v2/sync/changes$")),
-    ("GET", re.compile(r"^/v2/works/[^/]+/chorus$")),
-    ("GET", re.compile(r"^/v2/chorus-projects/[^/]+$")),
-    ("GET", re.compile(r"^/v2/chorus-mixes/[^/]+$")),
     # issue 124：房间列表与详情。
     ("GET", re.compile(r"^/v2/rooms$")),
     ("GET", re.compile(r"^/v2/rooms/[^/]+$")),
@@ -93,12 +90,6 @@ _PUBLIC_WRITE_ROUTES = (
     ("POST", re.compile(r"^/v2/rooms/[^/]+/items$")),
     ("DELETE", re.compile(r"^/v2/rooms/[^/]+/items/[^/]+$")),
     ("PUT", re.compile(r"^/v2/rooms/[^/]+/order$")),
-    ("POST", re.compile(r"^/v2/chorus-projects/[^/]+/tracks$")),
-    ("POST", re.compile(r"^/v2/chorus-tracks/[^/]+/complete$")),
-    ("PATCH", re.compile(r"^/v2/chorus-tracks/[^/]+/alignment$")),
-    ("POST", re.compile(r"^/v2/chorus-tracks/[^/]+/submit$")),
-    ("DELETE", re.compile(r"^/v2/chorus-tracks/[^/]+$")),
-    ("POST", re.compile(r"^/v2/chorus-projects/[^/]+/mixes:resolve$")),
     ("POST", re.compile(r"^/v2/labs/image-upload-batches$")),
     ("POST", re.compile(r"^/v2/labs/image-upload-batches/[^/]+/cancel$")),
     ("POST", re.compile(r"^/v2/labs/image-uploads$")),
@@ -113,8 +104,6 @@ _PUBLIC_ADMIN_DEVICE_WRITE_ROUTES = (
     ("POST", re.compile(r"^/v2/admin/devices/[^/]+/administrator$")),
     ("DELETE", re.compile(r"^/v2/admin/devices/[^/]+/administrator$")),
     ("POST", re.compile(r"^/v2/admin/devices/[^/]+/revoke$")),
-    ("PATCH", re.compile(r"^/v2/admin/chorus/moderation-settings$")),
-    ("PATCH", re.compile(r"^/v2/admin/chorus/tracks/[^/]+/moderation$")),
     ("POST", re.compile(r"^/v2/admin/shared-images/thumbnail-deliveries$")),
     ("PATCH", re.compile(r"^/v2/admin/shared-images/settings$")),
 )
@@ -245,8 +234,6 @@ def public_actor_context(
                 required_scope = "catalog:work-tags:write"
             elif request.url.path.startswith("/v2/rooms"):
                 required_scope = "rooms:write"
-            else:
-                required_scope = "chorus:track:write-own"
         if required_scope is not None:
             request.app.state.device_auth.require_scope(token, required_scope)
     except (DeviceAuthError, UnicodeDecodeError) as error:
@@ -367,7 +354,7 @@ def create_public_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(public_auth_router)
     app.include_router(public_updates_router)
     app.include_router(v2_router)
-    app.include_router(chorus_router)
+    app.include_router(management_router)
     app.include_router(room_router)
     app.include_router(image_router)
     app.include_router(image_admin_router)

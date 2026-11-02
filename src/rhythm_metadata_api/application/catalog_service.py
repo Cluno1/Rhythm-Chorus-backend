@@ -118,10 +118,7 @@ from rhythm_metadata_api.infrastructure.db.models import (
     AssetSource,
     ChangeEvent,
     ChangeEventWork,
-    ChorusMixVariant,
-    ChorusProject,
-    ChorusTimeline,
-    ChorusTrack,
+    ClientImage,
     Contributor,
     IdempotencyKey,
     LyricSourceDocument,
@@ -197,8 +194,6 @@ def _rendition_format_map(rendition: Rendition) -> dict[str, str]:
 
 def _rendition_management_category(kind: str) -> str:
     normalized = kind.strip().lower()
-    if normalized == "chorus_track":
-        return "chorus_track"
     if normalized in {"rehearsal", "reference_audio", "reference_midi"}:
         return "reference_resource"
     return "finished_audio"
@@ -1428,14 +1423,6 @@ class CatalogService:
                 },
             )
             session.flush()
-            if request.publish:
-                self._open_chorus_project_for_published_revision(
-                    session,
-                    work_id=arrangement.work_id,
-                    score=score,
-                    score_revision=revision,
-                    actor=actor,
-                )
             return (
                 ScoreWithRevisionResponse(
                     score=self._score_response(session, score),
@@ -1578,100 +1565,7 @@ class CatalogService:
                 actor,
                 {"fields": sorted(changes)},
             )
-            if published is not None:
-                self._open_chorus_project_for_published_revision(
-                    uow.session,
-                    work_id=work_id,
-                    score=score,
-                    score_revision=revision,
-                    actor=actor,
-                )
             return self._score_response(uow.session, score)
-
-    def _open_chorus_project_for_published_revision(
-        self,
-        session: Session,
-        *,
-        work_id: str,
-        score: Score,
-        score_revision: ScoreRevision,
-        actor: ActorContext,
-    ) -> None:
-        template = session.scalar(
-            select(ChorusProject)
-            .where(
-                ChorusProject.work_id == work_id,
-                ChorusProject.status == "open",
-                ChorusProject.deleted_at.is_(None),
-            )
-            .order_by(ChorusProject.created_at, ChorusProject.id)
-        )
-        if template is None:
-            return
-        project = session.scalar(
-            select(ChorusProject).where(
-                ChorusProject.work_id == work_id,
-                ChorusProject.score_id == score.id,
-                ChorusProject.deleted_at.is_(None),
-            )
-        )
-        timeline_hash = session.scalar(
-            select(Asset.sha256)
-            .join(ScoreRevisionAsset, ScoreRevisionAsset.asset_id == Asset.id)
-            .where(
-                ScoreRevisionAsset.score_revision_id == score_revision.id,
-                ScoreRevisionAsset.role == "primary_musicxml",
-                Asset.state == "ready",
-                Asset.deleted_at.is_(None),
-            )
-        )
-        if timeline_hash is None:
-            raise V2Conflict("published score revision has no ready primary MusicXML")
-        if project is None:
-            project = ChorusProject(
-                work_id=work_id,
-                arrangement_id=score.arrangement_id,
-                score_id=score.id,
-                alignment_score_revision_id=score_revision.id,
-                timeline_hash=timeline_hash,
-                title=template.title,
-                status="open",
-                created_by_user_id=actor.actor_id,
-            )
-            session.add(project)
-            session.flush()
-            operation = "chorus_project.created"
-        else:
-            existing_timeline = session.scalar(
-                select(ChorusTimeline.id).where(
-                    ChorusTimeline.chorus_project_id == project.id,
-                    ChorusTimeline.score_revision_id == score_revision.id,
-                    ChorusTimeline.deleted_at.is_(None),
-                )
-            )
-            if existing_timeline is not None:
-                return
-            project.revision += 1
-            project.updated_at = utc_now()
-            operation = "chorus_timeline.created"
-        session.add(
-            ChorusTimeline(
-                chorus_project_id=project.id,
-                score_revision_id=score_revision.id,
-                timeline_hash=timeline_hash,
-            )
-        )
-        session.flush()
-        self._append_event(
-            session,
-            work_id,
-            "chorus_project",
-            project.id,
-            project.revision,
-            operation,
-            actor,
-            {"source": "score_revision_published", "score_revision_id": score_revision.id},
-        )
 
     def create_score_revision(
         self,
@@ -1791,11 +1685,6 @@ class CatalogService:
             arrangement = self._require_arrangement(session, score.arrangement_id)
             entity_revision = score.revision
             revision_ids: set[str] = context["revision_ids"]
-            project_ids: set[str] = context["project_ids"]
-            timeline_ids: set[str] = context["timeline_ids"]
-            track_ids: set[str] = context["track_ids"]
-            chorus_rendition_ids: set[str] = context["chorus_rendition_ids"]
-            upload_session_ids: set[str] = context["upload_session_ids"]
             candidate_asset_ids: set[str] = context["candidate_asset_ids"]
 
             if arrangement.preferred_score_id == score.id:
@@ -1821,54 +1710,11 @@ class CatalogService:
                     )
                     .values(derived_from_revision_id=None)
                 )
-            if project_ids:
+            if revision_ids:
                 session.execute(
-                    delete(ChorusMixVariant).where(
-                        ChorusMixVariant.chorus_project_id.in_(project_ids)
+                    delete(ScoreRenditionSync).where(
+                        ScoreRenditionSync.score_revision_id.in_(revision_ids)
                     )
-                )
-            if track_ids:
-                session.execute(delete(ChorusTrack).where(ChorusTrack.id.in_(track_ids)))
-            if timeline_ids:
-                session.execute(
-                    delete(ChorusTimeline).where(ChorusTimeline.id.in_(timeline_ids))
-                )
-            if project_ids:
-                session.execute(
-                    delete(ChorusProject).where(ChorusProject.id.in_(project_ids))
-                )
-            if upload_session_ids:
-                session.execute(
-                    delete(UploadSession).where(UploadSession.id.in_(upload_session_ids))
-                )
-            if revision_ids or chorus_rendition_ids:
-                conditions = []
-                if revision_ids:
-                    conditions.append(ScoreRenditionSync.score_revision_id.in_(revision_ids))
-                if chorus_rendition_ids:
-                    conditions.append(ScoreRenditionSync.rendition_id.in_(chorus_rendition_ids))
-                session.execute(delete(ScoreRenditionSync).where(or_(*conditions)))
-            if chorus_rendition_ids:
-                session.execute(
-                    delete(ReleaseItem).where(ReleaseItem.rendition_id.in_(chorus_rendition_ids))
-                )
-                session.execute(
-                    delete(LyricSourceLink).where(
-                        LyricSourceLink.rendition_id.in_(chorus_rendition_ids)
-                    )
-                )
-                session.execute(
-                    delete(RenditionCredit).where(
-                        RenditionCredit.rendition_id.in_(chorus_rendition_ids)
-                    )
-                )
-                session.execute(
-                    delete(RenditionAsset).where(
-                        RenditionAsset.rendition_id.in_(chorus_rendition_ids)
-                    )
-                )
-                session.execute(
-                    delete(Rendition).where(Rendition.id.in_(chorus_rendition_ids))
                 )
             session.execute(delete(LyricSourceLink).where(LyricSourceLink.score_id == score.id))
             if revision_ids:
@@ -1951,146 +1797,35 @@ class CatalogService:
         revision_ids = set(
             session.scalars(select(ScoreRevision.id).where(ScoreRevision.score_id == score.id))
         )
-        project_conditions = [ChorusProject.score_id == score.id]
-        if revision_ids:
-            project_conditions.extend(
-                [
-                    ChorusProject.alignment_score_revision_id.in_(revision_ids),
-                    ChorusProject.id.in_(
-                        select(ChorusTimeline.chorus_project_id).where(
-                            ChorusTimeline.score_revision_id.in_(revision_ids)
-                        )
-                    ),
-                ]
-            )
-        project_ids = set(
-            session.scalars(select(ChorusProject.id).where(or_(*project_conditions)))
-        )
-        timeline_ids = set()
-        track_rows: list[tuple[str, str, str | None]] = []
-        mix_asset_ids: set[str] = set()
-        if project_ids:
-            timeline_ids = set(
-                session.scalars(
-                    select(ChorusTimeline.id).where(
-                        ChorusTimeline.chorus_project_id.in_(project_ids)
-                    )
+        score_asset_rows = list(
+            session.execute(
+                select(ScoreRevisionAsset.asset_id).where(
+                    ScoreRevisionAsset.score_revision_id.in_(revision_ids)
                 )
             )
-            track_rows = list(
-                session.execute(
-                    select(
-                        ChorusTrack.id,
-                        ChorusTrack.rendition_id,
-                        ChorusTrack.upload_session_id,
-                    ).where(ChorusTrack.chorus_project_id.in_(project_ids))
-                )
-            )
-            mix_asset_ids = {
-                asset_id
-                for asset_id in session.scalars(
-                    select(ChorusMixVariant.asset_id).where(
-                        ChorusMixVariant.chorus_project_id.in_(project_ids)
-                    )
-                )
-                if asset_id is not None
-            }
-        track_ids = {row[0] for row in track_rows}
-        chorus_rendition_ids = {row[1] for row in track_rows}
-        referenced_upload_session_ids = {row[2] for row in track_rows if row[2] is not None}
-        upload_session_ids = {
-            upload_id
-            for upload_id in referenced_upload_session_ids
-            if session.scalar(
-                select(ChorusTrack.id)
-                .where(
-                    ChorusTrack.upload_session_id == upload_id,
-                    ChorusTrack.id.not_in(track_ids),
-                )
-                .limit(1)
-            )
-            is None
-        }
-        upload_asset_ids = {
-            asset_id
-            for asset_id in session.scalars(
-                select(UploadSession.completed_asset_id).where(
-                    UploadSession.id.in_(upload_session_ids)
-                )
-            )
-            if asset_id is not None
-        }
-
-        score_asset_ids: set[str] = set()
-        score_file_links = 0
-        if revision_ids:
-            score_asset_rows = list(
-                session.execute(
-                    select(ScoreRevisionAsset.asset_id).where(
-                        ScoreRevisionAsset.score_revision_id.in_(revision_ids)
-                    )
-                )
-            )
-            score_file_links = len(score_asset_rows)
-            score_asset_ids = {row[0] for row in score_asset_rows}
-        rendition_asset_ids: set[str] = set()
-        rendition_cover_asset_ids: set[str] = set()
-        if chorus_rendition_ids:
-            rendition_asset_ids = set(
-                session.scalars(
-                    select(RenditionAsset.asset_id).where(
-                        RenditionAsset.rendition_id.in_(chorus_rendition_ids)
-                    )
-                )
-            )
-            rendition_cover_asset_ids = {
-                asset_id
-                for asset_id in session.scalars(
-                    select(Rendition.cover_asset_id).where(
-                        Rendition.id.in_(chorus_rendition_ids)
-                    )
-                )
-                if asset_id is not None
-            }
-        candidate_asset_ids = (
-            score_asset_ids
-            | rendition_asset_ids
-            | rendition_cover_asset_ids
-            | mix_asset_ids
-            | upload_asset_ids
-        )
+        ) if revision_ids else []
+        candidate_asset_ids = {row[0] for row in score_asset_rows}
         shared_asset_ids = {
-            asset_id
-            for asset_id in candidate_asset_ids
+            asset_id for asset_id in candidate_asset_ids
             if self._asset_has_reference_outside_score_branch(
-                session,
-                asset_id,
-                revision_ids=revision_ids,
-                rendition_ids=chorus_rendition_ids,
-                project_ids=project_ids,
-                track_ids=track_ids,
+                session, asset_id, revision_ids=revision_ids
             )
         }
-
-        sync_conditions = []
-        if revision_ids:
-            sync_conditions.append(ScoreRenditionSync.score_revision_id.in_(revision_ids))
-        if chorus_rendition_ids:
-            sync_conditions.append(ScoreRenditionSync.rendition_id.in_(chorus_rendition_ids))
         sync_anchors = session.scalar(
-            select(func.count()).select_from(ScoreRenditionSync).where(or_(*sync_conditions))
-        ) if sync_conditions else 0
-        lyric_conditions = [LyricSourceLink.score_id == score.id]
-        if chorus_rendition_ids:
-            lyric_conditions.append(LyricSourceLink.rendition_id.in_(chorus_rendition_ids))
+            select(func.count()).select_from(ScoreRenditionSync).where(
+                ScoreRenditionSync.score_revision_id.in_(revision_ids)
+            )
+        ) if revision_ids else 0
         impact = ScoreDeleteImpactResponse(
             score_id=score.id,
             work_id=arrangement.work_id,
             arrangement_id=arrangement.id,
             revisions=len(revision_ids),
-            score_file_links=score_file_links,
+            score_file_links=len(score_asset_rows),
             lyric_source_links=session.scalar(
-                select(func.count()).select_from(LyricSourceLink).where(or_(*lyric_conditions))
+                select(func.count()).select_from(LyricSourceLink).where(
+                    LyricSourceLink.score_id == score.id
+                )
             ) or 0,
             sync_anchors=sync_anchors or 0,
             detached_derived_scores=session.scalar(
@@ -2099,31 +1834,12 @@ class CatalogService:
                     Score.derived_from_revision_id.in_(revision_ids),
                 )
             ) if revision_ids else 0,
-            chorus_projects=len(project_ids),
-            chorus_timelines=len(timeline_ids),
-            chorus_tracks=len(track_ids),
-            upload_sessions=len(upload_session_ids),
-            chorus_renditions=len(chorus_rendition_ids),
-            release_items=session.scalar(
-                select(func.count()).select_from(ReleaseItem).where(
-                    ReleaseItem.rendition_id.in_(chorus_rendition_ids)
-                )
-            ) if chorus_rendition_ids else 0,
             candidate_assets=len(candidate_asset_ids),
             garbage_collect_assets=len(candidate_asset_ids - shared_asset_ids),
             shared_assets=len(shared_asset_ids),
             clears_preferred_score=arrangement.preferred_score_id == score.id,
         )
-        return {
-            "impact": impact,
-            "revision_ids": revision_ids,
-            "project_ids": project_ids,
-            "timeline_ids": timeline_ids,
-            "track_ids": track_ids,
-            "chorus_rendition_ids": chorus_rendition_ids,
-            "upload_session_ids": upload_session_ids,
-            "candidate_asset_ids": candidate_asset_ids,
-        }
+        return {"impact": impact, "revision_ids": revision_ids, "candidate_asset_ids": candidate_asset_ids}
 
     @staticmethod
     def _asset_has_reference_outside_score_branch(
@@ -2131,78 +1847,28 @@ class CatalogService:
         asset_id: str,
         *,
         revision_ids: set[str],
-        rendition_ids: set[str],
-        project_ids: set[str],
-        track_ids: set[str],
     ) -> bool:
-        direct_checks = [
-            select(Work.id).where(Work.cover_asset_id == asset_id),
-            select(Arrangement.id).where(Arrangement.cover_asset_id == asset_id),
-            select(Release.id).where(Release.cover_asset_id == asset_id),
-            select(LyricSourceDocument.id).where(
-                LyricSourceDocument.document_asset_id == asset_id
-            ),
-            select(LyricSourcePage.id).where(LyricSourcePage.image_asset_id == asset_id),
-        ]
-        if session.scalar(
-            select(Rendition.id).where(
-                Rendition.cover_asset_id == asset_id,
-                Rendition.id.not_in(rendition_ids),
-            ).limit(1)
-        ) is not None:
-            return True
-        if session.scalar(
-            select(ScoreRevisionAsset.id).where(
-                ScoreRevisionAsset.asset_id == asset_id,
-                ScoreRevisionAsset.score_revision_id.not_in(revision_ids),
-            ).limit(1)
-        ) is not None:
-            return True
-        if session.scalar(
-            select(RenditionAsset.id).where(
-                RenditionAsset.asset_id == asset_id,
-                RenditionAsset.rendition_id.not_in(rendition_ids),
-            ).limit(1)
-        ) is not None:
-            return True
-        if session.scalar(
-            select(ChorusMixVariant.id).where(
-                ChorusMixVariant.asset_id == asset_id,
-                ChorusMixVariant.chorus_project_id.not_in(project_ids),
-            ).limit(1)
-        ) is not None:
-            return True
-        if session.scalar(
-            select(ChorusTrack.id)
-            .join(UploadSession, UploadSession.id == ChorusTrack.upload_session_id)
-            .where(
-                UploadSession.completed_asset_id == asset_id,
-                ChorusTrack.id.not_in(track_ids),
-            )
-            .limit(1)
-        ) is not None:
-            return True
-        return any(session.scalar(statement.limit(1)) is not None for statement in direct_checks)
-
-    @staticmethod
-    def _asset_has_live_business_reference(session: Session, asset_id: str) -> bool:
         checks = [
             select(Work.id).where(Work.cover_asset_id == asset_id),
             select(Arrangement.id).where(Arrangement.cover_asset_id == asset_id),
             select(Rendition.id).where(Rendition.cover_asset_id == asset_id),
             select(Release.id).where(Release.cover_asset_id == asset_id),
-            select(LyricSourceDocument.id).where(
-                LyricSourceDocument.document_asset_id == asset_id
-            ),
+            select(LyricSourceDocument.id).where(LyricSourceDocument.document_asset_id == asset_id),
             select(LyricSourcePage.id).where(LyricSourcePage.image_asset_id == asset_id),
-            select(ScoreRevisionAsset.id).where(ScoreRevisionAsset.asset_id == asset_id),
+            select(ClientImage.id).where(ClientImage.asset_id == asset_id),
+            select(ScoreRevisionAsset.id).where(
+                ScoreRevisionAsset.asset_id == asset_id,
+                ScoreRevisionAsset.score_revision_id.not_in(revision_ids),
+            ),
             select(RenditionAsset.id).where(RenditionAsset.asset_id == asset_id),
-            select(ChorusMixVariant.id).where(ChorusMixVariant.asset_id == asset_id),
-            select(ChorusTrack.id)
-            .join(UploadSession, UploadSession.id == ChorusTrack.upload_session_id)
-            .where(UploadSession.completed_asset_id == asset_id),
         ]
         return any(session.scalar(statement.limit(1)) is not None for statement in checks)
+
+    @staticmethod
+    def _asset_has_live_business_reference(session: Session, asset_id: str) -> bool:
+        return CatalogService._asset_has_reference_outside_score_branch(
+            session, asset_id, revision_ids=set()
+        )
 
     def create_rendition(
         self,

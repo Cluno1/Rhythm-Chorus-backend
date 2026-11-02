@@ -11,7 +11,6 @@ from rhythm_metadata_api.infrastructure.db.models import (
     Asset,
     ChangeEvent,
     ChangeEventWork,
-    ChorusProject,
     Rendition,
     Score,
     Work,
@@ -23,7 +22,7 @@ class OverviewService:
     def __init__(self, uow_factory: UnitOfWorkFactory) -> None:
         self.uow_factory = uow_factory
 
-    def summary(self, pending_tracks: int) -> dict[str, object]:
+    def summary(self) -> dict[str, object]:
         pending = PendingCenterService(self.uow_factory).summary(limit=0)
         with self.uow_factory() as uow:
             session = uow.session
@@ -71,11 +70,6 @@ class OverviewService:
                         Asset.deleted_at.is_(None), Asset.state == "ready"
                     )
                 ),
-                "chorus_projects": count(
-                    select(func.count(ChorusProject.id))
-                    .join(Work, Work.id == ChorusProject.work_id)
-                    .where(ChorusProject.deleted_at.is_(None), *live_works)
-                ),
             }
             recent_works = session.scalars(
                 select(Work)
@@ -96,7 +90,6 @@ class OverviewService:
                 "generated_at": utc_now().isoformat(),
                 "counts": counts,
                 "attention": {
-                    "pending_tracks": pending_tracks,
                     "unpublished_scores": pending.unpublished_scores.total,
                     "failed_uploads": pending.failed_uploads.total,
                     "failed_assets": pending.failed_assets.total,

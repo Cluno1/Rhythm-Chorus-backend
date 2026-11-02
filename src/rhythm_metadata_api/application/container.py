@@ -6,7 +6,6 @@ from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session, aliased
 
 from rhythm_metadata_api.application.catalog_service import CatalogService
-from rhythm_metadata_api.application.chorus_service import ChorusService
 from rhythm_metadata_api.application.client_image_service import ClientImageService
 from rhythm_metadata_api.application.external_lyrics import ExternalLyricsService
 from rhythm_metadata_api.application.room_service import RoomService
@@ -27,7 +26,6 @@ class V2Container:
     settings: Settings
     engine: Engine
     catalog: CatalogService
-    chorus: ChorusService
     client_images: ClientImageService
     rooms: RoomService
     external_lyrics: ExternalLyricsService
@@ -60,7 +58,6 @@ class V2Container:
         sessions = create_session_factory(engine)
         storage = LocalAssetStorage(settings.local_object_root)
         catalog = CatalogService(UnitOfWorkFactory(sessions), storage, settings)
-        chorus = ChorusService(UnitOfWorkFactory(sessions), storage, settings)
         client_images = ClientImageService(
             UnitOfWorkFactory(sessions), settings, TencentCosImageGateway(settings)
         )
@@ -88,7 +85,6 @@ class V2Container:
             settings=settings,
             engine=engine,
             catalog=catalog,
-            chorus=chorus,
             client_images=client_images,
             rooms=rooms,
             external_lyrics=external_lyrics,

@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
-from rhythm_metadata_api.api.v2.chorus_routes import _prepare_default_mix
-from rhythm_metadata_api.api.v2.routes import model_response, require_if_match
 from rhythm_metadata_api.application.catalog_service import ActorContext
-from rhythm_metadata_api.application.chorus_service import ChorusService
 from rhythm_metadata_api.application.device_auth import DeviceAuthError, DeviceAuthService, _aware
 from rhythm_metadata_api.domain.auth_schemas import (
     AdminDeviceListResponse,
@@ -28,11 +25,6 @@ from rhythm_metadata_api.domain.auth_schemas import (
     InviteCreateResponse,
     NonceResponse,
     RevokeResponse,
-)
-from rhythm_metadata_api.domain.v2.chorus import (
-    ChorusModerationRequest,
-    ChorusModerationSettingsPatch,
-    ChorusModerationSettingsResponse,
 )
 from rhythm_metadata_api.infrastructure.db.models import utc_now
 
@@ -109,10 +101,6 @@ def admin_actor_context(
 
 
 AdminActor = Annotated[ActorContext, Depends(admin_actor_context)]
-
-
-def chorus_service(request: Request) -> ChorusService:
-    return request.app.state.v2_container.chorus
 
 
 @router.post("/admin/session", response_model=AdminSessionResponse)
@@ -270,53 +258,6 @@ def revoke_device(
     except DeviceAuthError as error:
         _raise(error)
     return RevokeResponse(revoked=revoked)
-
-
-@router.get("/admin/chorus/moderation-settings", response_model=ChorusModerationSettingsResponse)
-def get_chorus_moderation_settings(
-    request: Request, _: AdminActor
-) -> ChorusModerationSettingsResponse:
-    return chorus_service(request).moderation_settings()
-
-
-@router.patch("/admin/chorus/moderation-settings")
-def patch_chorus_moderation_settings(
-    body: ChorusModerationSettingsPatch,
-    request: Request,
-    admin: AdminActor,
-):
-    return model_response(
-        chorus_service(request).update_moderation_settings(body.automatic_approval, admin)
-    )
-
-
-@router.get("/admin/chorus/tracks")
-def list_chorus_tracks_for_moderation(
-    request: Request,
-    admin: AdminActor,
-    status: Annotated[
-        Literal["pending_review", "published", "rejected"], Query()
-    ] = "pending_review",
-    limit: Annotated[int, Query(ge=1, le=200)] = 100,
-    offset: Annotated[int, Query(ge=0)] = 0,
-):
-    return model_response(chorus_service(request).list_tracks_for_moderation(status, admin, limit, offset))
-
-
-@router.patch("/admin/chorus/tracks/{track_id}/moderation")
-def moderate_chorus_track(
-    track_id: str,
-    body: ChorusModerationRequest,
-    request: Request,
-    admin: AdminActor,
-    background_tasks: BackgroundTasks,
-    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
-):
-    chorus = chorus_service(request)
-    item = chorus.moderate_track(track_id, body, require_if_match(if_match), admin)
-    if item.status == "published":
-        background_tasks.add_task(_prepare_default_mix, chorus, item.chorus_project_id)
-    return model_response(item, headers={"ETag": f'"rev-{item.revision}"'})
 
 
 @router.post("/device/challenge", response_model=NonceResponse)

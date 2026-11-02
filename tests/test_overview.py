@@ -62,7 +62,6 @@ def test_management_overview_counts_live_catalog_and_recent_activity(tmp_path: P
             "renditions": 1,
             "assets": 1,
             "ready_assets": 1,
-            "chorus_projects": 0,
         }
         assert body["attention"]["unpublished_scores"] == 1
         assert body["recent_works"][0]["title"] == "Live Work"

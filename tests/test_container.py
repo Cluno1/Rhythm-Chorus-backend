@@ -155,7 +155,7 @@ def test_multi_device_migration_backfills_slots_and_supports_safe_downgrade(
     connection.commit()
     connection.close()
 
-    command.upgrade(config, "head")
+    command.upgrade(config, "issue83multidevice")
     connection = sqlite3.connect(database)
     slots = connection.execute(
         "SELECT id, active_slot FROM auth_devices ORDER BY id"

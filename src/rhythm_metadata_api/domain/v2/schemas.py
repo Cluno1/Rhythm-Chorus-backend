@@ -555,12 +555,6 @@ class ScoreDeleteImpactResponse(ApiModel):
     lyric_source_links: int
     sync_anchors: int
     detached_derived_scores: int
-    chorus_projects: int
-    chorus_timelines: int
-    chorus_tracks: int
-    upload_sessions: int
-    chorus_renditions: int
-    release_items: int
     candidate_assets: int
     garbage_collect_assets: int
     shared_assets: int
@@ -686,7 +680,7 @@ class RenditionResponse(LocalizedLyricsResponse):
     recorded_at: str | None
     location: str | None
     duration_ms: int | None
-    management_category: Literal["finished_audio", "reference_resource", "chorus_track"]
+    management_category: Literal["finished_audio", "reference_resource"]
     cover_asset_id: str | None
     credits: list[RenditionCreditResponse]
     release_placements: list[RenditionReleasePlacementResponse]
