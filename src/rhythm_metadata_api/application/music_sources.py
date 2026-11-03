@@ -10,12 +10,14 @@ from time import monotonic
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from rhythm_metadata_api.application.music_adapters import (
+    _ARTWORK_HOSTS,
+    _AUDIO_HOSTS,
     _ID,
     ADAPTERS,
     adapter_kinds,
@@ -33,6 +35,36 @@ from rhythm_metadata_api.infrastructure.db.models import MusicSongMetadata, Musi
 
 _SOURCE_ID = re.compile(r"^[a-z][a-z0-9_-]{1,39}$")
 _AUDIO_URL_TTL_SECONDS = 150
+_HOST = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.IGNORECASE)
+
+
+class MusicSourceConfig(BaseModel):
+    audio_hosts: list[str] = Field(default_factory=lambda: sorted(_AUDIO_HOSTS), max_length=20)
+    artwork_hosts: list[str] = Field(default_factory=lambda: sorted(_ARTWORK_HOSTS), max_length=20)
+    upstream_source: str = Field(default="酷我音乐", min_length=1, max_length=80)
+    audio_url_ttl_seconds: int = Field(default=_AUDIO_URL_TTL_SECONDS, ge=0, le=600)
+
+    @field_validator("audio_hosts", "artwork_hosts")
+    @classmethod
+    def valid_hosts(cls, values: list[str]) -> list[str]:
+        normalized = [value.strip().lower() for value in values]
+        if any(len(value) > 253 or not _HOST.fullmatch(value) for value in normalized):
+            raise ValueError("enter exact public DNS hostnames without a scheme, port or wildcard")
+        for value in normalized:
+            try:
+                ipaddress.ip_address(value)
+            except ValueError:
+                continue
+            raise ValueError("IP addresses are not allowed in upstream host rules")
+        return list(dict.fromkeys(normalized))
+
+    @field_validator("upstream_source")
+    @classmethod
+    def valid_upstream_source(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("upstream source is required")
+        return value
 
 
 class MusicSourceCreate(BaseModel):
@@ -42,6 +74,7 @@ class MusicSourceCreate(BaseModel):
     base_url: str = Field(min_length=1, max_length=500)
     enabled: bool = False
     priority: int = Field(default=100, ge=0, le=10000)
+    config: MusicSourceConfig = Field(default_factory=MusicSourceConfig)
 
 
 class MusicSourcePatch(BaseModel):
@@ -50,6 +83,7 @@ class MusicSourcePatch(BaseModel):
     base_url: str | None = Field(default=None, min_length=1, max_length=500)
     enabled: bool | None = None
     priority: int | None = Field(default=None, ge=0, le=10000)
+    config: MusicSourceConfig | None = None
 
 
 class MusicSongMetadataWrite(BaseModel):
@@ -139,6 +173,7 @@ def serialize_source(source: MusicSource) -> dict:
         "name": source.name,
         "adapter": source.adapter,
         "base_url": source.base_url,
+        "config": source.config,
         "enabled": source.enabled,
         "priority": source.priority,
         "revision": source.revision,
@@ -212,7 +247,7 @@ class MusicSourceService:
         source = MusicSource(
             id=data.id, name=data.name.strip(), adapter=data.adapter,
             base_url=validate_base_url(data.base_url), enabled=data.enabled,
-            priority=data.priority, revision=1,
+            priority=data.priority, config=data.config.model_dump(), revision=1,
         )
         if not source.name:
             raise V2DomainError("source name is required")
@@ -249,6 +284,10 @@ class MusicSourceService:
                 if data.priority is None:
                     raise V2DomainError("priority must be an integer")
                 changes["priority"] = data.priority
+            if "config" in fields:
+                if data.config is None:
+                    raise V2DomainError("source config is required")
+                changes["config"] = data.config.model_dump()
             changes["revision"] = data.revision + 1
             changes["updated_at"] = utc_now()
             result = session.execute(
@@ -274,7 +313,14 @@ class MusicSourceService:
         adapter = ADAPTERS.get(source.adapter)
         if adapter is None:
             raise V2Unavailable("configured music adapter is not installed")
-        return adapter
+        return adapter.configured(source.config) if hasattr(adapter, "configured") else adapter
+
+    def artwork_hosts(self, source_id: str | None = None) -> frozenset[str]:
+        sources = [self._active(source_id)] if source_id else self._enabled_sources()
+        return frozenset(
+            host for source in sources
+            for host in MusicSourceConfig.model_validate(source.config).artwork_hosts
+        )
 
     def _id(self, value: str) -> str:
         if not _ID.fullmatch(value):
@@ -290,7 +336,7 @@ class MusicSourceService:
             return serialize_metadata(item, self.images)
 
     def put_metadata(self, source_id: str, song_id: str, data: MusicSongMetadataWrite) -> dict:
-        self._active(source_id)
+        source = self._active(source_id)
         song_id = self._id(song_id)
         title = data.title.strip()
         artists = [name.strip() for name in data.artists]
@@ -303,7 +349,7 @@ class MusicSourceService:
                 raise V2DomainError("invalid music image URL") from error
             checked = _image_url(normalized)
             try:
-                return self.images.archive(checked)
+                return self.images.archive(checked, hosts=self.artwork_hosts(source.id))
             except MusicImageArchiveError:
                 # Keep the display URL; administrators can retry archival later.
                 return checked
@@ -339,7 +385,7 @@ class MusicSourceService:
             for field in ("artwork_url", "artist_avatar_url"):
                 original = getattr(item, field)
                 try:
-                    archived = self.images.archive(original)
+                    archived = self.images.archive(original, hosts=self.artwork_hosts(source_id))
                 except MusicImageArchiveError:
                     continue
                 if archived != original:
@@ -452,7 +498,8 @@ class MusicSourceService:
                 return cached[1]
             url = self._adapter(source).audio_url(source.base_url, song_id, quality)
             with self._audio_urls_guard:
-                self._audio_urls[key] = (monotonic() + _AUDIO_URL_TTL_SECONDS, url)
+                ttl = MusicSourceConfig.model_validate(source.config).audio_url_ttl_seconds
+                self._audio_urls[key] = (monotonic() + ttl, url)
                 if len(self._audio_urls) > 1000:
                     now = monotonic()
                     self._audio_urls = {

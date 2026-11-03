@@ -42,6 +42,7 @@ class MusicSource(Base):
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     adapter: Mapped[str] = mapped_column(String(40), nullable=False)
     base_url: Mapped[str] = mapped_column(String(500), nullable=False)
+    config: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)

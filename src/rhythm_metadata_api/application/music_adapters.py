@@ -10,6 +10,7 @@ import ipaddress
 import json
 import re
 import socket
+from copy import copy
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
@@ -123,6 +124,15 @@ class FeiniaoAdapter:
 
     def __init__(self, fetch=fetch_json) -> None:
         self.fetch = fetch
+        self.audio_hosts = _AUDIO_HOSTS
+        self.artwork_hosts = _ARTWORK_HOSTS
+
+    def configured(self, config: dict) -> FeiniaoAdapter:
+        adapter = copy(self)
+        adapter.audio_hosts = frozenset(config["audio_hosts"])
+        adapter.artwork_hosts = frozenset(config["artwork_hosts"])
+        adapter.upstream_source = config["upstream_source"]
+        return adapter
 
     def _get(self, base_url: str, api: str, **params: object) -> dict:
         # No arbitrary path/query is taken from clients. Every supported operation is a fixed GET.
@@ -135,14 +145,13 @@ class FeiniaoAdapter:
             raise V2Unavailable("music upstream rejected the request")
         return payload
 
-    @staticmethod
-    def _song(source_id: str, item: dict) -> dict | None:
+    def _song(self, source_id: str, item: dict) -> dict | None:
         rid = str(item.get("rid") or "")
         if not _ID.fullmatch(rid):
             return None
         duration = item.get("duration")
         duration_ms = int(duration) * 1000 if isinstance(duration, (int, float)) else None
-        artwork = FeiniaoAdapter._artwork(item.get("pic"))
+        artwork = self._artwork(item.get("pic"), source_id)
         return {
             "id": f"{source_id}:{rid}",
             "source_id": source_id,
@@ -154,21 +163,19 @@ class FeiniaoAdapter:
             "artwork_url": artwork,
         }
 
-    @staticmethod
-    def _artwork(value: object) -> str | None:
+    def _artwork(self, value: object, source_id: str) -> str | None:
         if not isinstance(value, str) or len(value) > 2000:
             return None
         try:
             parts = urlsplit(value)
-            if parts.scheme not in {"http", "https"} or parts.hostname not in _ARTWORK_HOSTS:
+            if parts.scheme not in {"http", "https"} or parts.hostname not in self.artwork_hosts:
                 return None
         except ValueError:
             return None
-        return f"/v2/music/artwork?url={quote(value, safe='')}"
+        return f"/v2/music/artwork?url={quote(value, safe='')}&source={quote(source_id, safe='')}"
 
-    @staticmethod
-    def _page(source_id: str, items: object, page: int, more: bool) -> dict:
-        songs = [FeiniaoAdapter._song(source_id, item) for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+    def _page(self, source_id: str, items: object, page: int, more: bool) -> dict:
+        songs = [self._song(source_id, item) for item in items if isinstance(item, dict)] if isinstance(items, list) else []
         return {"items": [song for song in songs if song], "page": page, "has_more": more}
 
     def search(self, base_url: str, source_id: str, query: str, page: int) -> dict:
@@ -198,7 +205,7 @@ class FeiniaoAdapter:
                 items.append({
                     "id": f"{source_id}:{pid}", "source_id": source_id,
                     "external_id": pid, "name": str(item.get("name") or ""),
-                    "artwork_url": self._artwork(item.get("img")),
+                    "artwork_url": self._artwork(item.get("img"), source_id),
                     "song_count": int(item.get("total_songs") or 0),
                 })
         return {
@@ -223,7 +230,7 @@ class FeiniaoAdapter:
         return {
             "id": f"{source_id}:{song_id}", "source_id": source_id,
             "external_id": song_id, "qualities": qualities,
-            "artwork_url": self._artwork(payload.get("pic")),
+            "artwork_url": self._artwork(payload.get("pic"), source_id),
         }
 
     def lyrics(self, base_url: str, source_id: str, song_id: str) -> dict:
@@ -239,7 +246,7 @@ class FeiniaoAdapter:
             if isinstance(item, dict) and item.get("type") == quality:
                 url = item.get("url")
                 if isinstance(url, str):
-                    return validate_public_url(url, hosts=_AUDIO_HOSTS)
+                    return validate_public_url(url, hosts=self.audio_hosts)
         raise V2NotFound("requested audio quality is unavailable")
 
 

@@ -11,14 +11,15 @@ from fastapi.testclient import TestClient
 
 from rhythm_metadata_api.application.device_auth import hash_admin_password
 from rhythm_metadata_api.application.music_adapters import (
-    ADAPTERS,
     _AUDIO_HOSTS,
+    ADAPTERS,
     FeiniaoAdapter,
     clean_feiniao_lrc,
     validate_public_url,
 )
 from rhythm_metadata_api.application.music_sources import (
     MusicSongMetadataWrite,
+    MusicSourceConfig,
     MusicSourceCreate,
     MusicSourcePatch,
 )
@@ -136,6 +137,60 @@ def test_add_and_disable_source_without_changing_client_routes(tmp_path: Path) -
         with pytest.raises(V2Conflict):
             service.patch("alternate", MusicSourcePatch(revision=1, enabled=True))
         assert client.get("/v2/music/sources", headers=AUTH).json() == {"items": []}
+
+
+def test_source_rules_are_editable_and_isolated(tmp_path: Path, monkeypatch) -> None:
+    requested_sources = []
+
+    def fetch(url: str) -> dict:
+        requested_sources.append(parse_qs(urlsplit(url).query)["source"][0])
+        return {"data": [{"type": "mp3", "url": "https://audio.example.org/song.mp3"}]}
+
+    monkeypatch.setitem(ADAPTERS, "feiniao", FeiniaoAdapter(fetch=fetch))
+    monkeypatch.setattr(
+        "rhythm_metadata_api.application.music_adapters.socket.getaddrinfo",
+        lambda *args: [(None, None, None, None, ("1.1.1.1", 443))],
+    )
+    with TestClient(create_app(settings(tmp_path))) as client:
+        service = client.app.state.v2_container.music_sources
+        service.patch("feiniao", MusicSourcePatch(revision=1, enabled=True))
+        with pytest.raises(V2DomainError):
+            service.audio_url("feiniao", "42", "mp3")
+        configured = service.patch("feiniao", MusicSourcePatch(revision=2, config=MusicSourceConfig(
+            audio_hosts=["audio.example.org"], artwork_hosts=["images.example.org"],
+            upstream_source="备用音源", audio_url_ttl_seconds=0,
+        )))
+        assert configured["config"]["audio_hosts"] == ["audio.example.org"]
+        assert service.audio_url("feiniao", "42", "mp3") == "https://audio.example.org/song.mp3"
+        assert requested_sources == ["酷我音乐", "备用音源"]
+        assert service.artwork_hosts("feiniao") == frozenset({"images.example.org"})
+        assert service.list_sources()["items"][0]["config"] == configured["config"]
+        art_path = service._adapter(service._active("feiniao"))._artwork(
+            "https://images.example.org/cover.jpg", "feiniao",
+        )
+        assert art_path and "source=feiniao" in art_path
+
+        class FakeImage(io.BytesIO):
+            def __init__(self):
+                super().__init__(b"image")
+                self.headers = {"Content-Type": "image/jpeg"}
+
+        class FakeOpener:
+            def open(self, request, timeout):
+                assert request.full_url == "https://images.example.org/cover.jpg"
+                return FakeImage()
+
+        monkeypatch.setattr("rhythm_metadata_api.api.v2.music_routes._opener", FakeOpener())
+        assert client.get(art_path, headers=AUTH).status_code == 200
+        assert client.get(art_path.replace("&source=feiniao", ""), headers=AUTH).status_code == 200
+        service.patch("feiniao", MusicSourcePatch(revision=3, config=MusicSourceConfig(
+            audio_hosts=["audio.example.org"], artwork_hosts=["img1.kuwo.cn"],
+            upstream_source="备用音源",
+        )))
+        assert client.get(art_path, headers=AUTH).status_code == 422
+    for bad_host in ("localhost", "127.0.0.1", "*.example.org", "example.org:443", "https://example.org"):
+        with pytest.raises(ValueError):
+            MusicSourceConfig(audio_hosts=[bad_host])
 
 
 def test_failed_source_does_not_hide_healthy_search_results(tmp_path: Path, monkeypatch) -> None:
@@ -386,11 +441,11 @@ def test_audio_url_is_reused_for_seek_and_refreshed_after_rejection(tmp_path: Pa
     class CountingAdapter(FeiniaoAdapter):
         def __init__(self):
             super().__init__(fetch=fake_fetch)
-            self.calls = 0
+            self.calls = []
 
         def audio_url(self, base_url, song_id, quality):
-            self.calls += 1
-            return f"https://car-er.kuwo.cn/song-{self.calls}.mp3"
+            self.calls.append(song_id)
+            return f"https://car-er.kuwo.cn/song-{len(self.calls)}.mp3"
 
     adapter = CountingAdapter()
     monkeypatch.setitem(ADAPTERS, "feiniao", adapter)
@@ -417,13 +472,13 @@ def test_audio_url_is_reused_for_seek_and_refreshed_after_rejection(tmp_path: Pa
         service = client.app.state.v2_container.music_sources
         service.patch("feiniao", MusicSourcePatch(revision=1, enabled=True))
         assert service.audio_url("feiniao", "42", "mp3") == service.audio_url("feiniao", "42", "mp3")
-        assert adapter.calls == 1
+        assert len(adapter.calls) == 1
         response = client.get(
             "/v2/music/sources/feiniao/songs/42/stream",
             headers={**AUTH, "Range": "bytes=100-100"},
         )
         assert response.status_code == 206 and response.content == b"x"
-        assert adapter.calls == 2
+        assert len(adapter.calls) == 2
         assert service.audio_url("feiniao", "42", "mp3").endswith("song-2.mp3")
 
 
@@ -441,6 +496,9 @@ def test_artwork_is_relayed_only_from_known_image_hosts(tmp_path: Path, monkeypa
     monkeypatch.setattr("rhythm_metadata_api.api.v2.music_routes._opener", FakeOpener())
     monkeypatch.setattr("rhythm_metadata_api.api.v2.music_routes.validate_public_url", lambda url, **kwargs: url)
     with TestClient(create_app(settings(tmp_path))) as client:
+        client.app.state.v2_container.music_sources.patch(
+            "feiniao", MusicSourcePatch(revision=1, enabled=True),
+        )
         response = client.get("/v2/music/artwork?url=https%3A%2F%2Fimg1.kuwo.cn%2Fpic.jpg", headers=AUTH)
         assert response.status_code == 200
         assert response.content == b"fake-image"

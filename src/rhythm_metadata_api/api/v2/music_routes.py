@@ -13,7 +13,6 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 from rhythm_metadata_api.api.public_auth import AdminActor
 from rhythm_metadata_api.api.v2.routes import Actor
 from rhythm_metadata_api.application.music_adapters import (
-    _ARTWORK_HOSTS,
     _opener,
     validate_public_url,
 )
@@ -100,10 +99,10 @@ def search(
 
 
 @router.get("/artwork")
-def artwork(url: str, _: Actor) -> Response:
+def artwork(url: str, service: Sources, _: Actor, source: str | None = None) -> Response:
     if len(url) > 2000:
         raise V2DomainError("artwork URL is too long")
-    validate_public_url(url, hosts=_ARTWORK_HOSTS)
+    validate_public_url(url, hosts=service.artwork_hosts(source))
     try:
         with _opener.open(UrlRequest(url, headers={"Accept": "image/*"}), timeout=8) as upstream:
             content_type = upstream.headers.get("Content-Type", "").split(";", 1)[0].lower()

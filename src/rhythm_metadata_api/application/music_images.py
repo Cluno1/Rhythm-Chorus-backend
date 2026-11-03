@@ -41,7 +41,7 @@ class MusicImageArchive:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
-    def _original_url(self, value: str) -> str:
+    def _original_url(self, value: str, hosts: frozenset[str] = _ARTWORK_HOSTS) -> str:
         if value.startswith("/v2/music/artwork?url="):
             parsed = urlsplit(value)
             urls = parse_qs(parsed.query).get("url", [])
@@ -49,7 +49,7 @@ class MusicImageArchive:
                 raise MusicImageArchiveError("invalid artwork proxy URL")
             value = urls[0]
         try:
-            validate_public_url(value, hosts=_ARTWORK_HOSTS)
+            validate_public_url(value, hosts=hosts)
         except Exception as error:
             raise MusicImageArchiveError("artwork host is not supported for COS archival") from error
         return value
@@ -66,11 +66,11 @@ class MusicImageArchive:
             raise MusicImageArchiveError("invalid COS music image URL")
         return value
 
-    def archive(self, value: str | None) -> str | None:
+    def archive(self, value: str | None, *, hosts: frozenset[str] = _ARTWORK_HOSTS) -> str | None:
         value = self.normalize(value)
         if not value or value.startswith(_PREFIX) or not self.settings.music_image_cos_bucket:
             return value
-        source_url = self._original_url(value)
+        source_url = self._original_url(value, hosts)
         try:
             with _opener.open(Request(source_url, headers={"Accept": "image/*"}), timeout=8) as response:
                 body = response.read(_MAX_BYTES + 1)
