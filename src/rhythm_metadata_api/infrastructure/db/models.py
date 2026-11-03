@@ -33,6 +33,48 @@ class Base(DeclarativeBase):
     pass
 
 
+class MusicSource(Base):
+    """An administrator-managed instance of a server-side music adapter."""
+
+    __tablename__ = "v2_music_sources"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    adapter: Mapped[str] = mapped_column(String(40), nullable=False)
+    base_url: Mapped[str] = mapped_column(String(500), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+    __table_args__ = (Index("v2_music_sources_enabled_priority_idx", "enabled", "priority"),)
+
+
+class MusicSongMetadata(Base):
+    """Shared display metadata learned by clients, independent of transient stream URLs."""
+
+    __tablename__ = "v2_music_song_metadata"
+
+    source_id: Mapped[str] = mapped_column(
+        String(40), ForeignKey("v2_music_sources.id"), primary_key=True
+    )
+    song_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    artists: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    album: Mapped[str | None] = mapped_column(String(500))
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    artwork_url: Mapped[str | None] = mapped_column(String(2000))
+    artist_avatar_url: Mapped[str | None] = mapped_column(String(2000))
+    lyrics_lrc: Mapped[str | None] = mapped_column(Text)
+    qualities: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    mode: Mapped[str] = mapped_column(String(12), nullable=False)
+    ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class RevisionedMixin:
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

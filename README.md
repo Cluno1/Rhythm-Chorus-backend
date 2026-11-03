@@ -12,8 +12,17 @@ Rhythm 私有作品库后端。v2 以 `Work → Arrangement → Score/Rendition 
 - Bearer 鉴权、`Idempotency-Key`、`If-Match`/ETag、RFC 7807 风格错误、Bundle 条件缓存和 changes 游标。
 - 本机内容寻址对象存储及支持 `Range` 的受保护 Asset 下载。
 - SQLAlchemy 2、Alembic、SQLite WAL/外键/事务。
+- 可配置音乐来源注册表：管理员启停、排序和更换上游根地址；统一只读搜索、推荐、歌单、歌词、封面和音频 Range 中转。
 
 `/v1/tracks/*` 暂时保留，只用于旧客户端迁移，不再扩展。
+
+### 音乐来源网关（issue 140）
+
+迁移后预置 `feiniao` 实例，地址为 `http://music.xn--q35am7h.site/`，默认停用。管理员可通过 Web 的“系统 → 音乐来源”启用、改地址、调整优先级，或新增同一适配器的实例。管理员接口为 `GET/POST /v2/admin/music-sources`、`PATCH /v2/admin/music-sources/{id}` 和 `GET /v2/admin/music-sources/adapters`；更新需提交返回的 `revision`。新协议需要在 `application/music_adapters.py` 注册适配器，管理端随后可选择它，客户端接口保持不变。
+
+客户端通过设备签名调用 `GET/PUT /v2/music/sources/{source_id}/songs/{song_id}/metadata`。按来源与歌曲 ID 保存首次入库时间、标题、歌手、专辑、时长、封面和歌手头像地址、歌词、音质以及自动/手动获取方式；手动记录优先于后续自动更新。搜索、推荐、歌单和歌曲详情优先采用已存字段，音频仍在播放时动态解析。图片字段保存 URL，不保存图片二进制。
+
+设备客户端使用 `GET /v2/music/sources` 列出已启用来源，`GET /v2/music/search?q=&page=&source=` 搜索；浏览接口为 `/v2/music/sources/{id}/recommend`、`/playlists`、`/playlists/{playlist_id}`，歌曲接口为 `/songs/{song_id}`、`/songs/{song_id}/lyrics`、`/songs/{song_id}/stream?quality=mp3`。封面 `artwork_url` 是相对自家 API 根地址的 `/v2/music/artwork?...`。歌曲身份为 `{来源ID}:{上游歌曲ID}`；请求路径使用不带来源前缀的上游歌曲 ID。设备接口沿用现有设备签名；音频 `GET/HEAD` 支持单个字节 Range。飞鸟适配器仅调用匿名只读接口，不转发登录 Cookie 或账号数据。
 
 ## 本地运行
 

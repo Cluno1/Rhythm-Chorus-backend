@@ -16,9 +16,11 @@ from rhythm_metadata_api.api.public_auth import router as public_auth_router
 from rhythm_metadata_api.api.public_updates import UpdateRepository
 from rhythm_metadata_api.api.public_updates import router as public_updates_router
 from rhythm_metadata_api.api.routes import health
-from rhythm_metadata_api.api.v2.management_routes import router as management_router
 from rhythm_metadata_api.api.v2.image_routes import admin_router as image_admin_router
 from rhythm_metadata_api.api.v2.image_routes import router as image_router
+from rhythm_metadata_api.api.v2.management_routes import router as management_router
+from rhythm_metadata_api.api.v2.music_routes import admin_router as music_admin_router
+from rhythm_metadata_api.api.v2.music_routes import router as music_router
 from rhythm_metadata_api.api.v2.room_routes import router as room_router
 from rhythm_metadata_api.api.v2.routes import actor_context
 from rhythm_metadata_api.api.v2.routes import router as v2_router
@@ -40,6 +42,13 @@ from rhythm_metadata_api.main import problem_response, serializable_validation_e
 
 _EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 _PUBLIC_READ_ROUTES = (
+    ("GET", re.compile(r"^/v2/music/sources$")),
+    ("GET", re.compile(r"^/v2/music/search$")),
+    ("GET", re.compile(r"^/v2/music/artwork$")),
+    ("GET", re.compile(r"^/v2/music/sources/[a-z][a-z0-9_-]{1,39}/(?:recommend|playlists)$")),
+    ("GET", re.compile(r"^/v2/music/sources/[a-z][a-z0-9_-]{1,39}/playlists/[A-Za-z0-9_-]{1,80}$")),
+    ("GET", re.compile(r"^/v2/music/sources/[a-z][a-z0-9_-]{1,39}/songs/[A-Za-z0-9_-]{1,80}(?:/lyrics|/stream|/metadata)?$")),
+    ("HEAD", re.compile(r"^/v2/music/sources/[a-z][a-z0-9_-]{1,39}/songs/[A-Za-z0-9_-]{1,80}/stream$")),
     ("GET", re.compile(r"^/v2/works$")),
     ("GET", re.compile(r"^/v2/library/songs$")),
     ("GET", re.compile(r"^/v2/library/albums$")),
@@ -79,6 +88,7 @@ _PUBLIC_READ_ROUTES = (
     ("GET", re.compile(r"^/v2/labs/images/[^/]+/delivery$")),
 )
 _PUBLIC_WRITE_ROUTES = (
+    ("PUT", re.compile(r"^/v2/music/sources/[a-z][a-z0-9_-]{1,39}/songs/[A-Za-z0-9_-]{1,80}/metadata$")),
     ("PUT", re.compile(r"^/v2/renditions/[^/]+/lyrics/[^/]+$")),
     # issue 116：只开放标签窄接口，通用 PATCH /v2/works/{id} 仍不对设备开放。
     ("PATCH", re.compile(r"^/v2/works/[^/]+/tags$")),
@@ -355,6 +365,8 @@ def create_public_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(public_updates_router)
     app.include_router(v2_router)
     app.include_router(management_router)
+    app.include_router(music_router)
+    app.include_router(music_admin_router)
     app.include_router(room_router)
     app.include_router(image_router)
     app.include_router(image_admin_router)

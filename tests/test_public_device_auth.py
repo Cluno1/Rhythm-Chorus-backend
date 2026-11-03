@@ -20,6 +20,7 @@ from rhythm_metadata_api.application.device_auth import (
     refresh_canonical,
     request_canonical,
 )
+from rhythm_metadata_api.application.music_sources import MusicSourcePatch
 from rhythm_metadata_api.core.config import Settings
 from rhythm_metadata_api.infrastructure.db.models import (
     Arrangement,
@@ -116,6 +117,28 @@ def test_public_admin_user_projection_includes_invite_only_users_without_codes(t
         assert response.json()["invites"][0]["status"] == "pending"
         assert code not in response.text
         assert "codeHash" not in response.text
+
+
+def test_signed_device_can_share_music_metadata(tmp_path: Path) -> None:
+    app = create_public_app(settings(tmp_path))
+    with TestClient(app) as client:
+        app.state.v2_container.music_sources.patch("feiniao", MusicSourcePatch(revision=1, enabled=True))
+        key = ec.generate_private_key(ec.SECP256R1())
+        credentials = enroll(client, create_invite(client, admin_token(client)), key)
+        path = "/v2/music/sources/feiniao/songs/42/metadata"
+        payload = {"title": "推荐歌", "artists": ["歌手"], "mode": "auto"}
+        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
+        response = client.request(
+            "PUT", path, content=body,
+            headers={
+                **signed_headers(client, credentials, key, path, method="PUT", body=body),
+                "Content-Type": "application/json",
+            },
+        )
+        assert response.status_code == 200, response.text
+        read = client.get(path, headers=signed_headers(client, credentials, key, path))
+        assert read.status_code == 200
+        assert read.json()["title"] == "推荐歌"
 
 
 def enroll_response(
