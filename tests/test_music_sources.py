@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from rhythm_metadata_api.application.device_auth import hash_admin_password
 from rhythm_metadata_api.application.music_adapters import (
     ADAPTERS,
+    _AUDIO_HOSTS,
     FeiniaoAdapter,
     clean_feiniao_lrc,
     validate_public_url,
@@ -333,6 +334,10 @@ def test_invalid_upstream_targets_are_rejected_without_network(monkeypatch) -> N
     assert validate_public_url(
         "http://car-bj.kuwo.cn/sample.mp3",
         hosts=frozenset({"car-er.kuwo.cn", "car-bj.kuwo.cn"}),
+    )
+    assert validate_public_url(
+        "http://car-lv.kuwo.cn/sample.mp3",
+        hosts=_AUDIO_HOSTS,
     )
     with pytest.raises(V2DomainError):
         validate_public_url(
