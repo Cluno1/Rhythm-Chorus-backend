@@ -90,7 +90,7 @@ class V2Container:
             client_images=client_images,
             rooms=rooms,
             external_lyrics=external_lyrics,
-            music_sources=MusicSourceService(sessions),
+            music_sources=MusicSourceService(sessions, settings),
         )
 
     def close(self) -> None:

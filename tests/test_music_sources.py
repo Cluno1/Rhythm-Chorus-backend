@@ -13,9 +13,14 @@ from rhythm_metadata_api.application.device_auth import hash_admin_password
 from rhythm_metadata_api.application.music_adapters import (
     ADAPTERS,
     FeiniaoAdapter,
+    clean_feiniao_lrc,
     validate_public_url,
 )
-from rhythm_metadata_api.application.music_sources import MusicSourceCreate, MusicSourcePatch
+from rhythm_metadata_api.application.music_sources import (
+    MusicSongMetadataWrite,
+    MusicSourceCreate,
+    MusicSourcePatch,
+)
 from rhythm_metadata_api.core.config import Settings
 from rhythm_metadata_api.domain.v2.errors import V2Conflict, V2DomainError
 from rhythm_metadata_api.main import create_app
@@ -58,6 +63,23 @@ def fake_fetch(url: str) -> dict:
     if api == "get_lyrics_with_source":
         return {"msg": "成功", "gc": "[00:01.00]旅人"}
     raise AssertionError(api)
+
+
+def test_feiniao_lyrics_watermark_is_removed_without_dropping_song_credits() -> None:
+    original = (
+        "[ti:]\r\n[by:飞鸟·轻音v4.4.0]\r\n"
+        "[00:00.000]该音源由 飞鸟·轻音 提供服务\r\n"
+        "[00:00.000]官网:飞鸟.site\r\n"
+        "[00:00.000]————下面是正歌部分————\r\n"
+        "[00:00.000]演员 - 薛之谦\r\n"
+        "[00:02.000]词：薛之谦\r\n"
+        "[00:21.000]简单点\r\n"
+    )
+    cleaned = clean_feiniao_lrc(original)
+    assert "飞鸟" not in cleaned
+    assert "[00:00.000]演员 - 薛之谦" in cleaned
+    assert "[00:02.000]词：薛之谦" in cleaned
+    assert "[00:21.000]简单点" in cleaned
 
 
 def test_admin_config_and_uniform_client_output(tmp_path: Path, monkeypatch) -> None:
@@ -197,6 +219,90 @@ def test_admin_session_manages_sources(tmp_path: Path) -> None:
         })
         assert response.status_code == 200
         assert response.json()["enabled"] is True
+
+
+def test_admin_can_browse_song_metadata_without_exposing_lyrics_in_list(tmp_path: Path) -> None:
+    with TestClient(create_public_app(settings(tmp_path))) as client:
+        session = client.post("/v2/admin/session", json={
+            "username": "admin", "password": "correct horse battery staple",
+        }).json()
+        admin_auth = {"Authorization": f"Bearer {session['accessToken']}"}
+        service = client.app.state.v2_container.music_sources
+        service.patch("feiniao", MusicSourcePatch(revision=1, enabled=True))
+        service.put_metadata("feiniao", "42", MusicSongMetadataWrite(
+            title="演员", artists=["薛之谦"], album="专辑",
+            lyrics_lrc="[00:01.00]歌词", mode="auto",
+        ))
+
+        listing = client.get(
+            "/v2/admin/music-sources/song-metadata?q=薛之谦&page_size=1",
+            headers=admin_auth,
+        )
+        assert listing.status_code == 200
+        data = listing.json()
+        assert data["total"] == 1 and data["page_size"] == 1
+        assert data["items"][0]["title"] == "演员"
+        assert data["items"][0]["has_lyrics"] is True
+        assert "lyrics_lrc" not in data["items"][0]
+        detail = client.get(
+            "/v2/admin/music-sources/song-metadata/feiniao/42", headers=admin_auth,
+        )
+        assert detail.json()["lyrics_lrc"] == "[00:01.00]歌词"
+        assert client.get("/v2/admin/music-sources/song-metadata").status_code == 401
+
+
+def test_music_images_are_uploaded_to_cos_and_delivered_by_stable_url(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    png = b"\x89PNG\r\n\x1a\n" + b"test-image"
+    requests = []
+
+    class FakeResponse:
+        status = 200
+
+        def __init__(self):
+            self.headers = {"Content-Type": "image/png"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, _size):
+            return png
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            requests.append(request)
+            return FakeResponse()
+
+    monkeypatch.setattr("rhythm_metadata_api.application.music_images._opener", FakeOpener())
+    monkeypatch.setattr(
+        "rhythm_metadata_api.application.music_images.validate_public_url",
+        lambda url, **_kwargs: url,
+    )
+    configured = settings(tmp_path).model_copy(update={
+        "cos_secret_id": "test-id", "cos_secret_key": "test-key",
+        "music_image_cos_bucket": "images-1250000000",
+        "music_image_public_base_url": "https://music.example.org",
+    })
+    with TestClient(create_app(configured)) as client:
+        service = client.app.state.v2_container.music_sources
+        service.patch("feiniao", MusicSourcePatch(revision=1, enabled=True))
+        saved = client.put("/v2/music/sources/feiniao/songs/42/metadata", headers=AUTH, json={
+            "title": "演员", "artists": ["薛之谦"],
+            "artwork_url": "/v2/music/artwork?url=https%3A%2F%2Fimg1.kuwo.cn%2Fcover.png",
+        })
+        assert saved.status_code == 200
+        data = saved.json()
+        assert data["artwork_storage"] == "cos"
+        assert data["artwork_url"].startswith("https://music.example.org/v2/music/images/")
+        assert len(requests) == 2 and requests[1].get_method() == "PUT"
+        image_name = data["artwork_url"].rsplit("/", 1)[1]
+        delivery = client.get(f"/v2/music/images/{image_name}", follow_redirects=False)
+        assert delivery.status_code == 307
+        assert "images-1250000000.cos.ap-guangzhou.myqcloud.com" in delivery.headers["location"]
 
 
 def test_invalid_upstream_targets_are_rejected_without_network(monkeypatch) -> None:

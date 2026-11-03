@@ -32,6 +32,8 @@ class Settings(BaseSettings):
 
     # Issue 91 client-owned images. This is a separate private bucket/control plane
     client_image_cos_bucket: str = ""
+    music_image_cos_bucket: str = ""
+    music_image_public_base_url: str = ""
     client_image_preview_host: str = ""
     client_image_ci_enabled: bool = False
     client_image_presign_expires_seconds: int = 10 * 60
@@ -107,6 +109,13 @@ class Settings(BaseSettings):
             raise ValueError(
                 "RHYTHM_CLIENT_IMAGE_COS_BUCKET requires RHYTHM_COS_SECRET_ID and "
                 "RHYTHM_COS_SECRET_KEY"
+            )
+        if self.music_image_cos_bucket and not (
+            self.cos_secret_id and self.cos_secret_key and self.music_image_public_base_url
+        ):
+            raise ValueError(
+                "RHYTHM_MUSIC_IMAGE_COS_BUCKET requires COS credentials and "
+                "RHYTHM_MUSIC_IMAGE_PUBLIC_BASE_URL"
             )
         if self.client_image_preview_host and (
             "://" in self.client_image_preview_host

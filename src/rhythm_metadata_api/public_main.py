@@ -45,6 +45,7 @@ _PUBLIC_READ_ROUTES = (
     ("GET", re.compile(r"^/v2/music/sources$")),
     ("GET", re.compile(r"^/v2/music/search$")),
     ("GET", re.compile(r"^/v2/music/artwork$")),
+    ("GET", re.compile(r"^/v2/music/images/[a-f0-9]{64}\.(?:jpg|png|webp|gif)$")),
     ("GET", re.compile(r"^/v2/music/sources/[a-z][a-z0-9_-]{1,39}/(?:recommend|playlists)$")),
     ("GET", re.compile(r"^/v2/music/sources/[a-z][a-z0-9_-]{1,39}/playlists/[A-Za-z0-9_-]{1,80}$")),
     ("GET", re.compile(r"^/v2/music/sources/[a-z][a-z0-9_-]{1,39}/songs/[A-Za-z0-9_-]{1,80}(?:/lyrics|/stream|/metadata)?$")),

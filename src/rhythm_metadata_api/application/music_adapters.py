@@ -21,6 +21,7 @@ MAX_JSON_BYTES = 2_000_000
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 _AUDIO_HOSTS = frozenset({"car-er.kuwo.cn", "car-bj.kuwo.cn"})
 _ARTWORK_HOSTS = frozenset({"img1.kuwo.cn", "img2.kuwo.cn", "img3.kuwo.cn", "img4.kuwo.cn"})
+_LRC_TIME = re.compile(r"^\[\d{1,3}:\d{2}(?:\.\d{1,3})?\]")
 _PROXY_FAKE_IPS = ipaddress.ip_network("198.18.0.0/15")
 
 
@@ -30,6 +31,25 @@ class NoRedirect(HTTPRedirectHandler):
 
 
 _opener = build_opener(NoRedirect)
+
+
+def clean_feiniao_lrc(value: str) -> str:
+    """Remove the site's fixed promotional header while retaining song credits and verses."""
+    kept = []
+    for line in value.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[by:") and ("飞鸟·轻音" in stripped or "飞鸟.site" in stripped):
+            continue
+        lyric = _LRC_TIME.sub("", stripped).strip()
+        if lyric in {
+            "该音源由 飞鸟·轻音 提供服务",
+            "官网:飞鸟.site",
+            "官网：飞鸟.site",
+            "————下面是正歌部分————",
+        }:
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
 
 
 def validate_public_url(url: str, *, hosts: frozenset[str] | None = None) -> str:
@@ -211,7 +231,7 @@ class FeiniaoAdapter:
         lyrics = payload.get("gc")
         if not isinstance(lyrics, str):
             raise V2NotFound("lyrics are unavailable")
-        return {"id": f"{source_id}:{song_id}", "source_id": source_id, "lrc": lyrics}
+        return {"id": f"{source_id}:{song_id}", "source_id": source_id, "lrc": clean_feiniao_lrc(lyrics)}
 
     def audio_url(self, base_url: str, song_id: str, quality: str) -> str:
         payload = self._get(base_url, "get_song_with_source", id=song_id, source=self.upstream_source)

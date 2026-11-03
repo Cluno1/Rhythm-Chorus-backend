@@ -8,7 +8,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request as UrlRequest
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 
 from rhythm_metadata_api.api.public_auth import AdminActor
 from rhythm_metadata_api.api.v2.routes import Actor
@@ -17,6 +17,7 @@ from rhythm_metadata_api.application.music_adapters import (
     _opener,
     validate_public_url,
 )
+from rhythm_metadata_api.application.music_images import MusicImageArchiveError
 from rhythm_metadata_api.application.music_sources import (
     MusicSongMetadataWrite,
     MusicSourceCreate,
@@ -46,6 +47,29 @@ def adapters(service: Sources, _: AdminActor) -> dict:
 @admin_router.get("")
 def admin_sources(service: Sources, _: AdminActor) -> dict:
     return service.list_sources()
+
+
+@admin_router.get("/song-metadata")
+def admin_song_metadata_list(
+    service: Sources, _: AdminActor, page: Page = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 25,
+    source: str | None = None, q: Annotated[str | None, Query(max_length=100)] = None,
+) -> dict:
+    return service.list_metadata(page=page, page_size=page_size, source_id=source, query=q)
+
+
+@admin_router.get("/song-metadata/{source_id}/{song_id}")
+def admin_song_metadata_detail(
+    source_id: str, song_id: str, service: Sources, _: AdminActor,
+) -> dict:
+    return service.admin_metadata(source_id, song_id)
+
+
+@admin_router.post("/song-metadata/{source_id}/{song_id}/archive-images")
+def admin_archive_song_images(
+    source_id: str, song_id: str, service: Sources, _: AdminActor,
+) -> dict:
+    return service.archive_metadata_images(source_id, song_id)
 
 
 @admin_router.post("", status_code=201)
@@ -91,6 +115,18 @@ def artwork(url: str, _: Actor) -> Response:
     if len(image) > 5_000_000:
         raise V2Unavailable("artwork is too large")
     return Response(content=image, media_type=content_type, headers={"Cache-Control": "private, max-age=86400"})
+
+
+@router.get("/images/{name}")
+def music_image(name: str, service: Sources) -> Response:
+    try:
+        url = service.images.signed_url(name)
+    except MusicImageArchiveError as error:
+        raise V2Unavailable("music image is unavailable") from error
+    return RedirectResponse(
+        url, status_code=307,
+        headers={"Cache-Control": "public, max-age=300", "Referrer-Policy": "no-referrer"},
+    )
 
 
 @router.get("/sources/{source_id}/recommend")

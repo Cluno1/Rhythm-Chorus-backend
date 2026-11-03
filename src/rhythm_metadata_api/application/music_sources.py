@@ -9,11 +9,18 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
-from sqlalchemy import select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from rhythm_metadata_api.application.music_adapters import _ID, ADAPTERS, adapter_kinds
+from rhythm_metadata_api.application.music_adapters import (
+    _ID,
+    ADAPTERS,
+    adapter_kinds,
+    clean_feiniao_lrc,
+)
+from rhythm_metadata_api.application.music_images import MusicImageArchive, MusicImageArchiveError
+from rhythm_metadata_api.core.config import Settings
 from rhythm_metadata_api.domain.v2.errors import (
     V2Conflict,
     V2DomainError,
@@ -61,6 +68,8 @@ def _image_url(value: str | None) -> str | None:
     parts = urlsplit(value)
     if value.startswith("/v2/music/artwork?url=") and parts.path == "/v2/music/artwork":
         return value
+    if value.startswith("/v2/music/images/") and parts.path == value:
+        return value
     if parts.scheme == "https" and parts.hostname and not parts.username and not parts.password:
         try:
             ipaddress.ip_address(parts.hostname)
@@ -69,7 +78,7 @@ def _image_url(value: str | None) -> str | None:
     raise V2DomainError("image URL must be HTTPS or a music artwork proxy path")
 
 
-def serialize_metadata(item: MusicSongMetadata) -> dict:
+def serialize_metadata(item: MusicSongMetadata, images: MusicImageArchive | None = None) -> dict:
     ingested_at = item.ingested_at.replace(tzinfo=item.ingested_at.tzinfo or UTC)
     updated_at = item.updated_at.replace(tzinfo=item.updated_at.tzinfo or UTC)
     return {
@@ -80,9 +89,11 @@ def serialize_metadata(item: MusicSongMetadata) -> dict:
         "artists": item.artists,
         "album": item.album,
         "duration_ms": item.duration_ms,
-        "artwork_url": item.artwork_url,
-        "artist_avatar_url": item.artist_avatar_url,
-        "lyrics_lrc": item.lyrics_lrc,
+        "artwork_url": images.delivery_url(item.artwork_url) if images else item.artwork_url,
+        "artist_avatar_url": images.delivery_url(item.artist_avatar_url) if images else item.artist_avatar_url,
+        "artwork_storage": images.storage(item.artwork_url) if images else "external",
+        "artist_avatar_storage": images.storage(item.artist_avatar_url) if images else "external",
+        "lyrics_lrc": clean_feiniao_lrc(item.lyrics_lrc) if item.lyrics_lrc else None,
         "qualities": item.qualities,
         "mode": item.mode,
         "ingested_at": ingested_at.isoformat(),
@@ -132,8 +143,9 @@ def serialize_source(source: MusicSource) -> dict:
 
 
 class MusicSourceService:
-    def __init__(self, sessions: sessionmaker[Session]) -> None:
+    def __init__(self, sessions: sessionmaker[Session], settings: Settings) -> None:
         self.sessions = sessions
+        self.images = MusicImageArchive(settings)
 
     def adapters(self) -> dict:
         return {"items": adapter_kinds()}
@@ -144,6 +156,47 @@ class MusicSourceService:
             if enabled_only:
                 query = query.where(MusicSource.enabled.is_(True))
             return {"items": [serialize_source(item) for item in session.scalars(query)]}
+
+    def list_metadata(
+        self, *, page: int = 1, page_size: int = 25,
+        source_id: str | None = None, query: str | None = None,
+    ) -> dict:
+        filters = []
+        if source_id:
+            filters.append(MusicSongMetadata.source_id == source_id)
+        if query:
+            pattern = f"%{query.strip()}%"
+            artist_names = func.json_each(MusicSongMetadata.artists).table_valued("value")
+            filters.append(or_(
+                MusicSongMetadata.title.ilike(pattern),
+                MusicSongMetadata.album.ilike(pattern),
+                MusicSongMetadata.song_id.ilike(pattern),
+                select(1).select_from(artist_names)
+                .where(artist_names.c.value.ilike(pattern)).exists(),
+            ))
+        with self.sessions() as session:
+            total = session.scalar(
+                select(func.count()).select_from(MusicSongMetadata).where(*filters)
+            ) or 0
+            rows = session.scalars(
+                select(MusicSongMetadata).where(*filters)
+                .order_by(MusicSongMetadata.ingested_at.desc(), MusicSongMetadata.source_id,
+                          MusicSongMetadata.song_id)
+                .offset((page - 1) * page_size).limit(page_size)
+            )
+            items = []
+            for row in rows:
+                item = serialize_metadata(row, self.images)
+                item["has_lyrics"] = bool(item.pop("lyrics_lrc"))
+                items.append(item)
+            return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+    def admin_metadata(self, source_id: str, song_id: str) -> dict:
+        with self.sessions() as session:
+            item = session.get(MusicSongMetadata, (source_id, self._id(song_id)))
+            if item is None:
+                raise V2NotFound("music metadata has not been collected")
+            return serialize_metadata(item, self.images)
 
     def create(self, data: MusicSourceCreate) -> dict:
         if not _SOURCE_ID.fullmatch(data.id):
@@ -228,7 +281,7 @@ class MusicSourceService:
             item = session.get(MusicSongMetadata, (source_id, self._id(song_id)))
             if item is None:
                 raise V2NotFound("music metadata has not been collected")
-            return serialize_metadata(item)
+            return serialize_metadata(item, self.images)
 
     def put_metadata(self, source_id: str, song_id: str, data: MusicSongMetadataWrite) -> dict:
         self._active(source_id)
@@ -237,14 +290,23 @@ class MusicSourceService:
         artists = [name.strip() for name in data.artists]
         if not title or any(not name or len(name) > 200 for name in artists):
             raise V2DomainError("title and artist names must be nonempty")
+        def image_value(value: str | None) -> str | None:
+            normalized = self.images.normalize(value)
+            checked = _image_url(normalized)
+            try:
+                return self.images.archive(checked)
+            except MusicImageArchiveError:
+                # Keep the display URL; administrators can retry archival later.
+                return checked
+
         changes = {
             "title": title,
             "artists": artists,
             "album": data.album.strip() or None if data.album is not None else None,
             "duration_ms": data.duration_ms,
-            "artwork_url": _image_url(data.artwork_url),
-            "artist_avatar_url": _image_url(data.artist_avatar_url),
-            "lyrics_lrc": data.lyrics_lrc,
+            "artwork_url": image_value(data.artwork_url),
+            "artist_avatar_url": image_value(data.artist_avatar_url),
+            "lyrics_lrc": clean_feiniao_lrc(data.lyrics_lrc) if data.lyrics_lrc else None,
             "qualities": list(dict.fromkeys(data.qualities)),
             "mode": data.mode,
         }
@@ -258,7 +320,24 @@ class MusicSourceService:
                     setattr(item, key, value)
                 item.updated_at = utc_now()
             session.commit()
-            return serialize_metadata(item)
+            return serialize_metadata(item, self.images)
+
+    def archive_metadata_images(self, source_id: str, song_id: str) -> dict:
+        with self.sessions() as session:
+            item = session.get(MusicSongMetadata, (source_id, self._id(song_id)))
+            if item is None:
+                raise V2NotFound("music metadata has not been collected")
+            for field in ("artwork_url", "artist_avatar_url"):
+                original = getattr(item, field)
+                try:
+                    archived = self.images.archive(original)
+                except MusicImageArchiveError:
+                    continue
+                if archived != original:
+                    setattr(item, field, archived)
+                    item.updated_at = utc_now()
+            session.commit()
+            return serialize_metadata(item, self.images)
 
     def _overlay(self, source_id: str, page: dict) -> dict:
         ids = [item.get("external_id") for item in page.get("items", [])]
@@ -266,7 +345,7 @@ class MusicSourceService:
             return page
         with self.sessions() as session:
             stored = {
-                item.song_id: serialize_metadata(item)
+                item.song_id: serialize_metadata(item, self.images)
                 for item in session.scalars(
                     select(MusicSongMetadata).where(
                         MusicSongMetadata.source_id == source_id,
