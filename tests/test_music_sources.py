@@ -303,6 +303,11 @@ def test_music_images_are_uploaded_to_cos_and_delivered_by_stable_url(
         delivery = client.get(f"/v2/music/images/{image_name}", follow_redirects=False)
         assert delivery.status_code == 307
         assert "images-1250000000.cos.ap-guangzhou.myqcloud.com" in delivery.headers["location"]
+        malformed = client.put("/v2/music/sources/feiniao/songs/42/metadata", headers=AUTH, json={
+            "title": "演员", "artists": ["薛之谦"],
+            "artwork_url": "/v2/music/images/not-a-hash.jpg",
+        })
+        assert malformed.status_code == 422
 
 
 def test_invalid_upstream_targets_are_rejected_without_network(monkeypatch) -> None:

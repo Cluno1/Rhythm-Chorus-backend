@@ -297,7 +297,10 @@ class MusicSourceService:
         if not title or any(not name or len(name) > 200 for name in artists):
             raise V2DomainError("title and artist names must be nonempty")
         def image_value(value: str | None) -> str | None:
-            normalized = self.images.normalize(value)
+            try:
+                normalized = self.images.normalize(value)
+            except MusicImageArchiveError as error:
+                raise V2DomainError("invalid music image URL") from error
             checked = _image_url(normalized)
             try:
                 return self.images.archive(checked)
