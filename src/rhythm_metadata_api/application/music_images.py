@@ -107,7 +107,9 @@ class MusicImageArchive:
 
     @staticmethod
     def storage(value: str | None) -> str:
-        return "cos" if value and value.startswith(_PREFIX) else "external"
+        if not value:
+            return "none"
+        return "cos" if value.startswith(_PREFIX) else "external"
 
     def signed_url(self, name: str) -> str:
         match = _IMAGE_NAME.fullmatch(name)
