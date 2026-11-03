@@ -372,6 +372,51 @@ def test_range_stream_preserves_partial_content(tmp_path: Path, monkeypatch) -> 
         assert response.content == b"x"
 
 
+def test_audio_url_is_reused_for_seek_and_refreshed_after_rejection(tmp_path: Path, monkeypatch) -> None:
+    class CountingAdapter(FeiniaoAdapter):
+        def __init__(self):
+            super().__init__(fetch=fake_fetch)
+            self.calls = 0
+
+        def audio_url(self, base_url, song_id, quality):
+            self.calls += 1
+            return f"https://car-er.kuwo.cn/song-{self.calls}.mp3"
+
+    adapter = CountingAdapter()
+    monkeypatch.setitem(ADAPTERS, "feiniao", adapter)
+
+    class FakeAudio(io.BytesIO):
+        status = 206
+
+        def __init__(self):
+            super().__init__(b"x")
+            self.headers = {
+                "Content-Type": "audio/mpeg", "Content-Range": "bytes 100-100/123",
+                "Content-Length": "1",
+            }
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            if request.full_url.endswith("song-1.mp3"):
+                from urllib.error import HTTPError
+                raise HTTPError(request.full_url, 403, "expired", {}, None)
+            return FakeAudio()
+
+    monkeypatch.setattr("rhythm_metadata_api.api.v2.music_routes._opener", FakeOpener())
+    with TestClient(create_app(settings(tmp_path))) as client:
+        service = client.app.state.v2_container.music_sources
+        service.patch("feiniao", MusicSourcePatch(revision=1, enabled=True))
+        assert service.audio_url("feiniao", "42", "mp3") == service.audio_url("feiniao", "42", "mp3")
+        assert adapter.calls == 1
+        response = client.get(
+            "/v2/music/sources/feiniao/songs/42/stream",
+            headers={**AUTH, "Range": "bytes=100-100"},
+        )
+        assert response.status_code == 206 and response.content == b"x"
+        assert adapter.calls == 2
+        assert service.audio_url("feiniao", "42", "mp3").endswith("song-2.mp3")
+
+
 def test_artwork_is_relayed_only_from_known_image_hosts(tmp_path: Path, monkeypatch) -> None:
     class FakeImage(io.BytesIO):
         def __init__(self, body: bytes) -> None:

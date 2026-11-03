@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import threading
 from datetime import UTC
+from time import monotonic
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -30,6 +32,7 @@ from rhythm_metadata_api.domain.v2.errors import (
 from rhythm_metadata_api.infrastructure.db.models import MusicSongMetadata, MusicSource, utc_now
 
 _SOURCE_ID = re.compile(r"^[a-z][a-z0-9_-]{1,39}$")
+_AUDIO_URL_TTL_SECONDS = 90
 
 
 class MusicSourceCreate(BaseModel):
@@ -146,6 +149,9 @@ class MusicSourceService:
     def __init__(self, sessions: sessionmaker[Session], settings: Settings) -> None:
         self.sessions = sessions
         self.images = MusicImageArchive(settings)
+        self._audio_urls: dict[tuple[str, int, str, str], tuple[float, str]] = {}
+        self._audio_urls_guard = threading.Lock()
+        self._audio_url_locks = [threading.Lock() for _ in range(32)]
 
     def adapters(self) -> dict:
         return {"items": adapter_kinds()}
@@ -429,4 +435,34 @@ class MusicSourceService:
         if quality not in {"mp3", "m4a", "ogg", "flac"}:
             raise V2DomainError("unsupported audio quality")
         source = self._active(source_id)
-        return self._adapter(source).audio_url(source.base_url, self._id(song_id), quality)
+        song_id = self._id(song_id)
+        key = (source.id, source.revision, song_id, quality)
+        with self._audio_urls_guard:
+            cached = self._audio_urls.get(key)
+        if cached and cached[0] > monotonic():
+            return cached[1]
+        # Per-key single flight prevents concurrent seeks from resolving the same song repeatedly.
+        with self._audio_url_locks[hash(key) % len(self._audio_url_locks)]:
+            with self._audio_urls_guard:
+                cached = self._audio_urls.get(key)
+            if cached and cached[0] > monotonic():
+                return cached[1]
+            url = self._adapter(source).audio_url(source.base_url, song_id, quality)
+            with self._audio_urls_guard:
+                self._audio_urls[key] = (monotonic() + _AUDIO_URL_TTL_SECONDS, url)
+                if len(self._audio_urls) > 1000:
+                    now = monotonic()
+                    self._audio_urls = {
+                        item_key: value for item_key, value in self._audio_urls.items()
+                        if value[0] > now
+                    }
+            return url
+
+    def invalidate_audio_url(
+        self, source_id: str, song_id: str, quality: str, failed_url: str,
+    ) -> None:
+        source = self._active(source_id)
+        key = (source.id, source.revision, self._id(song_id), quality)
+        with self._audio_urls_guard:
+            if (cached := self._audio_urls.get(key)) and cached[1] == failed_url:
+                self._audio_urls.pop(key, None)

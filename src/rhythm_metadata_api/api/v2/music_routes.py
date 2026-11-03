@@ -180,12 +180,23 @@ def _audio_response(
     try:
         upstream = _opener.open(request, timeout=15)
     except HTTPError as error:
-        if error.code == 416:
+        if error.code in {401, 403, 404, 410}:
+            service.invalidate_audio_url(source_id, song_id, quality, url)
+            refreshed_url = service.audio_url(source_id, song_id, quality)
+            try:
+                upstream = _opener.open(
+                    UrlRequest(refreshed_url, headers=headers, method="HEAD" if head else "GET"),
+                    timeout=15,
+                )
+            except (HTTPError, URLError, TimeoutError) as retry_error:
+                raise V2Unavailable("audio upstream rejected the refreshed URL") from retry_error
+        elif error.code == 416:
             return Response(status_code=416, headers={
                 "Content-Range": error.headers.get("Content-Range", "bytes */*"),
                 "Cache-Control": "no-store",
             })
-        raise V2Unavailable("audio upstream rejected the request") from error
+        else:
+            raise V2Unavailable("audio upstream rejected the request") from error
     except (URLError, TimeoutError) as error:
         raise V2Unavailable("audio upstream is unavailable") from error
     content_type = upstream.headers.get("Content-Type", "")
