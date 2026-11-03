@@ -32,7 +32,7 @@ from rhythm_metadata_api.domain.v2.errors import (
 from rhythm_metadata_api.infrastructure.db.models import MusicSongMetadata, MusicSource, utc_now
 
 _SOURCE_ID = re.compile(r"^[a-z][a-z0-9_-]{1,39}$")
-_AUDIO_URL_TTL_SECONDS = 90
+_AUDIO_URL_TTL_SECONDS = 150
 
 
 class MusicSourceCreate(BaseModel):
