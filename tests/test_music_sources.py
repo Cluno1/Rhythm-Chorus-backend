@@ -219,6 +219,15 @@ def test_invalid_upstream_targets_are_rejected_without_network(monkeypatch) -> N
         lambda *args: [(None, None, None, None, ("198.18.7.208", 80))],
     )
     assert validate_public_url("http://music.xn--q35am7h.site/")
+    assert validate_public_url(
+        "http://car-bj.kuwo.cn/sample.mp3",
+        hosts=frozenset({"car-er.kuwo.cn", "car-bj.kuwo.cn"}),
+    )
+    with pytest.raises(V2DomainError):
+        validate_public_url(
+            "http://other.kuwo.cn/sample.mp3",
+            hosts=frozenset({"car-er.kuwo.cn", "car-bj.kuwo.cn"}),
+        )
     monkeypatch.setattr(
         "rhythm_metadata_api.application.music_adapters.socket.getaddrinfo",
         lambda *args: [(None, None, None, None, ("127.0.0.1", 80))],

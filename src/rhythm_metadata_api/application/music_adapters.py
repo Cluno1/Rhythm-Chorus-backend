@@ -19,7 +19,7 @@ from rhythm_metadata_api.domain.v2.errors import V2DomainError, V2NotFound, V2Un
 
 MAX_JSON_BYTES = 2_000_000
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
-_AUDIO_HOSTS = frozenset({"car-er.kuwo.cn"})
+_AUDIO_HOSTS = frozenset({"car-er.kuwo.cn", "car-bj.kuwo.cn"})
 _ARTWORK_HOSTS = frozenset({"img1.kuwo.cn", "img2.kuwo.cn", "img3.kuwo.cn", "img4.kuwo.cn"})
 _PROXY_FAKE_IPS = ipaddress.ip_network("198.18.0.0/15")
 
