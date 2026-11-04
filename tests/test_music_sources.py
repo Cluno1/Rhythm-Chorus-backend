@@ -13,18 +13,20 @@ from rhythm_metadata_api.application.device_auth import hash_admin_password
 from rhythm_metadata_api.application.music_adapters import (
     _AUDIO_HOSTS,
     ADAPTERS,
+    FEINIAO_LYRIC_FILTERS,
     FeiniaoAdapter,
-    clean_feiniao_lrc,
+    clean_lyrics,
     validate_public_url,
 )
 from rhythm_metadata_api.application.music_sources import (
+    LyricFilters,
     MusicSongMetadataWrite,
     MusicSourceConfig,
     MusicSourceCreate,
     MusicSourcePatch,
 )
 from rhythm_metadata_api.core.config import Settings
-from rhythm_metadata_api.domain.v2.errors import V2Conflict, V2DomainError
+from rhythm_metadata_api.domain.v2.errors import V2Conflict, V2DomainError, V2NotFound
 from rhythm_metadata_api.main import create_app
 from rhythm_metadata_api.public_main import create_public_app
 
@@ -77,7 +79,7 @@ def test_feiniao_lyrics_watermark_is_removed_without_dropping_song_credits() -> 
         "[00:02.000]词：薛之谦\r\n"
         "[00:21.000]简单点\r\n"
     )
-    cleaned = clean_feiniao_lrc(original)
+    cleaned = clean_lyrics(original, FEINIAO_LYRIC_FILTERS)
     assert "飞鸟" not in cleaned
     assert "[00:00.000]演员 - 薛之谦" in cleaned
     assert "[00:02.000]词：薛之谦" in cleaned
@@ -256,6 +258,188 @@ def test_shared_metadata_precedes_upstream_and_manual_precedes_auto(tmp_path: Pa
             "title": "自动曲名", "artists": ["歌手"], "mode": "auto",
         }).json()
         assert automatic["title"] == "人工曲名"
+
+
+def test_full_width_watermark_variant_matches_one_rule() -> None:
+    cleaned = clean_lyrics("[00:00.000]官网：飞鸟.site\n[00:01.000]官网：飞鸟.site 之歌", FEINIAO_LYRIC_FILTERS)
+    assert cleaned == "[00:01.000]官网：飞鸟.site 之歌"
+
+
+def test_by_rule_never_touches_title_or_artist_tags() -> None:
+    lrc = "[ti:飞鸟·轻音]\n[ar:飞鸟·轻音]\n[by:飞鸟·轻音v4]"
+    assert clean_lyrics(lrc, FEINIAO_LYRIC_FILTERS) == "[ti:飞鸟·轻音]\n[ar:飞鸟·轻音]"
+
+
+def test_rule_text_is_literal_not_a_pattern() -> None:
+    assert clean_lyrics("[00:01.00]简单点\n[00:02.00].*", {"exact_lines": [".*"]}) == "[00:01.00]简单点"
+
+
+def _enabled_client(tmp_path: Path, monkeypatch, fetch=fake_fetch):
+    monkeypatch.setitem(ADAPTERS, "feiniao", FeiniaoAdapter(fetch=fetch))
+    client = TestClient(create_app(settings(tmp_path)))
+    client.__enter__()
+    service = client.app.state.v2_container.music_sources
+    service.patch("feiniao", MusicSourcePatch(revision=1, enabled=True))
+    return client, service
+
+
+def test_new_rule_applies_to_stored_and_upstream_lyrics_without_a_release(tmp_path, monkeypatch) -> None:
+    client, service = _enabled_client(tmp_path, monkeypatch)
+    with client:
+        metadata = "/v2/music/sources/feiniao/songs/42/metadata"
+        client.put(metadata, headers=AUTH, json={
+            "title": "歌", "artists": ["人"], "lyrics_lrc": "[00:01.00]新水印\n[00:02.00]正文", "mode": "auto",
+        })
+        assert "新水印" in client.get(metadata, headers=AUTH).json()["lyrics_lrc"]
+        service.patch("feiniao", MusicSourcePatch(revision=2, config=MusicSourceConfig(
+            lyric_filters=LyricFilters(exact_lines=["新水印", "旅人"]),
+        )))
+        assert client.get(metadata, headers=AUTH).json()["lyrics_lrc"] == "[00:02.00]正文"
+        upstream = client.get("/v2/music/sources/feiniao/songs/43/lyrics", headers=AUTH).json()
+        assert upstream["lrc"] == ""
+
+
+def test_manual_lyrics_are_never_filtered(tmp_path, monkeypatch) -> None:
+    client, _ = _enabled_client(tmp_path, monkeypatch)
+    with client:
+        text = "[00:00.000]官网:飞鸟.site\n[00:01.00]人工校对"
+        saved = client.put("/v2/music/sources/feiniao/songs/42/metadata", headers=AUTH, json={
+            "title": "歌", "artists": ["人"], "lyrics_lrc": text, "mode": "manual",
+        }).json()
+        assert saved["lyrics_lrc"] == text
+        assert client.get(
+            "/v2/music/sources/feiniao/songs/42/lyrics", headers=AUTH
+        ).json()["lrc"] == text
+
+
+def test_config_patch_without_new_fields_keeps_existing_rules(tmp_path, monkeypatch) -> None:
+    client, service = _enabled_client(tmp_path, monkeypatch)
+    with client:
+        service.patch("feiniao", MusicSourcePatch(revision=2, config=MusicSourceConfig(
+            audio_hosts=["audio.example.org"], artwork_hosts=["img1.kuwo.cn"], upstream_source="酷我音乐",
+            lyric_filters=LyricFilters(exact_lines=["自定义规则"]), audio_quality_order=["m4a"],
+        )))
+        # An older Web build strips fields it does not declare before calling the API.
+        response = service.patch("feiniao", MusicSourcePatch.model_validate({"revision": 3, "config": {
+            "audio_hosts": ["other.example.org"], "artwork_hosts": ["img1.kuwo.cn"],
+            "upstream_source": "酷我音乐", "audio_url_ttl_seconds": 150,
+        }}))
+    assert response["config"]["audio_hosts"] == ["other.example.org"]
+    assert response["config"]["lyric_filters"]["exact_lines"] == ["自定义规则"]
+    assert response["config"]["audio_quality_order"] == ["m4a"]
+
+
+def test_lyric_rule_limits_are_enforced() -> None:
+    for bad in (["x"], ["  "], ["x" * 201], ["ab"] * 51):
+        with pytest.raises(ValueError):
+            LyricFilters(exact_lines=bad)
+    assert LyricFilters(exact_lines=[" 水印 ", "水印"]).exact_lines == ["水印"]
+
+
+def test_new_source_gets_adapter_rules_and_migrated_source_keeps_them(tmp_path, monkeypatch) -> None:
+    client, service = _enabled_client(tmp_path, monkeypatch)
+    with client:
+        migrated = service.list_sources()["items"][0]["config"]
+        assert migrated["lyric_filters"] == FEINIAO_LYRIC_FILTERS
+        assert migrated["audio_quality_order"] == ["mp3", "m4a", "ogg"]
+        created = service.create(MusicSourceCreate(
+            id="backup", name="备用", adapter="feiniao", base_url="https://backup.example.org/",
+        ))
+        assert created["config"]["lyric_filters"] == FEINIAO_LYRIC_FILTERS
+        assert service.adapters()["items"][0]["default_config"]["lyric_filters"] == FEINIAO_LYRIC_FILTERS
+
+
+def test_lyric_filter_preview_reports_hits_and_writes_nothing(tmp_path, monkeypatch) -> None:
+    client, service = _enabled_client(tmp_path, monkeypatch)
+    with client:
+        path = "/v2/music/sources/feiniao/songs/{}/metadata"
+        body = {"title": "歌", "artists": ["人"], "lyrics_lrc": "[00:01.00]候选水印\n[00:02.00]正文"}
+        client.put(path.format(42), headers=AUTH, json={**body, "mode": "auto"})
+        client.put(path.format(43), headers=AUTH, json={**body, "mode": "manual"})
+        before = client.get(path.format(42), headers=AUTH).json()
+        result = service.preview_lyric_filters("feiniao", LyricFilters(exact_lines=["候选水印"]))
+        assert result["scanned_songs"] == 1
+        assert result["affected_songs"] == 1
+        assert result["removed_lines"] == 1
+        assert result["samples"] == [{"song_id": "42", "title": "歌", "line": "[00:01.00]候选水印"}]
+        assert client.get(path.format(42), headers=AUTH).json() == before
+
+
+def _formats(*types: str, host: str = "car-er.kuwo.cn"):
+    calls = []
+
+    def fetch(url: str) -> dict:
+        calls.append(url)
+        return {"data": [{"type": kind, "url": f"http://{host}/s.{kind}"} for kind in types]}
+
+    fetch.calls = calls
+    return fetch
+
+
+@pytest.fixture
+def public_dns(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "rhythm_metadata_api.application.music_adapters.socket.getaddrinfo",
+        lambda *args: [(None, None, None, None, ("1.1.1.1", 80))],
+    )
+
+
+def test_auto_quality_prefers_mp3_so_existing_caches_stay_valid(tmp_path, monkeypatch, public_dns) -> None:
+    client, service = _enabled_client(tmp_path, monkeypatch, _formats("flac", "m4a", "mp3"))
+    with client:
+        assert service.audio_url("feiniao", "42", "auto").endswith(".mp3")
+
+
+def test_auto_quality_falls_back_in_configured_order_and_skips_flac(tmp_path, monkeypatch, public_dns) -> None:
+    client, service = _enabled_client(tmp_path, monkeypatch, _formats("flac", "ogg", "m4a"))
+    with client:
+        assert service.audio_url("feiniao", "42", "auto").endswith(".m4a")
+        service.patch("feiniao", MusicSourcePatch(revision=2, config=MusicSourceConfig(
+            audio_quality_order=["flac", "mp3"],
+        )))
+        assert service.audio_url("feiniao", "42", "auto").endswith(".flac")
+
+
+def test_auto_quality_without_allowed_format_is_not_found(tmp_path, monkeypatch, public_dns) -> None:
+    client, _ = _enabled_client(tmp_path, monkeypatch, _formats("flac"))
+    with client:
+        response = client.get(
+            "/v2/music/sources/feiniao/songs/42/stream?quality=auto", headers=AUTH,
+        )
+    assert response.status_code == 404
+
+
+def test_explicit_mp3_never_falls_back(tmp_path, monkeypatch, public_dns) -> None:
+    client, service = _enabled_client(tmp_path, monkeypatch, _formats("m4a"))
+    with client, pytest.raises(V2NotFound):
+        service.audio_url("feiniao", "42", "mp3")
+
+
+def test_rejected_host_on_first_choice_does_not_fall_through(tmp_path, monkeypatch, public_dns) -> None:
+    def fetch(url: str) -> dict:
+        return {"data": [
+            {"type": "mp3", "url": "http://car-new.kuwo.cn/s.mp3"},
+            {"type": "m4a", "url": "http://car-er.kuwo.cn/s.m4a"},
+        ]}
+
+    client, service = _enabled_client(tmp_path, monkeypatch, fetch)
+    with client, pytest.raises(V2DomainError):
+        service.audio_url("feiniao", "42", "auto")
+
+
+def test_auto_quality_resolves_upstream_exactly_once_while_cached(tmp_path, monkeypatch, public_dns) -> None:
+    fetch = _formats("mp3")
+    client, service = _enabled_client(tmp_path, monkeypatch, fetch)
+    with client:
+        service.audio_url("feiniao", "42", "auto")
+        service.audio_url("feiniao", "42", "auto")
+    assert len(fetch.calls) == 1
+
+
+def test_unknown_quality_is_rejected(tmp_path, monkeypatch) -> None:
+    client, service = _enabled_client(tmp_path, monkeypatch)
+    with client, pytest.raises(V2DomainError):
+        service.audio_url("feiniao", "42", "best")
 
 
 def test_sparse_metadata_does_not_blank_upstream_search_fields(tmp_path: Path, monkeypatch) -> None:

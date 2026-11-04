@@ -1,8 +1,20 @@
-"""Persisted source registry and unified client-facing music operations."""
+"""Persisted source registry and unified client-facing music operations.
+
+Lyric filter invariants:
+- Filters run on upstream reads, automatic writes and every read, so a new rule applies at once,
+  including to old rows and restored backups. Manually edited lyrics are never filtered.
+- Accepted residual: removing a rule does not restore lines already filtered from stored automatic
+  lyrics, because clients submit filtered text. Refreshing the song from upstream restores them;
+  this is why administrators can preview a rule before saving it.
+- Saving rules bumps the source revision, so each song re-resolves its audio URL once.
+- config PATCH merges only submitted fields. A whole-object replace would let an older Web build,
+  whose schema strips unknown fields, silently reset rules it does not know about.
+"""
 
 from __future__ import annotations
 
 import ipaddress
+import logging
 import re
 import threading
 from datetime import UTC
@@ -20,8 +32,12 @@ from rhythm_metadata_api.application.music_adapters import (
     _AUDIO_HOSTS,
     _ID,
     ADAPTERS,
+    AUDIO_QUALITIES,
+    AUTO_QUALITY,
+    DEFAULT_AUDIO_QUALITY_ORDER,
     adapter_kinds,
-    clean_feiniao_lrc,
+    clean_lyrics,
+    split_lyrics,
 )
 from rhythm_metadata_api.application.music_images import MusicImageArchive, MusicImageArchiveError
 from rhythm_metadata_api.core.config import Settings
@@ -33,9 +49,33 @@ from rhythm_metadata_api.domain.v2.errors import (
 )
 from rhythm_metadata_api.infrastructure.db.models import MusicSongMetadata, MusicSource, utc_now
 
+log = logging.getLogger(__name__)
+
 _SOURCE_ID = re.compile(r"^[a-z][a-z0-9_-]{1,39}$")
 _AUDIO_URL_TTL_SECONDS = 150
 _HOST = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.IGNORECASE)
+
+
+AudioQuality = Literal["mp3", "m4a", "ogg", "flac"]
+_LYRIC_RULE_MIN = 2
+_LYRIC_RULE_MAX = 200
+_LYRIC_PREVIEW_ROWS = 5000
+_LYRIC_PREVIEW_SAMPLES = 20
+
+
+class LyricFilters(BaseModel):
+    exact_lines: list[str] = Field(default_factory=list, max_length=50)
+    by_tag_contains: list[str] = Field(default_factory=list, max_length=50)
+
+    @field_validator("exact_lines", "by_tag_contains")
+    @classmethod
+    def valid_rules(cls, values: list[str]) -> list[str]:
+        normalized = [value.strip() for value in values]
+        if any(not _LYRIC_RULE_MIN <= len(value) <= _LYRIC_RULE_MAX for value in normalized):
+            raise ValueError(
+                f"each lyric rule must contain {_LYRIC_RULE_MIN} to {_LYRIC_RULE_MAX} characters"
+            )
+        return list(dict.fromkeys(normalized))
 
 
 class MusicSourceConfig(BaseModel):
@@ -43,6 +83,15 @@ class MusicSourceConfig(BaseModel):
     artwork_hosts: list[str] = Field(default_factory=lambda: sorted(_ARTWORK_HOSTS), max_length=20)
     upstream_source: str = Field(default="酷我音乐", min_length=1, max_length=80)
     audio_url_ttl_seconds: int = Field(default=_AUDIO_URL_TTL_SECONDS, ge=0, le=600)
+    lyric_filters: LyricFilters = Field(default_factory=LyricFilters)
+    audio_quality_order: list[AudioQuality] = Field(
+        default_factory=lambda: list(DEFAULT_AUDIO_QUALITY_ORDER), min_length=1, max_length=4,
+    )
+
+    @field_validator("audio_quality_order")
+    @classmethod
+    def valid_quality_order(cls, values: list[str]) -> list[str]:
+        return list(dict.fromkeys(values))
 
     @field_validator("audio_hosts", "artwork_hosts")
     @classmethod
@@ -115,7 +164,9 @@ def _image_url(value: str | None) -> str | None:
     raise V2DomainError("image URL must be HTTPS or a music artwork proxy path")
 
 
-def serialize_metadata(item: MusicSongMetadata, images: MusicImageArchive | None = None) -> dict:
+def serialize_metadata(
+    item: MusicSongMetadata, images: MusicImageArchive | None = None, filters: dict | None = None,
+) -> dict:
     ingested_at = item.ingested_at.replace(tzinfo=item.ingested_at.tzinfo or UTC)
     updated_at = item.updated_at.replace(tzinfo=item.updated_at.tzinfo or UTC)
     return {
@@ -130,7 +181,11 @@ def serialize_metadata(item: MusicSongMetadata, images: MusicImageArchive | None
         "artist_avatar_url": images.delivery_url(item.artist_avatar_url) if images else item.artist_avatar_url,
         "artwork_storage": images.storage(item.artwork_url) if images else "external",
         "artist_avatar_storage": images.storage(item.artist_avatar_url) if images else "external",
-        "lyrics_lrc": clean_feiniao_lrc(item.lyrics_lrc) if item.lyrics_lrc else None,
+        "lyrics_lrc": (
+            clean_lyrics(item.lyrics_lrc, filters)
+            if item.lyrics_lrc and filters and item.mode != "manual"
+            else item.lyrics_lrc or None
+        ),
         "qualities": item.qualities,
         "mode": item.mode,
         "ingested_at": ingested_at.isoformat(),
@@ -225,9 +280,13 @@ class MusicSourceService:
                           MusicSongMetadata.song_id)
                 .offset((page - 1) * page_size).limit(page_size)
             )
+            filters = {
+                source.id: source.config.get("lyric_filters", {})
+                for source in session.scalars(select(MusicSource))
+            }
             items = []
             for row in rows:
-                item = serialize_metadata(row, self.images)
+                item = serialize_metadata(row, self.images, filters.get(row.source_id))
                 item["has_lyrics"] = bool(item.pop("lyrics_lrc"))
                 items.append(item)
             return {"items": items, "total": total, "page": page, "page_size": page_size}
@@ -237,17 +296,52 @@ class MusicSourceService:
             item = session.get(MusicSongMetadata, (source_id, self._id(song_id)))
             if item is None:
                 raise V2NotFound("music metadata has not been collected")
-            return serialize_metadata(item, self.images)
+            return serialize_metadata(item, self.images, self._lyric_filters(session, source_id))
+
+    def preview_lyric_filters(self, source_id: str, filters: LyricFilters) -> dict:
+        """Report what draft rules would remove from stored automatic lyrics; writes nothing."""
+        rules = filters.model_dump()
+        with self.sessions() as session:
+            if session.get(MusicSource, source_id) is None:
+                raise V2NotFound("music source not found")
+            rows = session.scalars(
+                select(MusicSongMetadata).where(
+                    MusicSongMetadata.source_id == source_id,
+                    MusicSongMetadata.mode != "manual",
+                    MusicSongMetadata.lyrics_lrc.is_not(None),
+                ).limit(_LYRIC_PREVIEW_ROWS)
+            )
+            scanned = affected = removed_lines = 0
+            samples: list[dict] = []
+            for row in rows:
+                scanned += 1
+                removed = split_lyrics(row.lyrics_lrc, rules)[1]
+                if not removed:
+                    continue
+                affected += 1
+                removed_lines += len(removed)
+                for line in removed:
+                    if len(samples) < _LYRIC_PREVIEW_SAMPLES:
+                        samples.append({"song_id": row.song_id, "title": row.title, "line": line})
+        return {
+            "scanned_songs": scanned, "affected_songs": affected,
+            "removed_lines": removed_lines, "samples": samples,
+        }
 
     def create(self, data: MusicSourceCreate) -> dict:
         if not _SOURCE_ID.fullmatch(data.id):
             raise V2DomainError("source id must contain lowercase letters, digits, '-' or '_'")
         if data.adapter not in ADAPTERS:
             raise V2DomainError("unsupported music adapter")
+        config = data.config.model_dump()
+        if "lyric_filters" not in data.config.model_fields_set:
+            # Filter text belongs to the adapter; other protocols start without any rules.
+            defaults = getattr(ADAPTERS[data.adapter], "default_config", {})
+            config["lyric_filters"] = defaults.get("lyric_filters", config["lyric_filters"])
         source = MusicSource(
             id=data.id, name=data.name.strip(), adapter=data.adapter,
             base_url=validate_base_url(data.base_url), enabled=data.enabled,
-            priority=data.priority, config=data.config.model_dump(), revision=1,
+            priority=data.priority, config=config, revision=1,
         )
         if not source.name:
             raise V2DomainError("source name is required")
@@ -287,7 +381,12 @@ class MusicSourceService:
             if "config" in fields:
                 if data.config is None:
                     raise V2DomainError("source config is required")
-                changes["config"] = data.config.model_dump()
+                current = MusicSourceConfig.model_validate(source.config).model_dump()
+                submitted = data.config.model_dump()
+                changes["config"] = {
+                    **current,
+                    **{key: submitted[key] for key in data.config.model_fields_set},
+                }
             changes["revision"] = data.revision + 1
             changes["updated_at"] = utc_now()
             result = session.execute(
@@ -300,6 +399,10 @@ class MusicSourceService:
                 raise V2Conflict("music source was changed by another administrator")
             session.commit()
             session.refresh(source)
+            log.info(
+                "music source %s updated to revision %s; fields: %s",
+                source_id, source.revision, sorted(fields - {"revision"}),
+            )
             return serialize_source(source)
 
     def _active(self, source_id: str) -> MusicSource:
@@ -322,6 +425,11 @@ class MusicSourceService:
             for host in MusicSourceConfig.model_validate(source.config).artwork_hosts
         )
 
+    @staticmethod
+    def _lyric_filters(session: Session, source_id: str) -> dict:
+        source = session.get(MusicSource, source_id)
+        return source.config.get("lyric_filters", {}) if source else {}
+
     def _id(self, value: str) -> str:
         if not _ID.fullmatch(value):
             raise V2DomainError("invalid upstream item id")
@@ -333,7 +441,7 @@ class MusicSourceService:
             item = session.get(MusicSongMetadata, (source_id, self._id(song_id)))
             if item is None:
                 raise V2NotFound("music metadata has not been collected")
-            return serialize_metadata(item, self.images)
+            return serialize_metadata(item, self.images, self._lyric_filters(session, source_id))
 
     def put_metadata(self, source_id: str, song_id: str, data: MusicSongMetadataWrite) -> dict:
         source = self._active(source_id)
@@ -361,7 +469,11 @@ class MusicSourceService:
             "duration_ms": data.duration_ms,
             "artwork_url": image_value(data.artwork_url),
             "artist_avatar_url": image_value(data.artist_avatar_url),
-            "lyrics_lrc": clean_feiniao_lrc(data.lyrics_lrc) if data.lyrics_lrc else None,
+            "lyrics_lrc": (
+                clean_lyrics(data.lyrics_lrc, source.config.get("lyric_filters", {}))
+                if data.lyrics_lrc and data.mode != "manual"
+                else data.lyrics_lrc or None
+            ),
             "qualities": list(dict.fromkeys(data.qualities)),
             "mode": data.mode,
         }
@@ -375,7 +487,7 @@ class MusicSourceService:
                     setattr(item, key, value)
                 item.updated_at = utc_now()
             session.commit()
-            return serialize_metadata(item, self.images)
+            return serialize_metadata(item, self.images, source.config.get("lyric_filters", {}))
 
     def archive_metadata_images(self, source_id: str, song_id: str) -> dict:
         with self.sessions() as session:
@@ -392,7 +504,7 @@ class MusicSourceService:
                     setattr(item, field, archived)
                     item.updated_at = utc_now()
             session.commit()
-            return serialize_metadata(item, self.images)
+            return serialize_metadata(item, self.images, self._lyric_filters(session, source_id))
 
     def _overlay(self, source_id: str, page: dict) -> dict:
         ids = [item.get("external_id") for item in page.get("items", [])]
@@ -483,10 +595,11 @@ class MusicSourceService:
                     return {"id": cached["id"], "source_id": source_id, "lrc": cached["lyrics_lrc"], "mode": cached["mode"]}
             except V2NotFound:
                 pass
-        return self._adapter(source).lyrics(source.base_url, source.id, self._id(song_id))
+        result = self._adapter(source).lyrics(source.base_url, source.id, self._id(song_id))
+        return {**result, "lrc": clean_lyrics(result["lrc"], source.config.get("lyric_filters", {}))}
 
     def audio_url(self, source_id: str, song_id: str, quality: str) -> str:
-        if quality not in {"mp3", "m4a", "ogg", "flac"}:
+        if quality != AUTO_QUALITY and quality not in AUDIO_QUALITIES:
             raise V2DomainError("unsupported audio quality")
         source = self._active(source_id)
         song_id = self._id(song_id)

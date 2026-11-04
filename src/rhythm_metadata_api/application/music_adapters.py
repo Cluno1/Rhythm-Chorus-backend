@@ -10,8 +10,9 @@ import ipaddress
 import json
 import re
 import socket
+import unicodedata
 from copy import copy
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -22,7 +23,16 @@ MAX_JSON_BYTES = 2_000_000
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 _AUDIO_HOSTS = frozenset({"car-er.kuwo.cn", "car-bj.kuwo.cn", "car-lv.kuwo.cn"})
 _ARTWORK_HOSTS = frozenset({"img1.kuwo.cn", "img2.kuwo.cn", "img3.kuwo.cn", "img4.kuwo.cn"})
-_LRC_TIME = re.compile(r"^\[\d{1,3}:\d{2}(?:\.\d{1,3})?\]")
+_LRC_TIME = re.compile(r"^(?:\[\d{1,3}:\d{2}(?:\.\d{1,3})?\])+")
+_BY_TAG = re.compile(r"^\[by:", re.IGNORECASE)
+AUDIO_QUALITIES = ("mp3", "m4a", "ogg", "flac")
+AUTO_QUALITY = "auto"
+# FLAC is left out on purpose: audio is relayed, so it would multiply gateway traffic.
+DEFAULT_AUDIO_QUALITY_ORDER = ("mp3", "m4a", "ogg")
+FEINIAO_LYRIC_FILTERS = {
+    "exact_lines": ["该音源由 飞鸟·轻音 提供服务", "官网:飞鸟.site", "————下面是正歌部分————"],
+    "by_tag_contains": ["飞鸟·轻音", "飞鸟.site"],
+}
 _PROXY_FAKE_IPS = ipaddress.ip_network("198.18.0.0/15")
 
 
@@ -34,23 +44,33 @@ class NoRedirect(HTTPRedirectHandler):
 _opener = build_opener(NoRedirect)
 
 
-def clean_feiniao_lrc(value: str) -> str:
-    """Remove the site's fixed promotional header while retaining song credits and verses."""
-    kept = []
+def _normalized(value: str) -> str:
+    """Compare text regardless of full-width punctuation and repeated whitespace."""
+    return " ".join(unicodedata.normalize("NFKC", value).split())
+
+
+def _line_is_filtered(line: str, exact_lines: set[str], by_tag_contains: list[str]) -> bool:
+    stripped = line.strip()
+    if _BY_TAG.match(stripped):
+        normalized = _normalized(stripped)
+        return any(text in normalized for text in by_tag_contains)
+    return _normalized(_LRC_TIME.sub("", stripped)) in exact_lines
+
+
+def split_lyrics(value: str, filters: dict) -> tuple[list[str], list[str]]:
+    """Return (kept, removed) lines. Rules are literal text, never patterns, so they cannot hang."""
+    exact_lines = {_normalized(text) for text in filters.get("exact_lines", [])}
+    by_tag_contains = [_normalized(text) for text in filters.get("by_tag_contains", [])]
+    kept: list[str] = []
+    removed: list[str] = []
     for line in value.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("[by:") and ("飞鸟·轻音" in stripped or "飞鸟.site" in stripped):
-            continue
-        lyric = _LRC_TIME.sub("", stripped).strip()
-        if lyric in {
-            "该音源由 飞鸟·轻音 提供服务",
-            "官网:飞鸟.site",
-            "官网：飞鸟.site",
-            "————下面是正歌部分————",
-        }:
-            continue
-        kept.append(line)
-    return "\n".join(kept).strip()
+        (removed if _line_is_filtered(line, exact_lines, by_tag_contains) else kept).append(line)
+    return kept, removed
+
+
+def clean_lyrics(value: str, filters: dict) -> str:
+    """Remove administrator-configured promotional lines; other lines keep their order and timing."""
+    return "\n".join(split_lyrics(value, filters)[0]).strip()
 
 
 def validate_public_url(url: str, *, hosts: frozenset[str] | None = None) -> str:
@@ -121,17 +141,22 @@ class MusicAdapter(Protocol):
 class FeiniaoAdapter:
     kind = "feiniao"
     upstream_source = "酷我音乐"
+    default_config: ClassVar[dict] = {"lyric_filters": FEINIAO_LYRIC_FILTERS}
 
     def __init__(self, fetch=fetch_json) -> None:
         self.fetch = fetch
         self.audio_hosts = _AUDIO_HOSTS
         self.artwork_hosts = _ARTWORK_HOSTS
+        self.audio_quality_order = DEFAULT_AUDIO_QUALITY_ORDER
 
     def configured(self, config: dict) -> FeiniaoAdapter:
         adapter = copy(self)
         adapter.audio_hosts = frozenset(config["audio_hosts"])
         adapter.artwork_hosts = frozenset(config["artwork_hosts"])
         adapter.upstream_source = config["upstream_source"]
+        adapter.audio_quality_order = tuple(
+            config.get("audio_quality_order") or DEFAULT_AUDIO_QUALITY_ORDER
+        )
         return adapter
 
     def _get(self, base_url: str, api: str, **params: object) -> dict:
@@ -226,7 +251,7 @@ class FeiniaoAdapter:
     def song(self, base_url: str, source_id: str, song_id: str) -> dict:
         payload = self._get(base_url, "get_song_with_source", id=song_id, source=self.upstream_source)
         qualities = [str(item.get("type")) for item in payload.get("data") or []
-                     if isinstance(item, dict) and item.get("url") and item.get("type") in {"mp3", "m4a", "ogg", "flac"}]
+                     if isinstance(item, dict) and item.get("url") and item.get("type") in AUDIO_QUALITIES]
         return {
             "id": f"{source_id}:{song_id}", "source_id": source_id,
             "external_id": song_id, "qualities": qualities,
@@ -238,20 +263,32 @@ class FeiniaoAdapter:
         lyrics = payload.get("gc")
         if not isinstance(lyrics, str):
             raise V2NotFound("lyrics are unavailable")
-        return {"id": f"{source_id}:{song_id}", "source_id": source_id, "lrc": clean_feiniao_lrc(lyrics)}
+        return {"id": f"{source_id}:{song_id}", "source_id": source_id, "lrc": lyrics}
 
     def audio_url(self, base_url: str, song_id: str, quality: str) -> str:
         payload = self._get(base_url, "get_song_with_source", id=song_id, source=self.upstream_source)
+        candidates: dict[str, str] = {}
         for item in payload.get("data") or []:
-            if isinstance(item, dict) and item.get("type") == quality:
-                url = item.get("url")
-                if isinstance(url, str):
-                    return validate_public_url(url, hosts=self.audio_hosts)
+            if isinstance(item, dict) and isinstance(item.get("url"), str):
+                candidates.setdefault(str(item.get("type")), item["url"])
+        # The Media3 cache key has no format, so "auto" must stay deterministic: the same upstream
+        # formats always select the same one. MP3 first keeps every existing cached song valid.
+        # A rejected host fails loudly instead of falling through, which would hide a bad host rule.
+        for candidate in self.audio_quality_order if quality == AUTO_QUALITY else (quality,):
+            if candidate in candidates:
+                return validate_public_url(candidates[candidate], hosts=self.audio_hosts)
         raise V2NotFound("requested audio quality is unavailable")
 
 
 ADAPTERS: dict[str, MusicAdapter] = {"feiniao": FeiniaoAdapter()}
 
 
-def adapter_kinds() -> list[dict[str, str]]:
-    return [{"id": key, "name": "飞鸟轻音" if key == "feiniao" else key} for key in ADAPTERS]
+def adapter_kinds() -> list[dict]:
+    return [
+        {
+            "id": key,
+            "name": "飞鸟轻音" if key == "feiniao" else key,
+            "default_config": getattr(adapter, "default_config", {}),
+        }
+        for key, adapter in ADAPTERS.items()
+    ]

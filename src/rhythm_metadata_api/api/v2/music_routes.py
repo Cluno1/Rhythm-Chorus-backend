@@ -18,6 +18,7 @@ from rhythm_metadata_api.application.music_adapters import (
 )
 from rhythm_metadata_api.application.music_images import MusicImageArchiveError
 from rhythm_metadata_api.application.music_sources import (
+    LyricFilters,
     MusicSongMetadataWrite,
     MusicSourceCreate,
     MusicSourcePatch,
@@ -69,6 +70,13 @@ def admin_archive_song_images(
     source_id: str, song_id: str, service: Sources, _: AdminActor,
 ) -> dict:
     return service.archive_metadata_images(source_id, song_id)
+
+
+@admin_router.post("/{source_id}/lyric-filters/preview")
+def preview_lyric_filters(
+    source_id: str, body: LyricFilters, service: Sources, _: AdminActor,
+) -> dict:
+    return service.preview_lyric_filters(source_id, body)
 
 
 @admin_router.post("", status_code=201)
