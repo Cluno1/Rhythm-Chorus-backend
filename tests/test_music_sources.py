@@ -258,6 +258,28 @@ def test_shared_metadata_precedes_upstream_and_manual_precedes_auto(tmp_path: Pa
         assert automatic["title"] == "人工曲名"
 
 
+def test_sparse_metadata_does_not_blank_upstream_search_fields(tmp_path: Path, monkeypatch) -> None:
+    def fetch(url: str) -> dict:
+        return {"code": 0, "data": {"songs": [{
+            "rid": 42, "name": "上游歌", "artist": "歌手", "album": "上游专辑",
+            "duration": 240, "pic": "https://img1.kuwo.cn/c.jpg",
+        }], "hasMore": False}}
+
+    monkeypatch.setitem(ADAPTERS, "feiniao", FeiniaoAdapter(fetch=fetch))
+    with TestClient(create_app(settings(tmp_path))) as client:
+        client.app.state.v2_container.music_sources.patch(
+            "feiniao", MusicSourcePatch(revision=1, enabled=True)
+        )
+        client.put("/v2/music/sources/feiniao/songs/42/metadata", headers=AUTH, json={
+            "title": "存储歌名", "artists": ["歌手"], "mode": "auto",
+        })
+        item = client.get("/v2/music/search?q=x", headers=AUTH).json()["sources"][0]["items"][0]
+    assert item["title"] == "存储歌名"
+    assert item["album"] == "上游专辑"
+    assert item["duration_ms"] == 240000
+    assert "img1.kuwo.cn" in item["artwork_url"]
+
+
 def test_admin_session_manages_sources(tmp_path: Path) -> None:
     with TestClient(create_public_app(settings(tmp_path))) as client:
         response = client.post("/v2/admin/session", json={

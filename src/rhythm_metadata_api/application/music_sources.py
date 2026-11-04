@@ -412,7 +412,12 @@ class MusicSourceService:
         for item in page["items"]:
             overlay = stored.get(item.get("external_id"))
             if overlay:
-                overlay = {key: value for key, value in overlay.items() if key != "lyrics_lrc"}
+                # Blank stored fields must not hide upstream values. A manually cleared album therefore
+                # still lists the upstream album; the API cannot tell "cleared" from "not provided".
+                overlay = {
+                    key: value for key, value in overlay.items()
+                    if key != "lyrics_lrc" and value not in (None, "", [])
+                }
             merged.append({**item, **overlay} if overlay else item)
         return {**page, "items": merged}
 
