@@ -21,6 +21,7 @@ from rhythm_metadata_api.api.v2.image_routes import router as image_router
 from rhythm_metadata_api.api.v2.management_routes import router as management_router
 from rhythm_metadata_api.api.v2.music_routes import admin_router as music_admin_router
 from rhythm_metadata_api.api.v2.music_routes import router as music_router
+from rhythm_metadata_api.api.v2.room_routes import admin_router as room_admin_router
 from rhythm_metadata_api.api.v2.room_routes import router as room_router
 from rhythm_metadata_api.api.v2.routes import actor_context
 from rhythm_metadata_api.api.v2.routes import router as v2_router
@@ -76,6 +77,8 @@ _PUBLIC_READ_ROUTES = (
     # issue 124：房间列表与详情。
     ("GET", re.compile(r"^/v2/rooms$")),
     ("GET", re.compile(r"^/v2/rooms/[^/]+$")),
+    ("GET", re.compile(r"^/v2/room-templates$")),
+    ("GET", re.compile(r"^/v2/room-users$")),
     ("GET", re.compile(r"^/v2/app-updates/latest$")),
     ("GET", re.compile(r"^/v2/app-updates/files/\d+/[A-Za-z0-9._-]+\.apk$")),
     ("HEAD", re.compile(r"^/v2/app-updates/files/\d+/[A-Za-z0-9._-]+\.apk$")),
@@ -101,6 +104,7 @@ _PUBLIC_WRITE_ROUTES = (
     ("POST", re.compile(r"^/v2/rooms/[^/]+/items$")),
     ("DELETE", re.compile(r"^/v2/rooms/[^/]+/items/[^/]+$")),
     ("PUT", re.compile(r"^/v2/rooms/[^/]+/order$")),
+    ("PATCH", re.compile(r"^/v2/rooms/[^/]+/sections/[^/]+$")),
     ("POST", re.compile(r"^/v2/labs/image-upload-batches$")),
     ("POST", re.compile(r"^/v2/labs/image-upload-batches/[^/]+/cancel$")),
     ("POST", re.compile(r"^/v2/labs/image-uploads$")),
@@ -369,6 +373,7 @@ def create_public_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(music_router)
     app.include_router(music_admin_router)
     app.include_router(room_router)
+    app.include_router(room_admin_router)
     app.include_router(image_router)
     app.include_router(image_admin_router)
     return app

@@ -58,10 +58,17 @@ from rhythm_metadata_api.domain.v2.rooms import (
     RoomListResponse,
     RoomOrderUpdate,
     RoomResponse,
+    RoomSectionPatch,
     RoomSectionResponse,
     RoomSectionSummary,
     RoomSummary,
+    RoomTemplateListResponse,
+    RoomTemplatePatch,
+    RoomTemplateResponse,
+    RoomTemplateSectionResponse,
+    RoomTemplateWrite,
     RoomUser,
+    RoomUserListResponse,
 )
 from rhythm_metadata_api.domain.v2.schemas import LibrarySearchItem
 from rhythm_metadata_api.infrastructure.db.models import (
@@ -69,6 +76,8 @@ from rhythm_metadata_api.infrastructure.db.models import (
     Room,
     RoomItem,
     RoomSection,
+    RoomTemplate,
+    RoomTemplateSection,
     Work,
     utc_now,
 )
@@ -122,6 +131,26 @@ class RoomService:
 
     # ---- 读 ----
 
+    def list_templates(self, *, enabled_only: bool) -> RoomTemplateListResponse:
+        with self.uow_factory() as uow:
+            statement = select(RoomTemplate).order_by(RoomTemplate.name, RoomTemplate.id)
+            if enabled_only:
+                statement = statement.where(RoomTemplate.enabled.is_(True))
+            return RoomTemplateListResponse(
+                items=[self._template_response(uow.session, template) for template in uow.session.scalars(statement)]
+            )
+
+    def list_users(self) -> RoomUserListResponse:
+        with self.uow_factory() as uow:
+            users = uow.session.scalars(
+                select(AuthUser).where(AuthUser.status == "active")
+                .order_by(AuthUser.display_name, AuthUser.id)
+            )
+            return RoomUserListResponse(items=[
+                RoomUser(user_id=user.id, display_name=(user.display_name or "").strip() or None)
+                for user in users
+            ])
+
     def list_rooms(self, actor: ActorContext, work_id: str | None = None) -> RoomListResponse:
         now = self._purge_expired()
         with self.uow_factory() as uow:
@@ -146,6 +175,45 @@ class RoomService:
 
     # ---- 写 ----
 
+    def create_template(self, request: RoomTemplateWrite) -> RoomTemplateResponse:
+        with self.uow_factory() as uow:
+            session = uow.session
+            self._validate_assignees(session, [entry.assignee_user_id for entry in request.sections])
+            template = RoomTemplate(name=request.name, enabled=request.enabled, revision=1)
+            session.add(template)
+            session.flush()
+            for position, entry in enumerate(request.sections, start=1):
+                session.add(RoomTemplateSection(
+                    template_id=template.id, name=entry.name, position=position,
+                    assignee_user_id=entry.assignee_user_id,
+                ))
+            session.flush()
+            LOGGER.info("room template created: template=%s sections=%s", template.id, len(request.sections))
+            return self._template_response(session, template)
+
+    def update_template(self, template_id: str, request: RoomTemplatePatch) -> RoomTemplateResponse:
+        with self.uow_factory() as uow:
+            session = uow.session
+            template = session.get(RoomTemplate, template_id)
+            if template is None:
+                raise V2NotFound("room template not found")
+            if template.revision != request.revision:
+                raise StaleRevision(etag(request.revision), etag(template.revision))
+            self._validate_assignees(session, [entry.assignee_user_id for entry in request.sections])
+            session.execute(delete(RoomTemplateSection).where(RoomTemplateSection.template_id == template.id))
+            template.name = request.name
+            template.enabled = request.enabled
+            template.revision += 1
+            template.updated_at = self._now()
+            for position, entry in enumerate(request.sections, start=1):
+                session.add(RoomTemplateSection(
+                    template_id=template.id, name=entry.name, position=position,
+                    assignee_user_id=entry.assignee_user_id,
+                ))
+            session.flush()
+            LOGGER.info("room template updated: template=%s revision=%s", template.id, template.revision)
+            return self._template_response(session, template)
+
     def create_room(
         self, request: RoomCreate, idempotency_key: str, actor: ActorContext
     ) -> StoredResponse:
@@ -162,11 +230,12 @@ class RoomService:
                 service_date=request.service_date,
                 expires_at=room_expires_at(request.service_date),
                 created_by_user_id=actor.actor_id,
+                template_id=request.template_id,
                 revision=1,
             )
             session.add(room)
             session.flush()
-            for section in self._initial_sections(room):
+            for section in self._initial_sections(session, room):
                 session.add(section)
             session.flush()
             LOGGER.info(
@@ -319,11 +388,83 @@ class RoomService:
             self._delete_rooms(session, [room.id])
             LOGGER.info("room deleted: room=%s by=%s", room_id, actor.actor_id)
 
+    def update_section(
+        self, room_id: str, section_id: str, request: RoomSectionPatch,
+        expected_revision: int, actor: ActorContext, *, administrator: bool = False,
+    ) -> RoomResponse:
+        if not request.model_fields_set:
+            raise V2DomainError("at least one section field is required")
+        now = self._purge_expired()
+        with self.uow_factory() as uow:
+            session = uow.session
+            room = self._require_room(session, room_id, now)
+            if actor.actor_id != room.created_by_user_id and not administrator:
+                raise RoomForbidden("only the room creator or an administrator can edit sections")
+            if room.revision != expected_revision:
+                raise StaleRevision(etag(expected_revision), etag(room.revision))
+            section = session.get(RoomSection, section_id)
+            if section is None or section.room_id != room.id:
+                raise V2NotFound("section not found in this room")
+            if "assignee_user_id" in request.model_fields_set:
+                self._validate_assignees(session, [request.assignee_user_id])
+                section.assignee_user_id = request.assignee_user_id
+            if "name" in request.model_fields_set:
+                section.name = request.name
+            room.revision += 1
+            room.updated_at = self._now()
+            session.flush()
+            LOGGER.info(
+                "room section updated: room=%s section=%s by=%s revision=%s",
+                room.id, section.id, actor.actor_id, room.revision,
+            )
+            return self._response(session, room, actor)
+
     # ---- 内部 ----
 
-    def _initial_sections(self, room: Room) -> list[RoomSection]:
-        """新房间的段。第一期固定一个无名默认段；第二期在这里按 ``room.template_id`` 生成。"""
-        return [RoomSection(room_id=room.id, name=None, position=1)]
+    def _initial_sections(self, session: Session, room: Room) -> list[RoomSection]:
+        """Copy a template once; existing rooms remain unchanged when the template is edited."""
+        if room.template_id is None:
+            return [RoomSection(room_id=room.id, name=None, position=1)]
+        template = session.get(RoomTemplate, room.template_id)
+        if template is None or not template.enabled:
+            raise V2NotFound("enabled room template not found")
+        entries = session.scalars(
+            select(RoomTemplateSection)
+            .where(RoomTemplateSection.template_id == template.id)
+            .order_by(RoomTemplateSection.position, RoomTemplateSection.id)
+        )
+        return [
+            RoomSection(
+                room_id=room.id, name=entry.name, position=entry.position,
+                assignee_user_id=entry.assignee_user_id,
+            )
+            for entry in entries
+        ]
+
+    @staticmethod
+    def _template_response(session: Session, template: RoomTemplate) -> RoomTemplateResponse:
+        sections = session.scalars(
+            select(RoomTemplateSection)
+            .where(RoomTemplateSection.template_id == template.id)
+            .order_by(RoomTemplateSection.position, RoomTemplateSection.id)
+        )
+        return RoomTemplateResponse(
+            id=template.id, name=template.name, enabled=template.enabled,
+            revision=template.revision,
+            sections=[RoomTemplateSectionResponse(
+                id=section.id, name=section.name, position=section.position,
+                assignee_user_id=section.assignee_user_id,
+            ) for section in sections],
+        )
+
+    @staticmethod
+    def _validate_assignees(session: Session, user_ids: list[str | None]) -> None:
+        wanted = {user_id for user_id in user_ids if user_id}
+        active = set(session.scalars(
+            select(AuthUser.id).where(AuthUser.id.in_(wanted), AuthUser.status == "active")
+        ))
+        if active != wanted:
+            raise V2DomainError("section assignee must be an active registered user")
 
     def _purge_expired(self) -> datetime:
         """懒清理：在**独立事务**里删掉已过期的房间（连同段和歌）并提交，返回本次的当前时间。

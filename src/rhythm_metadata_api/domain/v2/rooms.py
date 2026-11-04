@@ -16,6 +16,7 @@ from rhythm_metadata_api.domain.v2.schemas import ApiModel, LibrarySearchItem
 class RoomCreate(ApiModel):
     name: str = Field(min_length=1, max_length=60)
     service_date: date
+    template_id: str | None = Field(default=None, min_length=36, max_length=36)
 
     @field_validator("name")
     @classmethod
@@ -30,6 +31,69 @@ class RoomItemCreate(ApiModel):
     work_id: str = Field(min_length=1, max_length=36)
     # 不传时放进最后一段；第二期「我负责的段」会由客户端显式传入。
     section_id: str | None = Field(default=None, max_length=36)
+
+
+class RoomTemplateSectionWrite(ApiModel):
+    name: str = Field(min_length=1, max_length=60)
+    assignee_user_id: str | None = Field(default=None, min_length=1, max_length=100)
+
+    @field_validator("name")
+    @classmethod
+    def strip_name(cls, value: str) -> str:
+        stripped = " ".join(value.split())
+        if not stripped:
+            raise ValueError("section name must not be blank")
+        return stripped
+
+
+class RoomTemplateWrite(ApiModel):
+    name: str = Field(min_length=1, max_length=60)
+    enabled: bool = True
+    sections: list[RoomTemplateSectionWrite] = Field(min_length=1, max_length=50)
+
+    @field_validator("name")
+    @classmethod
+    def strip_name(cls, value: str) -> str:
+        stripped = " ".join(value.split())
+        if not stripped:
+            raise ValueError("template name must not be blank")
+        return stripped
+
+
+class RoomTemplatePatch(RoomTemplateWrite):
+    revision: int = Field(ge=1)
+
+
+class RoomTemplateSectionResponse(RoomTemplateSectionWrite):
+    id: str
+    position: int
+
+
+class RoomTemplateResponse(ApiModel):
+    id: str
+    name: str
+    enabled: bool
+    revision: int
+    sections: list[RoomTemplateSectionResponse]
+
+
+class RoomTemplateListResponse(ApiModel):
+    items: list[RoomTemplateResponse]
+
+
+class RoomSectionPatch(ApiModel):
+    name: str | None = Field(default=None, max_length=60)
+    assignee_user_id: str | None = Field(default=None, max_length=100)
+
+    @field_validator("name")
+    @classmethod
+    def strip_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = " ".join(value.split())
+        if not stripped:
+            raise ValueError("section name must not be blank")
+        return stripped
 
 
 class RoomOrderSection(ApiModel):
@@ -47,6 +111,10 @@ class RoomUser(ApiModel):
     user_id: str
     # 没设昵称时为 null，由客户端显示兜底名称。
     display_name: str | None = None
+
+
+class RoomUserListResponse(ApiModel):
+    items: list[RoomUser]
 
 
 class RoomContainedWork(ApiModel):

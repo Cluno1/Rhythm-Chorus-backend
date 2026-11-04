@@ -983,9 +983,34 @@ class AuthAuditEvent(Base):
     )
 
 
-# issue 124: rooms where several people pick and order the songs for one gathering.
-# Every item belongs to a section from the start (one unnamed default section today), so
-# admin room templates, named sections and section assignees later only add data.
+# issue 124/152: rooms and reusable administrator-managed section templates.
+class RoomTemplate(Base):
+    __tablename__ = "v2_room_templates"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(60), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class RoomTemplateSection(Base):
+    __tablename__ = "v2_room_template_sections"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    template_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_room_templates.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(60), nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    assignee_user_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+    __table_args__ = (Index("v2_room_template_sections_template_idx", "template_id", "position"),)
+
+
 class Room(Base):
     __tablename__ = "v2_rooms"
 
@@ -995,7 +1020,7 @@ class Room(Base):
     # Start of the day after service_date (UTC+8); lazily purged once passed.
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_by_user_id: Mapped[str] = mapped_column(String(100), nullable=False)
-    # Reserved for room templates (issue 124 phase 2); always null today.
+    # Snapshot provenance only: editing a template never changes an existing room.
     template_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
@@ -1016,7 +1041,7 @@ class RoomSection(Base):
     # Null for the default section; template sections carry names such as "开场".
     name: Mapped[str | None] = mapped_column(String(60), nullable=True)
     position: Mapped[int] = mapped_column(Integer, nullable=False)
-    # Reserved for section assignees (issue 124 phase 2); always null today.
+    # Can be changed by the room creator or an administrator.
     assignee_user_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
     __table_args__ = (Index("v2_room_sections_room_idx", "room_id", "position"),)
