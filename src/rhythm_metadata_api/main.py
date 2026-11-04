@@ -7,6 +7,8 @@ from fastapi.responses import JSONResponse
 
 from rhythm_metadata_api.api.public_auth import router as public_auth_router
 from rhythm_metadata_api.api.routes import health, tracks
+from rhythm_metadata_api.api.v2.announcement_routes import admin_router as announcement_admin_router
+from rhythm_metadata_api.api.v2.announcement_routes import router as announcement_router
 from rhythm_metadata_api.api.v2.image_routes import admin_router as image_admin_router
 from rhythm_metadata_api.api.v2.image_routes import router as image_router
 from rhythm_metadata_api.api.v2.management_routes import router as management_router
@@ -126,6 +128,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(music_admin_router)
     app.include_router(room_router)
     app.include_router(room_admin_router)
+    app.include_router(announcement_router)
+    app.include_router(announcement_admin_router)
     app.include_router(image_router)
     app.include_router(image_admin_router)
     app.include_router(public_auth_router)

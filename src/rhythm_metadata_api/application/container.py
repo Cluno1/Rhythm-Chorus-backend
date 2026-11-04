@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session, aliased
 
+from rhythm_metadata_api.application.announcement_service import AnnouncementService
 from rhythm_metadata_api.application.catalog_service import CatalogService
 from rhythm_metadata_api.application.client_image_service import ClientImageService
 from rhythm_metadata_api.application.external_lyrics import ExternalLyricsService
@@ -29,6 +30,7 @@ class V2Container:
     catalog: CatalogService
     client_images: ClientImageService
     rooms: RoomService
+    announcements: AnnouncementService
     external_lyrics: ExternalLyricsService
     music_sources: MusicSourceService
 
@@ -89,6 +91,7 @@ class V2Container:
             catalog=catalog,
             client_images=client_images,
             rooms=rooms,
+            announcements=AnnouncementService(UnitOfWorkFactory(sessions), settings),
             external_lyrics=external_lyrics,
             music_sources=MusicSourceService(sessions, settings),
         )

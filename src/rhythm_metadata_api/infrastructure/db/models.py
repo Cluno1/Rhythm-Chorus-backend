@@ -1069,3 +1069,32 @@ class RoomItem(Base):
         UniqueConstraint("room_id", "work_id", name="v2_room_items_one_work_per_room"),
         Index("v2_room_items_section_idx", "section_id", "position"),
     )
+
+
+class Announcement(Base):
+    __tablename__ = "v2_announcements"
+    __table_args__ = (Index("v2_announcements_status_published_idx", "status", "published_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    title: Mapped[str] = mapped_column(String(100), nullable=False)
+    summary: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    body: Mapped[dict] = mapped_column(JSON, nullable=False)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="draft")
+    importance: Mapped[str] = mapped_column(String(20), nullable=False, default="normal")
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_by: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class AnnouncementImage(Base):
+    __tablename__ = "v2_announcement_images"
+
+    name: Mapped[str] = mapped_column(String(80), primary_key=True)
+    media_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    byte_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    uploaded_by: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+

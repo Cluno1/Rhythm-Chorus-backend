@@ -16,6 +16,8 @@ from rhythm_metadata_api.api.public_auth import router as public_auth_router
 from rhythm_metadata_api.api.public_updates import UpdateRepository
 from rhythm_metadata_api.api.public_updates import router as public_updates_router
 from rhythm_metadata_api.api.routes import health
+from rhythm_metadata_api.api.v2.announcement_routes import admin_router as announcement_admin_router
+from rhythm_metadata_api.api.v2.announcement_routes import router as announcement_router
 from rhythm_metadata_api.api.v2.image_routes import admin_router as image_admin_router
 from rhythm_metadata_api.api.v2.image_routes import router as image_router
 from rhythm_metadata_api.api.v2.management_routes import router as management_router
@@ -79,6 +81,9 @@ _PUBLIC_READ_ROUTES = (
     ("GET", re.compile(r"^/v2/rooms/[^/]+$")),
     ("GET", re.compile(r"^/v2/room-templates$")),
     ("GET", re.compile(r"^/v2/room-users$")),
+    ("GET", re.compile(r"^/v2/announcements$")),
+    ("GET", re.compile(r"^/v2/announcements/images/[a-f0-9]{64}\.(?:jpg|png|webp|gif)$")),
+    ("GET", re.compile(r"^/v2/announcements/[^/]+$")),
     ("GET", re.compile(r"^/v2/app-updates/latest$")),
     ("GET", re.compile(r"^/v2/app-updates/files/\d+/[A-Za-z0-9._-]+\.apk$")),
     ("HEAD", re.compile(r"^/v2/app-updates/files/\d+/[A-Za-z0-9._-]+\.apk$")),
@@ -374,6 +379,8 @@ def create_public_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(music_admin_router)
     app.include_router(room_router)
     app.include_router(room_admin_router)
+    app.include_router(announcement_router)
+    app.include_router(announcement_admin_router)
     app.include_router(image_router)
     app.include_router(image_admin_router)
     return app
