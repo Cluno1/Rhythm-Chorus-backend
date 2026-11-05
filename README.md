@@ -22,7 +22,7 @@ Rhythm 私有作品库后端。v2 以 `Work → Arrangement → Score/Rendition 
 
 客户端通过设备签名调用 `GET/PUT /v2/music/sources/{source_id}/songs/{song_id}/metadata`。按来源与歌曲 ID 保存首次入库时间、标题、歌手、专辑、时长、封面和歌手头像地址、歌词、音质以及自动/手动获取方式；手动记录优先于后续自动更新。搜索、推荐、歌单和歌曲详情优先采用已存字段，音频仍在播放时动态解析。图片字段保存 URL，不保存图片二进制。
 
-设备客户端使用 `GET /v2/music/sources` 列出已启用来源，`GET /v2/music/search?q=&page=&source=` 搜索；浏览接口为 `/v2/music/sources/{id}/recommend`、`/playlists`、`/playlists/{playlist_id}`，歌曲接口为 `/songs/{song_id}`、`/songs/{song_id}/lyrics`、`/songs/{song_id}/stream?quality=mp3`。封面 `artwork_url` 是相对自家 API 根地址的 `/v2/music/artwork?...`。歌曲身份为 `{来源ID}:{上游歌曲ID}`；请求路径使用不带来源前缀的上游歌曲 ID。设备接口沿用现有设备签名；音频 `GET/HEAD` 支持单个字节 Range。飞鸟适配器仅调用匿名只读接口，不转发登录 Cookie 或账号数据。
+设备客户端使用 `GET /v2/music/sources` 列出已启用来源，`GET /v2/music/search?q=&page=&source=` 搜索；`GET /v2/music/recommended-albums?limit=` 随机返回推荐歌单（只有名称、封面、歌曲数，歌曲走 `/playlists/{id}`）；浏览接口为 `/v2/music/sources/{id}/recommend`、`/playlists`、`/playlists/{playlist_id}`，歌曲接口为 `/songs/{song_id}`、`/songs/{song_id}/lyrics`、`/songs/{song_id}/stream?quality=mp3`。封面 `artwork_url` 是相对自家 API 根地址的 `/v2/music/artwork?...`。歌曲身份为 `{来源ID}:{上游歌曲ID}`；请求路径使用不带来源前缀的上游歌曲 ID。设备接口沿用现有设备签名；音频 `GET/HEAD` 支持单个字节 Range。飞鸟适配器仅调用匿名只读接口，不转发登录 Cookie 或账号数据。
 
 ## 本地运行
 

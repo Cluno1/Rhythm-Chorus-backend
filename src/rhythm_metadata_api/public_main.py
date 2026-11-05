@@ -47,6 +47,7 @@ _EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85
 _PUBLIC_READ_ROUTES = (
     ("GET", re.compile(r"^/v2/music/sources$")),
     ("GET", re.compile(r"^/v2/music/search$")),
+    ("GET", re.compile(r"^/v2/music/recommended-albums$")),
     ("GET", re.compile(r"^/v2/music/artwork$")),
     ("GET", re.compile(r"^/v2/music/images/[a-f0-9]{64}\.(?:jpg|png|webp|gif)$")),
     ("GET", re.compile(r"^/v2/music/sources/[a-z][a-z0-9_-]{1,39}/(?:recommend|playlists)$")),

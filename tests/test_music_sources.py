@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from fastapi.testclient import TestClient
 
+from rhythm_metadata_api.application import music_sources
 from rhythm_metadata_api.application.device_auth import hash_admin_password
 from rhythm_metadata_api.application.music_adapters import (
     _AUDIO_HOSTS,
@@ -28,7 +29,7 @@ from rhythm_metadata_api.application.music_sources import (
 from rhythm_metadata_api.core.config import Settings
 from rhythm_metadata_api.domain.v2.errors import V2Conflict, V2DomainError, V2NotFound
 from rhythm_metadata_api.main import create_app
-from rhythm_metadata_api.public_main import create_public_app
+from rhythm_metadata_api.public_main import _public_read_allowed, create_public_app
 
 TOKEN = "issue140-test-bootstrap-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -708,3 +709,104 @@ def test_artwork_is_relayed_only_from_known_image_hosts(tmp_path: Path, monkeypa
         response = client.get("/v2/music/artwork?url=https%3A%2F%2Fimg1.kuwo.cn%2Fpic.jpg", headers=AUTH)
         assert response.status_code == 200
         assert response.content == b"fake-image"
+
+
+def recommended_client(tmp_path: Path, monkeypatch, playlists: list[dict]):
+    calls: list[int] = []
+    state = {"fail": False}
+
+    def fetch(url: str) -> dict:
+        params = parse_qs(urlsplit(url).query)
+        assert params["api"][0] == "playlist_home"
+        calls.append(int(params["pn"][0]))
+        if state["fail"]:
+            raise V2DomainError("upstream failed")
+        data = playlists if calls[-1] == 1 else []
+        return {"code": 200, "data": data, "pagination": {"total_pages": 10}}
+
+    monkeypatch.setitem(ADAPTERS, "feiniao", FeiniaoAdapter(fetch=fetch))
+    client = TestClient(create_app(settings(tmp_path)))
+    client.__enter__()
+    client.app.state.v2_container.music_sources.patch("feiniao", MusicSourcePatch(revision=1, enabled=True))
+    return client, calls, state
+
+
+def recommended_names(client: TestClient, limit: int = 50) -> set[str]:
+    response = client.get(f"/v2/music/recommended-albums?limit={limit}", headers=AUTH)
+    assert response.status_code == 200
+    return {item["name"] for item in response.json()["items"]}
+
+
+def playlist_row(pid: str, name: str = "歌单", songs: int = 50, img: str | None = "https://img1.kuwo.cn/a.jpg") -> dict:
+    return {"id": pid, "name": name, "total_songs": songs, "img": img}
+
+
+def test_推荐歌单只返回有名称有封面且歌曲数在范围内的(tmp_path, monkeypatch) -> None:
+    client, _, _ = recommended_client(tmp_path, monkeypatch, [
+        playlist_row("1", "合适"), playlist_row("2", "  "), playlist_row("3", "无封面", img=None),
+        playlist_row("4", "太少", songs=9), playlist_row("5", "太多", songs=201),
+        playlist_row("6", "下限", songs=10), playlist_row("7", "上限", songs=200),
+    ])
+    with client:
+        assert recommended_names(client) == {"合适", "下限", "上限"}
+
+
+def test_推荐歌单数量不超过_limit(tmp_path, monkeypatch) -> None:
+    client, _, _ = recommended_client(
+        tmp_path, monkeypatch, [playlist_row(str(i), f"歌单{i}") for i in range(1, 11)],
+    )
+    with client:
+        assert len(recommended_names(client, limit=3)) == 3
+
+
+def test_候选池有效期内恰好拉一轮上游(tmp_path, monkeypatch) -> None:
+    client, calls, _ = recommended_client(tmp_path, monkeypatch, [playlist_row("1")])
+    with client:
+        recommended_names(client)
+        recommended_names(client)
+        assert len(calls) == 3
+        assert calls[0] == 1
+
+
+def test_刷新失败时继续返回旧候选池且五分钟内不重试(tmp_path, monkeypatch) -> None:
+    now = {"value": 1000.0}
+    monkeypatch.setattr(music_sources, "monotonic", lambda: now["value"])
+    client, calls, state = recommended_client(tmp_path, monkeypatch, [playlist_row("1", "旧歌单")])
+    with client:
+        assert recommended_names(client) == {"旧歌单"}
+        state["fail"] = True
+        now["value"] += 3601
+        assert recommended_names(client) == {"旧歌单"}
+        assert len(calls) == 6
+        now["value"] += 299
+        assert recommended_names(client) == {"旧歌单"}
+        assert len(calls) == 6
+
+
+def test_没有缓存且上游失败时返回空列表(tmp_path, monkeypatch) -> None:
+    client, _, state = recommended_client(tmp_path, monkeypatch, [playlist_row("1")])
+    state["fail"] = True
+    with client:
+        assert recommended_names(client) == set()
+
+
+def test_修改歌曲数范围立即生效且不重新拉上游(tmp_path, monkeypatch) -> None:
+    client, calls, _ = recommended_client(tmp_path, monkeypatch, [playlist_row("1", "五十首", songs=50)])
+    with client:
+        assert recommended_names(client) == {"五十首"}
+        service = client.app.state.v2_container.music_sources
+        service.patch("feiniao", MusicSourcePatch(
+            revision=2, config=MusicSourceConfig(recommended_min_songs=60),
+        ))
+        assert recommended_names(client) == set()
+        assert len(calls) == 3
+
+
+def test_歌曲数范围下限不能大于上限() -> None:
+    with pytest.raises(ValueError):
+        MusicSourceConfig(recommended_min_songs=20, recommended_max_songs=10)
+
+
+def test_推荐歌单是公开网关的只读路由() -> None:
+    assert _public_read_allowed("GET", "/v2/music/recommended-albums")
+    assert not _public_read_allowed("POST", "/v2/music/recommended-albums")

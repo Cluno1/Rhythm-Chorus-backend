@@ -136,6 +136,13 @@ def music_image(name: str, service: Sources) -> Response:
     )
 
 
+@router.get("/recommended-albums")
+def recommended_albums(
+    service: Sources, _: Actor, limit: Annotated[int, Query(ge=1, le=50)] = 10
+) -> dict:
+    return service.recommended_albums(limit)
+
+
 @router.get("/sources/{source_id}/recommend")
 def recommend(source_id: str, service: Sources, _: Actor, page: Page = 1) -> dict:
     return service.recommend(source_id, page)

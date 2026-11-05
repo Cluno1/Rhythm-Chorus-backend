@@ -9,20 +9,29 @@ Lyric filter invariants:
 - Saving rules bumps the source revision, so each song re-resolves its audio URL once.
 - config PATCH merges only submitted fields. A whole-object replace would let an older Web build,
   whose schema strips unknown fields, silently reset rules it does not know about.
+
+Recommended album invariants:
+- Requests never wait on upstream while a pool is fresh, and the pool refreshes once per hour per
+  worker. Filters run per request, so a new song count range applies at once.
+- A failed refresh keeps serving the old pool and waits five minutes before retrying, otherwise a
+  broken upstream would add seconds to every home screen request.
+- Accepted residual: each worker holds its own pool, so workers may return different playlists.
+  This is harmless for a random recommendation and each pool expires by itself.
 """
 
 from __future__ import annotations
 
 import ipaddress
 import logging
+import random
 import re
 import threading
 from datetime import UTC
 from time import monotonic
-from typing import Literal
+from typing import Literal, Self
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -53,6 +62,12 @@ log = logging.getLogger(__name__)
 
 _SOURCE_ID = re.compile(r"^[a-z][a-z0-9_-]{1,39}$")
 _AUDIO_URL_TTL_SECONDS = 150
+_RECOMMENDED_POOL_TTL_SECONDS = 3600
+_RECOMMENDED_RETRY_SECONDS = 300
+_RECOMMENDED_RANDOM_PAGES = 2
+_RECOMMENDED_LAST_PAGE = 10
+_RECOMMENDED_MIN_SONGS = 10
+_RECOMMENDED_MAX_SONGS = 200
 _HOST = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.IGNORECASE)
 
 
@@ -87,6 +102,14 @@ class MusicSourceConfig(BaseModel):
     audio_quality_order: list[AudioQuality] = Field(
         default_factory=lambda: list(DEFAULT_AUDIO_QUALITY_ORDER), min_length=1, max_length=4,
     )
+    recommended_min_songs: int = Field(default=_RECOMMENDED_MIN_SONGS, ge=1, le=100000)
+    recommended_max_songs: int = Field(default=_RECOMMENDED_MAX_SONGS, ge=1, le=100000)
+
+    @model_validator(mode="after")
+    def valid_recommended_range(self) -> Self:
+        if self.recommended_min_songs > self.recommended_max_songs:
+            raise ValueError("recommended_min_songs must not exceed recommended_max_songs")
+        return self
 
     @field_validator("audio_quality_order")
     @classmethod
@@ -242,6 +265,8 @@ class MusicSourceService:
         self._audio_urls: dict[tuple[str, int, str, str], tuple[float, str]] = {}
         self._audio_urls_guard = threading.Lock()
         self._audio_url_locks = [threading.Lock() for _ in range(32)]
+        self._recommended_pools: dict[str, tuple[float, list[dict]]] = {}
+        self._recommended_lock = threading.Lock()
 
     def adapters(self) -> dict:
         return {"items": adapter_kinds()}
@@ -563,6 +588,41 @@ class MusicSourceService:
                 select(MusicSource).where(MusicSource.enabled.is_(True))
                 .order_by(MusicSource.priority, MusicSource.id)
             ))
+
+    def recommended_albums(self, limit: int) -> dict:
+        candidates = []
+        for source in self._enabled_sources():
+            low = source.config.get("recommended_min_songs", _RECOMMENDED_MIN_SONGS)
+            high = source.config.get("recommended_max_songs", _RECOMMENDED_MAX_SONGS)
+            candidates += [
+                item for item in self._recommended_pool(source)
+                if item["name"].strip() and item["artwork_url"] and low <= item["song_count"] <= high
+            ]
+        return {"items": random.sample(candidates, min(limit, len(candidates)))}
+
+    def _recommended_pool(self, source: MusicSource) -> list[dict]:
+        cached = self._recommended_pools.get(source.id)
+        if cached and monotonic() < cached[0]:
+            return cached[1]
+        with self._recommended_lock:
+            cached = self._recommended_pools.get(source.id)
+            if cached and monotonic() < cached[0]:
+                return cached[1]
+            pages = random.sample(range(2, _RECOMMENDED_LAST_PAGE + 1), _RECOMMENDED_RANDOM_PAGES)
+            items: dict[str, dict] = {}
+            for page in (1, *pages):
+                try:
+                    result = self._adapter(source).playlists(source.base_url, source.id, page)
+                except (V2Unavailable, V2DomainError) as error:
+                    log.warning("Recommended playlists failed: source=%s page=%s error=%s", source.id, page, error)
+                    continue
+                items.update((item["id"], item) for item in result["items"])
+            if items:
+                pool = (monotonic() + _RECOMMENDED_POOL_TTL_SECONDS, list(items.values()))
+            else:
+                pool = (monotonic() + _RECOMMENDED_RETRY_SECONDS, cached[1] if cached else [])
+            self._recommended_pools[source.id] = pool
+            return pool[1]
 
     def recommend(self, source_id: str, page: int) -> dict:
         source = self._active(source_id)
