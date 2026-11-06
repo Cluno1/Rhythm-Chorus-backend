@@ -246,10 +246,12 @@ class FeiniaoAdapter:
                     "artwork_url": self._artwork(item.get("img"), source_id),
                     "song_count": int(item.get("total_songs") or 0),
                 })
+        total_pages = int(pagination.get("total_pages") or page) if isinstance(pagination, dict) else page
         return {
             "items": items, "page": page,
-            "has_more": page < int(pagination.get("total_pages") or page)
-            if isinstance(pagination, dict) else False,
+            "has_more": page < total_pages,
+            # issue 171: the recommended pool samples pages across the whole hot list.
+            "total_pages": total_pages,
         }
 
     def search_playlists(self, base_url: str, source_id: str, query: str, page: int) -> dict:

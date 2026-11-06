@@ -711,23 +711,38 @@ def test_artwork_is_relayed_only_from_known_image_hosts(tmp_path: Path, monkeypa
         assert response.content == b"fake-image"
 
 
-def recommended_client(tmp_path: Path, monkeypatch, playlists: list[dict]):
+def recommended_client(
+    tmp_path: Path, monkeypatch, playlists: list[dict], *,
+    total_pages: int = 10, pages: dict[int, list[dict]] | None = None,
+    keyword_rows: list[dict] | None = None,
+):
     calls: list[int] = []
-    state = {"fail": False}
+    searches: list[str] = []
+    state = {"fail": False, "search_fail": False}
 
     def fetch(url: str) -> dict:
         params = parse_qs(urlsplit(url).query)
+        if params["api"][0] == "search_playlist":
+            searches.append(params["key"][0])
+            if state["search_fail"]:
+                raise V2DomainError("search failed")
+            return {"code": 200, "data": {"list": keyword_rows or [], "total": str(len(keyword_rows or []))}}
         assert params["api"][0] == "playlist_home"
         calls.append(int(params["pn"][0]))
         if state["fail"]:
             raise V2DomainError("upstream failed")
-        data = playlists if calls[-1] == 1 else []
-        return {"code": 200, "data": data, "pagination": {"total_pages": 10}}
+        if pages is not None:
+            data = pages.get(calls[-1], [])
+        else:
+            data = playlists if calls[-1] == 1 else []
+        return {"code": 200, "data": data, "pagination": {"total_pages": total_pages}}
 
     monkeypatch.setitem(ADAPTERS, "feiniao", FeiniaoAdapter(fetch=fetch))
     client = TestClient(create_app(settings(tmp_path)))
     client.__enter__()
     client.app.state.v2_container.music_sources.patch("feiniao", MusicSourcePatch(revision=1, enabled=True))
+    state["searches"] = searches
+    _SEARCHES[id(client)] = searches
     return client, calls, state
 
 
@@ -739,6 +754,17 @@ def recommended_names(client: TestClient, limit: int = 50) -> set[str]:
 
 def playlist_row(pid: str, name: str = "歌单", songs: int = 50, img: str | None = "https://img1.kuwo.cn/a.jpg") -> dict:
     return {"id": pid, "name": name, "total_songs": songs, "img": img}
+
+
+def keyword_row(pid: str, name: str, songs: int = 50) -> dict:
+    return {"id": pid, "name": name, "total": str(songs), "img": "https://img1.kuwo.cn/k.jpg"}
+
+
+_SEARCHES: dict[int, list[str]] = {}
+
+
+def state_searches(client: TestClient) -> list[str]:
+    return _SEARCHES[id(client)]
 
 
 def test_推荐歌单只返回有名称有封面且歌曲数在范围内的(tmp_path, monkeypatch) -> None:
@@ -764,8 +790,11 @@ def test_候选池有效期内恰好拉一轮上游(tmp_path, monkeypatch) -> No
     with client:
         recommended_names(client)
         recommended_names(client)
-        assert len(calls) == 3
+        # First pool: page 1 (learns total_pages) + 2 front + 2 anywhere, each page exactly once.
         assert calls[0] == 1
+        assert len(calls) == 5
+        assert len(set(calls)) == 5
+        assert len(state_searches(client)) == 1
 
 
 def test_刷新失败时继续返回旧候选池且五分钟内不重试(tmp_path, monkeypatch) -> None:
@@ -777,10 +806,10 @@ def test_刷新失败时继续返回旧候选池且五分钟内不重试(tmp_pat
         state["fail"] = True
         now["value"] += 3601
         assert recommended_names(client) == {"旧歌单"}
-        assert len(calls) == 6
+        assert len(calls) == 9
         now["value"] += 299
         assert recommended_names(client) == {"旧歌单"}
-        assert len(calls) == 6
+        assert len(calls) == 9
 
 
 def test_没有缓存且上游失败时返回空列表(tmp_path, monkeypatch) -> None:
@@ -799,7 +828,7 @@ def test_修改歌曲数范围立即生效且不重新拉上游(tmp_path, monkey
             revision=2, config=MusicSourceConfig(recommended_min_songs=60),
         ))
         assert recommended_names(client) == set()
-        assert len(calls) == 3
+        assert len(calls) == 5
 
 
 def test_歌曲数范围下限不能大于上限() -> None:
@@ -977,3 +1006,109 @@ def test_歌词写入与本地歌词接口在公开网关白名单内() -> None:
     assert _public_write_allowed("PUT", "/v2/music/device-lyrics")
     assert _public_read_allowed("GET", "/v2/music/device-lyrics")
     assert not _public_write_allowed("POST", "/v2/music/sources/feiniao/songs/42/lyrics")
+
+
+# ---- issue 171：首页轮播推荐歌单常换新 ----
+
+
+def test_推荐抽页范围按上游总页数且不取最后一页也不固定第一页(tmp_path, monkeypatch) -> None:
+    now = {"value": 1000.0}
+    monkeypatch.setattr(music_sources, "monotonic", lambda: now["value"])
+    client, calls, _ = recommended_client(tmp_path, monkeypatch, [playlist_row("1")], total_pages=455)
+    with client:
+        recommended_names(client)
+        seen_pages: set[int] = set()
+        for _ in range(40):
+            now["value"] += 3601
+            before = len(calls)
+            recommended_names(client)
+            refresh = calls[before:]
+            assert len(refresh) == 4 and len(set(refresh)) == 4
+            assert sum(1 for page in refresh if page <= 50) >= 2
+            seen_pages.update(refresh)
+        assert max(seen_pages) > 50
+        assert all(1 <= page <= 454 for page in seen_pages)
+
+
+def test_推荐不取只剩几个歌单的最后一页(tmp_path, monkeypatch) -> None:
+    now = {"value": 1000.0}
+    monkeypatch.setattr(music_sources, "monotonic", lambda: now["value"])
+    client, calls, _ = recommended_client(tmp_path, monkeypatch, [playlist_row("1")], total_pages=6)
+    with client:
+        for _ in range(30):
+            recommended_names(client)
+            now["value"] += 3601
+        # 4 of pages 1..5 every refresh; page 6 (the short last page) never.
+        assert set(calls) == {1, 2, 3, 4, 5}
+
+
+def test_推荐优先返回72小时内没推过的歌单(tmp_path, monkeypatch) -> None:
+    rows = [playlist_row(str(i), f"歌单{i}") for i in range(1, 7)]
+    client, _, _ = recommended_client(tmp_path, monkeypatch, rows)
+    with client:
+        first = recommended_names(client, limit=3)
+        second = recommended_names(client, limit=3)
+        assert first.isdisjoint(second)
+        assert first | second == {f"歌单{i}" for i in range(1, 7)}
+
+
+def test_没推过的不够时用最早推过的补满(tmp_path, monkeypatch) -> None:
+    clock = {"value": 1_000_000.0}
+    monkeypatch.setattr(music_sources.time, "time", lambda: clock["value"])
+    rows = [playlist_row(str(i), f"歌单{i}") for i in range(1, 5)]
+    client, _, _ = recommended_client(tmp_path, monkeypatch, rows)
+    with client:
+        first = recommended_names(client, limit=3)
+        clock["value"] += 10
+        second = recommended_names(client, limit=3)
+        assert len(second) == 3
+        assert len(second - first) == 1
+        clock["value"] += 72 * 3600 + 20
+        assert len(recommended_names(client, limit=4)) == 4
+
+
+def test_推过记录超过上限时先删最旧的(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(music_sources, "_RECOMMENDED_SEEN_MAX", 3)
+    rows = [playlist_row(str(i), f"歌单{i}") for i in range(1, 6)]
+    client, _, _ = recommended_client(tmp_path, monkeypatch, rows)
+    with client:
+        recommended_names(client, limit=5)
+        service = client.app.state.v2_container.music_sources
+        assert len(service._recommended_seen) == 3
+
+
+def test_关键词每小时轮换并混入候选池(tmp_path, monkeypatch) -> None:
+    now = {"value": 1000.0}
+    clock = {"value": 3600.0 * 1000}
+    monkeypatch.setattr(music_sources, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(music_sources.time, "time", lambda: clock["value"])
+    client, _, state = recommended_client(
+        tmp_path, monkeypatch, [], keyword_rows=[keyword_row("900", "关键词歌单")],
+    )
+    with client:
+        client.app.state.v2_container.music_sources.patch("feiniao", MusicSourcePatch(
+            revision=2, config=MusicSourceConfig(recommended_keywords=["民谣", "摇滚", "治愈"]),
+        ))
+        assert recommended_names(client) == {"关键词歌单"}
+        now["value"] += 3601
+        clock["value"] += 3600
+        recommended_names(client)
+        assert state["searches"] == ["摇滚", "治愈"]
+
+
+def test_关键词为空时不搜索(tmp_path, monkeypatch) -> None:
+    client, _, state = recommended_client(tmp_path, monkeypatch, [playlist_row("1", "热门")])
+    with client:
+        client.app.state.v2_container.music_sources.patch("feiniao", MusicSourcePatch(
+            revision=2, config=MusicSourceConfig(recommended_keywords=[]),
+        ))
+        assert recommended_names(client) == {"热门"}
+        assert state["searches"] == []
+
+
+def test_关键词搜索失败仍返回热门榜结果(tmp_path, monkeypatch) -> None:
+    client, _, state = recommended_client(tmp_path, monkeypatch, [playlist_row("1", "热门")])
+    state["search_fail"] = True
+    with client:
+        assert recommended_names(client) == {"热门"}
+        assert len(state["searches"]) == 1

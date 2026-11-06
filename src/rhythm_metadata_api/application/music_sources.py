@@ -28,6 +28,15 @@ Recommended album invariants:
   broken upstream would add seconds to every home screen request.
 - Accepted residual: each worker holds its own pool, so workers may return different playlists.
   This is harmless for a random recommendation and each pool expires by itself.
+- issue 171, rotation: the hot list has hundreds of pages but its first pages change slowly, so
+  the pool samples pages across the whole list (``total_pages`` from upstream, half of them from
+  the newer front pages, never the short last page; page 1 is not pinned) and adds one keyword
+  playlist search, the keyword rotating every hour. Playlists returned in the last 72 hours are
+  only used to fill up when too few unseen ones remain.
+- Accepted residual: the "recently returned" record lives in process memory and is shared by all
+  users. A restart or a second worker starts with an empty record, which only falls back to plain
+  random picks for a while; it is capped so it cannot grow without bound. Rejected: a table or
+  Redis for this, which adds a write to every home screen request for a best-effort preference.
 """
 
 from __future__ import annotations
@@ -37,6 +46,8 @@ import logging
 import random
 import re
 import threading
+import time
+from collections import OrderedDict
 from datetime import UTC
 from time import monotonic
 from typing import Literal, Self
@@ -75,8 +86,15 @@ _SOURCE_ID = re.compile(r"^[a-z][a-z0-9_-]{1,39}$")
 _AUDIO_URL_TTL_SECONDS = 150
 _RECOMMENDED_POOL_TTL_SECONDS = 3600
 _RECOMMENDED_RETRY_SECONDS = 300
-_RECOMMENDED_RANDOM_PAGES = 2
-_RECOMMENDED_LAST_PAGE = 10
+_RECOMMENDED_FRONT_PAGES = 2
+_RECOMMENDED_ANY_PAGES = 2
+_RECOMMENDED_FRONT_LAST_PAGE = 50
+_RECOMMENDED_SEEN_SECONDS = 72 * 3600
+_RECOMMENDED_SEEN_MAX = 5000
+_RECOMMENDED_KEYWORDS = (
+    "流行", "民谣", "摇滚", "古典", "治愈", "轻音乐", "爵士", "粤语", "经典老歌", "华语",
+    "欧美", "日语", "说唱", "电子", "学习", "运动", "睡前", "咖啡馆", "钢琴", "怀旧",
+)
 _RECOMMENDED_MIN_SONGS = 10
 _RECOMMENDED_MAX_SONGS = 200
 _HOST = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.IGNORECASE)
@@ -115,6 +133,16 @@ class MusicSourceConfig(BaseModel):
     )
     recommended_min_songs: int = Field(default=_RECOMMENDED_MIN_SONGS, ge=1, le=100000)
     recommended_max_songs: int = Field(default=_RECOMMENDED_MAX_SONGS, ge=1, le=100000)
+    # issue 171: one of these is searched per hourly pool refresh; empty turns the mix-in off.
+    recommended_keywords: list[str] = Field(default_factory=lambda: list(_RECOMMENDED_KEYWORDS), max_length=100)
+
+    @field_validator("recommended_keywords")
+    @classmethod
+    def valid_recommended_keywords(cls, values: list[str]) -> list[str]:
+        normalized = [value.strip() for value in values if value.strip()]
+        if any(len(value) > 40 for value in normalized):
+            raise ValueError("each recommended keyword must contain at most 40 characters")
+        return list(dict.fromkeys(normalized))
 
     @model_validator(mode="after")
     def valid_recommended_range(self) -> Self:
@@ -286,6 +314,10 @@ class MusicSourceService:
         self._audio_url_locks = [threading.Lock() for _ in range(32)]
         self._recommended_pools: dict[str, tuple[float, list[dict]]] = {}
         self._recommended_lock = threading.Lock()
+        self._recommended_total_pages: dict[str, int] = {}
+        # issue 171: playlist id -> wall-clock time it was last returned, oldest first.
+        self._recommended_seen: OrderedDict[str, float] = OrderedDict()
+        self._recommended_seen_lock = threading.Lock()
 
     def adapters(self) -> dict:
         return {"items": adapter_kinds()}
@@ -681,15 +713,46 @@ class MusicSourceService:
             ))
 
     def recommended_albums(self, limit: int) -> dict:
-        candidates = []
+        candidates: dict[str, dict] = {}
         for source in self._enabled_sources():
             low = source.config.get("recommended_min_songs", _RECOMMENDED_MIN_SONGS)
             high = source.config.get("recommended_max_songs", _RECOMMENDED_MAX_SONGS)
-            candidates += [
-                item for item in self._recommended_pool(source)
-                if item["name"].strip() and item["artwork_url"] and low <= item["song_count"] <= high
-            ]
-        return {"items": random.sample(candidates, min(limit, len(candidates)))}
+            for item in self._recommended_pool(source):
+                if item["name"].strip() and item["artwork_url"] and low <= item["song_count"] <= high:
+                    candidates.setdefault(item["id"], item)
+        return {"items": self._pick_unseen(list(candidates.values()), limit)}
+
+    def _pick_unseen(self, candidates: list[dict], limit: int) -> list[dict]:
+        """issue 171: prefer playlists not returned in the last 72 hours, then the least recent."""
+        count = min(limit, len(candidates))
+        now = time.time()
+        with self._recommended_seen_lock:
+            seen = self._recommended_seen
+            while seen and next(iter(seen.values())) < now - _RECOMMENDED_SEEN_SECONDS:
+                seen.popitem(last=False)
+            fresh = [item for item in candidates if item["id"] not in seen]
+            picked = random.sample(fresh, min(count, len(fresh)))
+            if len(picked) < count:
+                stale = sorted((item for item in candidates if item["id"] in seen), key=lambda item: seen[item["id"]])
+                picked += stale[:count - len(picked)]
+            for item in picked:
+                seen.pop(item["id"], None)
+                seen[item["id"]] = now
+            while len(seen) > _RECOMMENDED_SEEN_MAX:
+                seen.popitem(last=False)
+        return picked
+
+    def _recommended_pages(self, source_id: str, exclude: tuple[int, ...] = ()) -> list[int]:
+        """Pages of the hot list for one pool refresh; page 1 only while the page count is unknown."""
+        total = self._recommended_total_pages.get(source_id)
+        if total is None:
+            return [1]
+        last = max(1, total - 1) if total > 1 else 1
+        front = [page for page in range(1, min(_RECOMMENDED_FRONT_LAST_PAGE, last) + 1) if page not in exclude]
+        pages = random.sample(front, min(_RECOMMENDED_FRONT_PAGES, len(front)))
+        rest = [page for page in range(1, last + 1) if page not in pages and page not in exclude]
+        pages += random.sample(rest, min(_RECOMMENDED_ANY_PAGES, len(rest)))
+        return pages
 
     def _recommended_pool(self, source: MusicSource) -> list[dict]:
         cached = self._recommended_pools.get(source.id)
@@ -699,15 +762,37 @@ class MusicSourceService:
             cached = self._recommended_pools.get(source.id)
             if cached and monotonic() < cached[0]:
                 return cached[1]
-            pages = random.sample(range(2, _RECOMMENDED_LAST_PAGE + 1), _RECOMMENDED_RANDOM_PAGES)
+            adapter = self._adapter(source)
             items: dict[str, dict] = {}
-            for page in (1, *pages):
+            pages = self._recommended_pages(source.id)
+            first_build = pages == [1]
+            for page in pages:
                 try:
-                    result = self._adapter(source).playlists(source.base_url, source.id, page)
+                    result = adapter.playlists(source.base_url, source.id, page)
                 except (V2Unavailable, V2DomainError) as error:
                     log.warning("Recommended playlists failed: source=%s page=%s error=%s", source.id, page, error)
                     continue
                 items.update((item["id"], item) for item in result["items"])
+                if result.get("total_pages"):
+                    self._recommended_total_pages[source.id] = int(result["total_pages"])
+            if first_build and source.id in self._recommended_total_pages:
+                # Page 1 told us the size of the list; fill the first pool like every later one.
+                for page in self._recommended_pages(source.id, exclude=(1,)):
+                    try:
+                        result = adapter.playlists(source.base_url, source.id, page)
+                    except (V2Unavailable, V2DomainError) as error:
+                        log.warning("Recommended playlists failed: source=%s page=%s error=%s", source.id, page, error)
+                        continue
+                    items.update((item["id"], item) for item in result["items"])
+            keywords = source.config.get("recommended_keywords", list(_RECOMMENDED_KEYWORDS))
+            if keywords and hasattr(adapter, "search_playlists"):
+                keyword = keywords[int(time.time() // 3600) % len(keywords)]
+                try:
+                    result = adapter.search_playlists(source.base_url, source.id, keyword, 1)
+                    items.update((item["id"], item) for item in result["items"])
+                except (V2Unavailable, V2DomainError) as error:
+                    log.warning("Recommended keyword playlists failed: source=%s error=%s", source.id, error)
+            log.info("Recommended pool refreshed: source=%s pages=%s playlists=%s", source.id, pages, len(items))
             if items:
                 pool = (monotonic() + _RECOMMENDED_POOL_TTL_SECONDS, list(items.values()))
             else:
