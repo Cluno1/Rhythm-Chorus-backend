@@ -10,6 +10,17 @@ Lyric filter invariants:
 - config PATCH merges only submitted fields. A whole-object replace would let an older Web build,
   whose schema strips unknown fields, silently reset rules it does not know about.
 
+Public song lyrics invariants (issue 166):
+- ``lyrics_mode`` records who chose the lyrics, apart from the record-wide ``mode``. ``PUT .../lyrics``
+  with ``auto`` writes only while no lyrics are stored, as one conditional UPDATE, so two clients
+  that both fell back to LRCLIB cannot replace each other. ``manual`` always replaces them; the user
+  decided that the latest manual choice wins for everyone.
+- An automatic whole-record ``PUT .../metadata`` never blanks stored lyrics and never replaces
+  manually chosen lyrics. Otherwise "refresh from the song's source", which finds no lyrics for
+  exactly these songs, would erase the fallback lyrics again.
+- Rejected: reusing the whole-record ``PUT`` for fallback lyrics. It also rewrites title, artwork and
+  the record-wide mode, and a manual lyric would block automatic tag refreshes for the whole song.
+
 Recommended album invariants:
 - Requests never wait on upstream while a pool is fresh, and the pool refreshes once per hour per
   worker. Filters run per request, so a new song count range applies at once.
@@ -170,6 +181,12 @@ class MusicSongMetadataWrite(BaseModel):
     mode: Literal["auto", "manual"] = "auto"
 
 
+class MusicSongLyricsWrite(BaseModel):
+    lyrics_lrc: str = Field(min_length=1, max_length=200_000)
+    mode: Literal["auto", "manual"] = "auto"
+    provider: str | None = Field(default=None, max_length=40)
+
+
 def _image_url(value: str | None) -> str | None:
     if value is None or not value.strip():
         return None
@@ -206,9 +223,11 @@ def serialize_metadata(
         "artist_avatar_storage": images.storage(item.artist_avatar_url) if images else "external",
         "lyrics_lrc": (
             clean_lyrics(item.lyrics_lrc, filters)
-            if item.lyrics_lrc and filters and item.mode != "manual"
+            if item.lyrics_lrc and filters and item.mode != "manual" and item.lyrics_mode != "manual"
             else item.lyrics_lrc or None
         ),
+        "lyrics_mode": item.lyrics_mode,
+        "lyrics_provider": item.lyrics_provider,
         "qualities": item.qualities,
         "mode": item.mode,
         "ingested_at": ingested_at.isoformat(),
@@ -502,17 +521,65 @@ class MusicSourceService:
             "qualities": list(dict.fromkeys(data.qualities)),
             "mode": data.mode,
         }
+        if changes["lyrics_lrc"]:
+            changes.update(
+                lyrics_mode=data.mode, lyrics_provider="edit" if data.mode == "manual" else "source",
+                lyrics_updated_at=utc_now(),
+            )
+        else:
+            changes.update(lyrics_mode=None, lyrics_provider=None, lyrics_updated_at=None)
         with self.sessions() as session:
             item = session.get(MusicSongMetadata, (source_id, song_id))
             if item is None:
                 item = MusicSongMetadata(source_id=source_id, song_id=song_id, **changes)
                 session.add(item)
             elif item.mode != "manual" or data.mode == "manual":
+                if data.mode == "auto" and (not changes["lyrics_lrc"] or item.lyrics_mode == "manual"):
+                    # issue 166: see the module invariants; keep the stored lyrics and their origin.
+                    for key in ("lyrics_lrc", "lyrics_mode", "lyrics_provider", "lyrics_updated_at"):
+                        changes.pop(key)
                 for key, value in changes.items():
                     setattr(item, key, value)
                 item.updated_at = utc_now()
             session.commit()
             return serialize_metadata(item, self.images, source.config.get("lyric_filters", {}))
+
+    def put_lyrics(self, source_id: str, song_id: str, data: MusicSongLyricsWrite) -> dict:
+        """issue 166: store fallback (auto) or user-picked (manual) lyrics without touching other fields."""
+        source = self._active(source_id)
+        song_id = self._id(song_id)
+        lyrics = (
+            clean_lyrics(data.lyrics_lrc, source.config.get("lyric_filters", {}))
+            if data.mode == "auto" else data.lyrics_lrc.strip()
+        )
+        if not lyrics:
+            raise V2DomainError("lyrics must not be blank")
+        values = {
+            "lyrics_lrc": lyrics, "lyrics_mode": data.mode,
+            "lyrics_provider": (data.provider or "").strip() or None,
+            "lyrics_updated_at": utc_now(), "updated_at": utc_now(),
+        }
+        with self.sessions() as session:
+            if session.get(MusicSongMetadata, (source_id, song_id)) is None:
+                raise V2NotFound("music metadata has not been collected")
+            query = update(MusicSongMetadata).where(
+                MusicSongMetadata.source_id == source_id, MusicSongMetadata.song_id == song_id,
+            )
+            if data.mode == "auto":
+                query = query.where(or_(
+                    MusicSongMetadata.lyrics_lrc.is_(None), MusicSongMetadata.lyrics_lrc == "",
+                ))
+            written = session.execute(query.values(**values)).rowcount == 1
+            session.commit()
+            log.info(
+                "public song lyrics %s: source=%s song=%s mode=%s provider=%s",
+                "stored" if written else "kept", source_id, song_id, data.mode, values["lyrics_provider"],
+            )
+            item = session.get(MusicSongMetadata, (source_id, song_id), populate_existing=True)
+            return {
+                "written": written,
+                **serialize_metadata(item, self.images, source.config.get("lyric_filters", {})),
+            }
 
     def archive_metadata_images(self, source_id: str, song_id: str) -> dict:
         with self.sessions() as session:
@@ -579,6 +646,30 @@ class MusicSourceService:
                     raise V2Unavailable("configured music source is unavailable") from error
                 unavailable.append(source.id)
         if sources and not results:
+            raise V2Unavailable("all configured music sources are unavailable")
+        return {"sources": results, "unavailable_sources": unavailable}
+
+    def search_playlists(self, query: str, page: int, source_id: str | None = None) -> dict:
+        """issue 167: playlists by name, in the same multi-source shell as song search."""
+        query = query.strip()
+        if not query or len(query) > 100:
+            raise V2DomainError("search query must contain 1 to 100 characters")
+        sources = [self._active(source_id)] if source_id else self._enabled_sources()
+        results = []
+        unavailable = []
+        for source in sources:
+            adapter = self._adapter(source)
+            if not hasattr(adapter, "search_playlists"):
+                continue
+            try:
+                result = adapter.search_playlists(source.base_url, source.id, query, page)
+                results.append({"source_id": source.id, **result})
+            except (V2Unavailable, V2DomainError) as error:
+                log.warning("Playlist search failed: source=%s page=%s error=%s", source.id, page, error)
+                if source_id:
+                    raise V2Unavailable("configured music source is unavailable") from error
+                unavailable.append(source.id)
+        if sources and not results and unavailable:
             raise V2Unavailable("all configured music sources are unavailable")
         return {"sources": results, "unavailable_sources": unavailable}
 

@@ -74,6 +74,31 @@ class MusicSongMetadata(Base):
     mode: Mapped[str] = mapped_column(String(12), nullable=False)
     ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    # issue 166: who chose the lyrics, independent of the record-wide ``mode``.
+    lyrics_mode: Mapped[str | None] = mapped_column(String(12))
+    lyrics_provider: Mapped[str | None] = mapped_column(String(40))
+    lyrics_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DeviceSongLyrics(Base):
+    """issue 166: lyrics adopted for a local song, shared by normalized title and artist."""
+
+    __tablename__ = "v2_device_song_lyrics"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    title_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    artist_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    artist: Mapped[str] = mapped_column(String(500), nullable=False)
+    album: Mapped[str | None] = mapped_column(String(500))
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    lyrics_lrc: Mapped[str] = mapped_column(Text, nullable=False)
+    mode: Mapped[str] = mapped_column(String(12), nullable=False)
+    provider: Mapped[str | None] = mapped_column(String(40))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    __table_args__ = (Index("v2_device_song_lyrics_key_idx", "title_key", "artist_key"),)
 
 
 class RevisionedMixin:

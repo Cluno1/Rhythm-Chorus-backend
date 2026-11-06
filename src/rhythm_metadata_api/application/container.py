@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session, aliased
 from rhythm_metadata_api.application.announcement_service import AnnouncementService
 from rhythm_metadata_api.application.catalog_service import CatalogService
 from rhythm_metadata_api.application.client_image_service import ClientImageService
+from rhythm_metadata_api.application.device_song_lyrics import DeviceSongLyricsService
 from rhythm_metadata_api.application.external_lyrics import ExternalLyricsService
 from rhythm_metadata_api.application.music_sources import MusicSourceService
 from rhythm_metadata_api.application.room_service import RoomService
@@ -33,6 +34,7 @@ class V2Container:
     announcements: AnnouncementService
     external_lyrics: ExternalLyricsService
     music_sources: MusicSourceService
+    device_song_lyrics: DeviceSongLyricsService
 
     @classmethod
     def build(cls, settings: Settings) -> V2Container:
@@ -94,6 +96,7 @@ class V2Container:
             announcements=AnnouncementService(UnitOfWorkFactory(sessions), settings),
             external_lyrics=external_lyrics,
             music_sources=MusicSourceService(sessions, settings),
+            device_song_lyrics=DeviceSongLyricsService(sessions),
         )
 
     def close(self) -> None:

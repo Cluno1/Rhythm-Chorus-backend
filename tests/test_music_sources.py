@@ -810,3 +810,170 @@ def test_歌曲数范围下限不能大于上限() -> None:
 def test_推荐歌单是公开网关的只读路由() -> None:
     assert _public_read_allowed("GET", "/v2/music/recommended-albums")
     assert not _public_read_allowed("POST", "/v2/music/recommended-albums")
+
+
+# ---- issue 167：公共歌单关键词搜索 ----
+
+def _playlist_search_fetch(pages: dict[int, object], calls: list[dict]):
+    def fetch(url: str) -> dict:
+        params = parse_qs(urlsplit(url).query)
+        if params["api"][0] != "search_playlist":
+            return fake_fetch(url)
+        calls.append({key: values[0] for key, values in params.items()})
+        return {"code": 200, "data": pages[int(params["pn"][0])]}
+    return fetch
+
+
+def _live_client(tmp_path: Path, monkeypatch, fetch) -> TestClient:
+    monkeypatch.setitem(ADAPTERS, "feiniao", FeiniaoAdapter(fetch=fetch))
+    client = TestClient(create_app(settings(tmp_path)))
+    client.__enter__()
+    client.app.state.v2_container.music_sources.patch("feiniao", MusicSourcePatch(revision=1, enabled=True))
+    return client
+
+
+def test_歌单搜索恰好请求一次上游search_playlist并映射摘要(tmp_path, monkeypatch) -> None:
+    calls: list[dict] = []
+    fetch = _playlist_search_fetch({1: {"total": "45", "list": [{
+        "id": "3591", "name": "赞美诗精选", "img": "https://img1.kuwo.cn/p.jpg",
+        "total": "32", "uname": "u", "listencnt": "9",
+    }]}}, calls)
+    client = _live_client(tmp_path, monkeypatch, fetch)
+    try:
+        response = client.get("/v2/music/playlists/search", headers=AUTH, params={"q": " 赞美 ", "page": 1})
+    finally:
+        client.__exit__(None, None, None)
+    assert response.status_code == 200, response.text
+    assert len(calls) == 1
+    assert calls[0]["key"] == "赞美" and calls[0]["pn"] == "1"
+    page = response.json()["sources"][0]
+    assert page["source_id"] == "feiniao" and page["page"] == 1 and page["has_more"] is True
+    assert page["items"] == [{
+        "id": "feiniao:3591", "source_id": "feiniao", "external_id": "3591", "name": "赞美诗精选",
+        "artwork_url": "/v2/music/artwork?url=https%3A%2F%2Fimg1.kuwo.cn%2Fp.jpg&source=feiniao",
+        "song_count": 32,
+    }]
+
+
+def test_歌单搜索到最后一页或空页时没有下一页() -> None:
+    adapter = FeiniaoAdapter(fetch=_playlist_search_fetch({
+        3: {"total": "45", "list": [{"id": "1", "name": "a"}]},
+        4: {"total": "999", "list": []},
+    }, []))
+    assert adapter.search_playlists("http://x.example/", "feiniao", "a", 3)["has_more"] is False
+    assert adapter.search_playlists("http://x.example/", "feiniao", "a", 4)["has_more"] is False
+
+
+def test_歌单搜索跳过非法ID和无名称项且歌曲数非法时为零() -> None:
+    adapter = FeiniaoAdapter(fetch=_playlist_search_fetch({1: {"total": 3, "list": [
+        {"id": "../x", "name": "坏ID"}, {"id": "2", "name": "  "},
+        {"id": "3", "name": "好歌单", "total": "abc"}, "不是对象",
+    ]}}, []))
+    items = adapter.search_playlists("http://x.example/", "feiniao", "a", 1)["items"]
+    assert [(item["external_id"], item["song_count"]) for item in items] == [("3", 0)]
+
+
+def test_歌单搜索响应结构变化时来源不可用(tmp_path, monkeypatch) -> None:
+    client = _live_client(tmp_path, monkeypatch, _playlist_search_fetch({1: ["bad"]}, []))
+    try:
+        assert client.get("/v2/music/playlists/search", headers=AUTH,
+                          params={"q": "a", "source": "feiniao"}).status_code == 503
+        assert client.get("/v2/music/playlists/search", headers=AUTH, params={"q": "a"}).status_code == 503
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_歌单搜索是公开网关的只读路由() -> None:
+    assert _public_read_allowed("GET", "/v2/music/playlists/search")
+    assert not _public_read_allowed("POST", "/v2/music/playlists/search")
+
+
+# ---- issue 166：公共歌曲歌词字段级写入 ----
+
+SONG = "/v2/music/sources/feiniao/songs/42"
+
+
+def _collect(client: TestClient, lyrics: str | None = None) -> None:
+    body = {"title": "推荐歌", "artists": ["歌手"], "mode": "auto"}
+    if lyrics is not None:
+        body["lyrics_lrc"] = lyrics
+    assert client.put(f"{SONG}/metadata", headers=AUTH, json=body).status_code == 200
+
+
+def _put_lyrics(client: TestClient, lyrics: str, mode: str, provider: str = "LRCLIB"):
+    return client.put(f"{SONG}/lyrics", headers=AUTH, json={
+        "lyrics_lrc": lyrics, "mode": mode, "provider": provider,
+    })
+
+
+def test_自动兜底歌词只在没有歌词时写入(tmp_path, monkeypatch) -> None:
+    client = _live_client(tmp_path, monkeypatch, fake_fetch)
+    try:
+        _collect(client)
+        first = _put_lyrics(client, "[00:01.00]兜底", "auto")
+        assert first.status_code == 200, first.text
+        assert first.json()["written"] is True
+        assert first.json()["lyrics_mode"] == "auto" and first.json()["lyrics_provider"] == "LRCLIB"
+        second = _put_lyrics(client, "[00:01.00]另一个兜底", "auto").json()
+        assert second["written"] is False
+        assert client.get(f"{SONG}/metadata", headers=AUTH).json()["lyrics_lrc"] == "[00:01.00]兜底"
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_手动选择的歌词覆盖自动和他人的手动歌词(tmp_path, monkeypatch) -> None:
+    client = _live_client(tmp_path, monkeypatch, fake_fetch)
+    try:
+        _collect(client, "[00:01.00]来源歌词")
+        assert _put_lyrics(client, "[00:01.00]甲选的", "manual").json()["written"] is True
+        latest = _put_lyrics(client, "[00:01.00]乙选的", "manual", "CHINESE_LYRICS").json()
+        assert latest["written"] is True
+        assert latest["lyrics_lrc"] == "[00:01.00]乙选的"
+        assert latest["lyrics_mode"] == "manual" and latest["lyrics_provider"] == "CHINESE_LYRICS"
+        assert latest["mode"] == "auto"
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_自动整条写入不清空兜底歌词也不覆盖手动歌词(tmp_path, monkeypatch) -> None:
+    client = _live_client(tmp_path, monkeypatch, fake_fetch)
+    try:
+        _collect(client)
+        _put_lyrics(client, "[00:01.00]兜底", "auto")
+        _collect(client)  # 从来源刷新：来源没有歌词
+        assert client.get(f"{SONG}/metadata", headers=AUTH).json()["lyrics_lrc"] == "[00:01.00]兜底"
+        _put_lyrics(client, "[00:01.00]手选", "manual")
+        _collect(client, "[00:01.00]来源后来有了歌词")
+        stored = client.get(f"{SONG}/metadata", headers=AUTH).json()
+        assert stored["lyrics_lrc"] == "[00:01.00]手选" and stored["lyrics_mode"] == "manual"
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_来源歌词仍会替换自动兜底歌词(tmp_path, monkeypatch) -> None:
+    client = _live_client(tmp_path, monkeypatch, fake_fetch)
+    try:
+        _collect(client)
+        _put_lyrics(client, "[00:01.00]兜底", "auto")
+        _collect(client, "[00:01.00]来源歌词")
+        stored = client.get(f"{SONG}/metadata", headers=AUTH).json()
+        assert stored["lyrics_lrc"] == "[00:01.00]来源歌词" and stored["lyrics_provider"] == "source"
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_未收录的公共歌曲不能单独写歌词(tmp_path, monkeypatch) -> None:
+    client = _live_client(tmp_path, monkeypatch, fake_fetch)
+    try:
+        assert _put_lyrics(client, "[00:01.00]x", "auto").status_code == 404
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_歌词写入与本地歌词接口在公开网关白名单内() -> None:
+    from rhythm_metadata_api.public_main import _public_write_allowed
+
+    assert _public_write_allowed("PUT", "/v2/music/sources/feiniao/songs/42/lyrics")
+    assert _public_write_allowed("PUT", "/v2/music/device-lyrics")
+    assert _public_read_allowed("GET", "/v2/music/device-lyrics")
+    assert not _public_write_allowed("POST", "/v2/music/sources/feiniao/songs/42/lyrics")

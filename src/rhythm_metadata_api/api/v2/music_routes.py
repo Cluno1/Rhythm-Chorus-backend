@@ -12,6 +12,10 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 
 from rhythm_metadata_api.api.public_auth import AdminActor
 from rhythm_metadata_api.api.v2.routes import Actor
+from rhythm_metadata_api.application.device_song_lyrics import (
+    DeviceSongLyricsService,
+    DeviceSongLyricsWrite,
+)
 from rhythm_metadata_api.application.music_adapters import (
     _opener,
     validate_public_url,
@@ -19,6 +23,7 @@ from rhythm_metadata_api.application.music_adapters import (
 from rhythm_metadata_api.application.music_images import MusicImageArchiveError
 from rhythm_metadata_api.application.music_sources import (
     LyricFilters,
+    MusicSongLyricsWrite,
     MusicSongMetadataWrite,
     MusicSourceCreate,
     MusicSourcePatch,
@@ -36,6 +41,13 @@ def source_service(request: Request) -> MusicSourceService:
 
 
 Sources = Annotated[MusicSourceService, Depends(source_service)]
+
+
+def device_lyrics_service(request: Request) -> DeviceSongLyricsService:
+    return request.app.state.v2_container.device_song_lyrics
+
+
+DeviceLyrics = Annotated[DeviceSongLyricsService, Depends(device_lyrics_service)]
 Page = Annotated[int, Query(ge=1, le=1000)]
 
 
@@ -104,6 +116,14 @@ def search(
     service: Sources, _: Actor, q: str, page: Page = 1, source: str | None = None
 ) -> dict:
     return service.search(q, page, source)
+
+
+@router.get("/playlists/search")
+def search_playlists(
+    service: Sources, _: Actor, q: Annotated[str, Query(max_length=100)],
+    page: Page = 1, source: str | None = None,
+) -> dict:
+    return service.search_playlists(q, page, source)
 
 
 @router.get("/artwork")
@@ -175,6 +195,28 @@ def put_song_metadata(
     source_id: str, song_id: str, body: MusicSongMetadataWrite, service: Sources, _: Actor
 ) -> dict:
     return service.put_metadata(source_id, song_id, body)
+
+
+@router.put("/sources/{source_id}/songs/{song_id}/lyrics")
+def put_song_lyrics(
+    source_id: str, song_id: str, body: MusicSongLyricsWrite, service: Sources, _: Actor
+) -> dict:
+    return service.put_lyrics(source_id, song_id, body)
+
+
+@router.get("/device-lyrics")
+def device_lyrics(
+    service: DeviceLyrics, _: Actor,
+    title: Annotated[str, Query(min_length=1, max_length=500)],
+    artist: Annotated[str, Query(min_length=1, max_length=500)],
+    duration_ms: Annotated[int | None, Query(ge=0, le=86_400_000)] = None,
+) -> dict:
+    return service.find(title, artist, duration_ms)
+
+
+@router.put("/device-lyrics")
+def put_device_lyrics(body: DeviceSongLyricsWrite, service: DeviceLyrics, _: Actor) -> dict:
+    return service.save(body)
 
 
 @router.get("/sources/{source_id}/songs/{song_id}/lyrics")

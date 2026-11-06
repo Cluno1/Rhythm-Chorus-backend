@@ -34,6 +34,18 @@ FEINIAO_LYRIC_FILTERS = {
     "by_tag_contains": ["飞鸟·轻音", "飞鸟.site"],
 }
 _PROXY_FAKE_IPS = ipaddress.ip_network("198.18.0.0/15")
+_PLAYLIST_PAGE_SIZE = 20
+
+
+def _count(value: object) -> int:
+    """Upstream counts arrive as numbers or digit strings; anything else counts as zero."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(value, 0)
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return 0
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -132,6 +144,7 @@ class MusicAdapter(Protocol):
     def search(self, base_url: str, source_id: str, query: str, page: int) -> dict: ...
     def recommend(self, base_url: str, source_id: str, page: int) -> dict: ...
     def playlists(self, base_url: str, source_id: str, page: int) -> dict: ...
+    def search_playlists(self, base_url: str, source_id: str, query: str, page: int) -> dict: ...
     def playlist(self, base_url: str, source_id: str, playlist_id: str, page: int) -> dict: ...
     def song(self, base_url: str, source_id: str, song_id: str) -> dict: ...
     def lyrics(self, base_url: str, source_id: str, song_id: str) -> dict: ...
@@ -238,6 +251,29 @@ class FeiniaoAdapter:
             "has_more": page < int(pagination.get("total_pages") or page)
             if isinstance(pagination, dict) else False,
         }
+
+    def search_playlists(self, base_url: str, source_id: str, query: str, page: int) -> dict:
+        """issue 167: keyword playlist search; the upstream pages by 20 and reports a string total."""
+        payload = self._get(base_url, "search_playlist", key=query, pn=page)
+        data = payload.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("list"), list):
+            raise V2Unavailable("playlist search response changed")
+        items = []
+        for item in data["list"]:
+            if not isinstance(item, dict):
+                continue
+            pid = str(item.get("id") or "")
+            name = str(item.get("name") or "").strip()
+            if not _ID.fullmatch(pid) or not name:
+                continue
+            items.append({
+                "id": f"{source_id}:{pid}", "source_id": source_id, "external_id": pid, "name": name,
+                "artwork_url": self._artwork(item.get("img"), source_id),
+                "song_count": _count(item.get("total")),
+            })
+        total = _count(data.get("total"))
+        # An empty page ends the search even if the reported total is larger.
+        return {"items": items, "page": page, "has_more": bool(data["list"]) and page * _PLAYLIST_PAGE_SIZE < total}
 
     def playlist(self, base_url: str, source_id: str, playlist_id: str, page: int) -> dict:
         payload = self._get(base_url, "playlist_detail", pid=playlist_id, pn=page)

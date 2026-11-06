@@ -47,6 +47,8 @@ _EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85
 _PUBLIC_READ_ROUTES = (
     ("GET", re.compile(r"^/v2/music/sources$")),
     ("GET", re.compile(r"^/v2/music/search$")),
+    ("GET", re.compile(r"^/v2/music/playlists/search$")),
+    ("GET", re.compile(r"^/v2/music/device-lyrics$")),
     ("GET", re.compile(r"^/v2/music/recommended-albums$")),
     ("GET", re.compile(r"^/v2/music/artwork$")),
     ("GET", re.compile(r"^/v2/music/images/[a-f0-9]{64}\.(?:jpg|png|webp|gif)$")),
@@ -98,7 +100,8 @@ _PUBLIC_READ_ROUTES = (
     ("GET", re.compile(r"^/v2/labs/images/[^/]+/delivery$")),
 )
 _PUBLIC_WRITE_ROUTES = (
-    ("PUT", re.compile(r"^/v2/music/sources/[a-z][a-z0-9_-]{1,39}/songs/[A-Za-z0-9_-]{1,80}/metadata$")),
+    ("PUT", re.compile(r"^/v2/music/sources/[a-z][a-z0-9_-]{1,39}/songs/[A-Za-z0-9_-]{1,80}/(?:metadata|lyrics)$")),
+    ("PUT", re.compile(r"^/v2/music/device-lyrics$")),
     ("PUT", re.compile(r"^/v2/renditions/[^/]+/lyrics/[^/]+$")),
     # issue 116：只开放标签窄接口，通用 PATCH /v2/works/{id} 仍不对设备开放。
     ("PATCH", re.compile(r"^/v2/works/[^/]+/tags$")),
