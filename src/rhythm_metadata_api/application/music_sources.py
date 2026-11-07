@@ -50,6 +50,13 @@ Standby source invariants (issue 173):
   a restart forgets it and the source is simply tried again (self-healing, no table).
 - A fallback audio URL is cached under the requested source's key, so seeks reuse it and the
   existing invalidate-and-retry path re-resolves through the same fallback.
+- issue 174, playlists: playlist search and the home pool follow the same rule as song search,
+  one source per catalog. The home pool keeps using the first source whose pool is non-empty, so
+  Kuwo direct builds no pool while Feiniao has one; while Feiniao is skipped as down, its last pool
+  is still served (opened through the playlist standby) instead of refreshing it. A refresh that
+  hits "unavailable" marks the source down and stops, rather than timing out on every page.
+  ``feiniao:<pid>`` playlist pages fall back to Kuwo with the same pid and page and keep the
+  ``feiniao:`` playlist ID; their songs carry the serving source's IDs, which play either way.
 - Not covered: a URL that resolves but whose CDN then fails mid-stream; the stream route's single
   retry handles that as before. Configuration errors (a host rule rejection, V2DomainError) do not
   fall back, so a bad rule stays visible instead of being masked by the standby.
@@ -562,6 +569,13 @@ class MusicSourceService:
     def _mark_down(self, source_id: str) -> None:
         self._down_until[source_id] = monotonic() + _SOURCE_DOWN_SECONDS
 
+    def _yields_to_standby(self, source_id: str, catalog: str | None, catalogs: dict[str, str | None]) -> bool:
+        """True while ``source_id`` is marked down and a healthy source of its catalog is enabled."""
+        return catalog is not None and self._is_down(source_id) and any(
+            other != source_id and other_catalog == catalog and not self._is_down(other)
+            for other, other_catalog in catalogs.items()
+        )
+
     def _with_standby(self, source: MusicSource, operation):
         """Run ``operation(source, adapter)``, then on same-catalog standbys (issue 173)."""
         catalog = self._catalog(source)
@@ -768,10 +782,7 @@ class MusicSourceService:
             catalog = catalogs[source.id]
             if catalog is not None and catalog in served:
                 continue  # issue 173: a healthier source of the same catalog already answered
-            if catalog is not None and self._is_down(source.id) and any(
-                other.id != source.id and catalogs[other.id] == catalog and not self._is_down(other.id)
-                for other in sources
-            ):
+            if self._yields_to_standby(source.id, catalog, catalogs):
                 unavailable.append(source.id)
                 continue
             try:
@@ -801,14 +812,26 @@ class MusicSourceService:
         sources = [self._active(source_id)] if source_id else self._enabled_sources()
         results = []
         unavailable = []
+        served: set[str] = set()
+        catalogs = {source.id: None if source_id else self._catalog(source) for source in sources}
         for source in sources:
             adapter = self._adapter(source)
             if not hasattr(adapter, "search_playlists"):
                 continue
+            catalog = catalogs[source.id]
+            if catalog is not None and catalog in served:
+                continue  # issue 174: one source per catalog, as in song search
+            if self._yields_to_standby(source.id, catalog, catalogs):
+                unavailable.append(source.id)
+                continue
             try:
                 result = adapter.search_playlists(source.base_url, source.id, query, page)
                 results.append({"source_id": source.id, **result})
+                if catalog is not None:
+                    served.add(catalog)
             except (V2Unavailable, V2DomainError) as error:
+                if isinstance(error, V2Unavailable) and not source_id:
+                    self._mark_down(source.id)
                 log.warning("Playlist search failed: source=%s page=%s error=%s", source.id, page, error)
                 if source_id:
                     raise V2Unavailable("configured music source is unavailable") from error
@@ -826,12 +849,26 @@ class MusicSourceService:
 
     def recommended_albums(self, limit: int) -> dict:
         candidates: dict[str, dict] = {}
-        for source in self._enabled_sources():
-            if not getattr(self._adapter(source), "browses_catalog", True):
-                continue
+        browsing = [
+            (source, self._adapter(source)) for source in self._enabled_sources()
+            if getattr(self._adapter(source), "browses_catalog", True)
+        ]
+        catalogs = {source.id: getattr(adapter, "catalog", None) for source, adapter in browsing}
+        served: set[str] = set()
+        for source, _adapter in browsing:
+            catalog = catalogs[source.id]
+            if catalog is not None and catalog in served:
+                continue  # issue 174: a source of this catalog already has a pool
+            if self._yields_to_standby(source.id, catalog, catalogs):
+                cached = self._recommended_pools.get(source.id)
+                pool = cached[1] if cached else []  # keep the last pool, do not wait on a down source
+            else:
+                pool = self._recommended_pool(source)
+            if pool and catalog is not None:
+                served.add(catalog)
             low = source.config.get("recommended_min_songs", _RECOMMENDED_MIN_SONGS)
             high = source.config.get("recommended_max_songs", _RECOMMENDED_MAX_SONGS)
-            for item in self._recommended_pool(source):
+            for item in pool:
                 if item["name"].strip() and item["artwork_url"] and low <= item["song_count"] <= high:
                     candidates.setdefault(item["id"], item)
         return {"items": self._pick_unseen(list(candidates.values()), limit)}
@@ -885,6 +922,9 @@ class MusicSourceService:
                     result = adapter.playlists(source.base_url, source.id, page)
                 except (V2Unavailable, V2DomainError) as error:
                     log.warning("Recommended playlists failed: source=%s page=%s error=%s", source.id, page, error)
+                    if isinstance(error, V2Unavailable):
+                        self._mark_down(source.id)
+                        break
                     continue
                 items.update((item["id"], item) for item in result["items"])
                 if result.get("total_pages"):
@@ -896,10 +936,13 @@ class MusicSourceService:
                         result = adapter.playlists(source.base_url, source.id, page)
                     except (V2Unavailable, V2DomainError) as error:
                         log.warning("Recommended playlists failed: source=%s page=%s error=%s", source.id, page, error)
+                        if isinstance(error, V2Unavailable):
+                            self._mark_down(source.id)
+                            break
                         continue
                     items.update((item["id"], item) for item in result["items"])
             keywords = source.config.get("recommended_keywords", list(_RECOMMENDED_KEYWORDS))
-            if keywords and hasattr(adapter, "search_playlists"):
+            if keywords and hasattr(adapter, "search_playlists") and not self._is_down(source.id):
                 keyword = keywords[int(time.time() // 3600) % len(keywords)]
                 try:
                     result = adapter.search_playlists(source.base_url, source.id, keyword, 1)
@@ -924,8 +967,11 @@ class MusicSourceService:
 
     def playlist(self, source_id: str, playlist_id: str, page: int) -> dict:
         source = self._active(source_id)
-        result = self._adapter(source).playlist(source.base_url, source.id, self._id(playlist_id), page)
-        return self._overlay(source.id, result)
+        playlist_id = self._id(playlist_id)
+        serving, result = self._with_standby(
+            source, lambda serving, adapter: adapter.playlist(serving.base_url, serving.id, playlist_id, page),
+        )
+        return self._overlay(serving.id, {**result, "id": f"{source.id}:{playlist_id}"})
 
     def song(self, source_id: str, song_id: str, refresh: bool = False) -> dict:
         source = self._active(source_id)

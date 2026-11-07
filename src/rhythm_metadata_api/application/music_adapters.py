@@ -24,6 +24,11 @@ Kuwo direct adapter invariants (issue 173):
 - Kuwo's song info answers "音乐查询失败" (status 301) for about half of identical requests, and its
   search sometimes reports a total with nothing shown. Both are retried at once, at most three
   calls in all, as LX does for search; a song that fails three times reads as having no lyrics.
+- issue 174: Kuwo direct also serves the hot playlist list, playlist search and playlist detail.
+  Feiniao's playlist IDs are Kuwo ``pid``s with the same songs in the same order, and both page
+  details by 20, so a ``feiniao:<pid>`` page can be served by Kuwo with the same page number.
+  Playlist search uses the ``client=kt`` parameters: LX's PC parameters return nothing for common
+  words such as 流行 and answer with single-quoted pseudo-JSON.
 - ``catalog`` names the platform whose IDs an adapter speaks. Feiniao on Kuwo and Kuwo direct both
   speak Kuwo ``rid``s, so one can stand in for the other with the same song ID (see the service).
 """
@@ -73,11 +78,16 @@ _KUWO_PAGE_SIZE = 30
 _KUWO_ATTEMPTS = 3
 _KUWO_COVER_PREFIX = "http://img1.kwcdn.kuwo.cn/star/albumcover/500/"
 _KUWO_ARTIST_PREFIX = "http://img1.kwcdn.kuwo.cn/star/starheads/500/"
+_KUWO_HOT_PLAYLISTS = "http://wapi.kuwo.cn/api/pc/classify/playlist/getRcmPlayList"
+_KUWO_PLAYLIST_DETAIL = "http://nplserver.kuwo.cn/pl.svc"
+_KUWO_HOT_PAGE_SIZE = 36
+_KUWO_SONGLIST_DIGEST = "8"  # ordinary user playlists; other digests need different detail APIs
 KUWO_AUDIO_HOSTS = (
     "bd-er.kuwo.cn", "bd-lw.kuwo.cn", "car-bj.kuwo.cn", "car-er.kuwo.cn", "car-lv.kuwo.cn", "car-lw.kuwo.cn",
 )
 KUWO_ARTWORK_HOSTS = (
     "img1.kwcdn.kuwo.cn", "img2.kwcdn.kuwo.cn", "img3.kwcdn.kuwo.cn", "img4.kwcdn.kuwo.cn", "star.kuwo.cn",
+    "img1.kuwo.cn", "img2.kuwo.cn", "img3.kuwo.cn", "img4.kuwo.cn",
 )
 KUWO_DEFAULT_RESOLVERS = (
     {"name": "haitangw", "kind": "redirect",
@@ -430,7 +440,7 @@ class KuwoAdapter:
 
     kind = "kuwo"
     catalog = "kuwo"
-    browses_catalog = False
+    browses_catalog = True
     default_config: ClassVar[dict] = {
         "audio_hosts": list(KUWO_AUDIO_HOSTS),
         "artwork_hosts": list(KUWO_ARTWORK_HOSTS),
@@ -561,14 +571,89 @@ class KuwoAdapter:
     def recommend(self, base_url: str, source_id: str, page: int) -> dict:
         return {"items": [], "page": page, "has_more": False}
 
+    def _summary(self, source_id: str, pid: object, name: object, img: object, count: object) -> dict | None:
+        pid, title = str(pid or ""), self._text(name)
+        if not _ID.fullmatch(pid) or not title:
+            return None
+        return {
+            "id": f"{source_id}:{pid}", "source_id": source_id, "external_id": pid, "name": title,
+            "artwork_url": artwork_proxy(str(img or ""), source_id, self.artwork_hosts),
+            "song_count": _count(count),
+        }
+
     def playlists(self, base_url: str, source_id: str, page: int) -> dict:
-        return {"items": [], "page": page, "has_more": False, "total_pages": page}
+        params = {
+            "loginUid": 0, "loginSid": 0, "appUid": "76039576", "pn": page,
+            "rn": _KUWO_HOT_PAGE_SIZE, "order": "hot",
+        }
+        payload = self.fetch(_KUWO_HOT_PLAYLISTS + "?" + urlencode(params), strict_type=False)
+        data = payload.get("data")
+        if payload.get("code") != 200 or not isinstance(data, dict) or not isinstance(data.get("data"), list):
+            raise V2Unavailable("kuwo playlist list response changed")
+        items = [
+            self._summary(source_id, item.get("id"), item.get("name"), item.get("img"), item.get("total"))
+            for item in data["data"]
+            if isinstance(item, dict) and str(item.get("digest")) == _KUWO_SONGLIST_DIGEST
+        ]
+        total_pages = max(1, math.ceil(_count(data.get("total")) / _KUWO_HOT_PAGE_SIZE))
+        return {
+            "items": [item for item in items if item], "page": page,
+            "has_more": page < total_pages, "total_pages": total_pages,
+        }
 
     def search_playlists(self, base_url: str, source_id: str, query: str, page: int) -> dict:
-        return {"items": [], "page": page, "has_more": False}
+        params = {
+            "client": "kt", "all": query, "pn": page - 1, "rn": _PLAYLIST_PAGE_SIZE, "uid": "794762570",
+            "ver": "kwplayer_ar_9.2.2.1", "vipver": 1, "ft": "playlist", "encoding": "utf8",
+            "rformat": "json", "mobi": 1,
+        }
+        payload = self.fetch(base_url + "r.s?" + urlencode(params), strict_type=False)
+        rows = payload.get("abslist")
+        if not isinstance(rows, list):
+            raise V2Unavailable("kuwo playlist search response changed")
+        items = [
+            self._summary(source_id, row.get("playlistid"), row.get("name"), row.get("pic"), row.get("songnum"))
+            for row in rows if isinstance(row, dict)
+        ]
+        return {
+            "items": [item for item in items if item], "page": page,
+            "has_more": bool(rows) and page * _PLAYLIST_PAGE_SIZE < _count(payload.get("TOTAL")),
+        }
+
+    def _playlist_song(self, source_id: str, item: dict) -> dict | None:
+        rid = str(item.get("id") or "")
+        if not _ID.fullmatch(rid):
+            return None
+        duration = str(item.get("duration") or "")
+        cover = str(item.get("albumpic") or "").replace("/albumcover/120/", "/albumcover/500/")
+        return {
+            "id": f"{source_id}:{rid}", "source_id": source_id, "external_id": rid,
+            "title": self._text(item.get("name")),
+            "artists": [self._text(item.get("artist")).replace("&", "、")],
+            "album": self._text(item.get("album")) or None,
+            "duration_ms": int(duration) * 1000 if duration.isdigit() else None,
+            "artwork_url": artwork_proxy(cover, source_id, self.artwork_hosts),
+        }
 
     def playlist(self, base_url: str, source_id: str, playlist_id: str, page: int) -> dict:
-        raise V2NotFound("this music source has no playlists")
+        params = {
+            "op": "getlistinfo", "pid": playlist_id, "pn": page - 1, "rn": _PLAYLIST_PAGE_SIZE,
+            "encode": "utf8", "keyset": "pl2012", "identity": "kuwo", "pcmp4": 1,
+            "vipver": "MUSIC_9.0.5.0_W1", "newver": 1,
+        }
+        url = _KUWO_PLAYLIST_DETAIL + "?" + urlencode(params)
+        for _ in range(_KUWO_ATTEMPTS):
+            payload = self.fetch(url, strict_type=False)
+            rows = payload.get("musiclist")
+            if payload.get("result") == "ok" and isinstance(rows, list):
+                break
+        else:
+            raise V2Unavailable("kuwo playlist detail failed")
+        songs = [self._playlist_song(source_id, row) for row in rows if isinstance(row, dict)]
+        return {
+            "id": f"{source_id}:{playlist_id}", "items": [song for song in songs if song], "page": page,
+            "has_more": page * _PLAYLIST_PAGE_SIZE < _count(payload.get("total")),
+        }
 
 
 ADAPTERS: dict[str, MusicAdapter] = {"feiniao": FeiniaoAdapter(), "kuwo": KuwoAdapter()}

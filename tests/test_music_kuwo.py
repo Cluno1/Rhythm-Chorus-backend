@@ -1,4 +1,4 @@
-"""issue 173: Kuwo direct adapter (LX Music's APIs) and same-catalog standby sources."""
+"""issue 173/174: Kuwo direct adapter (LX Music's APIs) and same-catalog standby sources."""
 
 from __future__ import annotations
 
@@ -350,3 +350,203 @@ def test_网易实例故障不会拿酷我同ID顶替(tmp_path, monkeypatch) -> 
         with pytest.raises(V2Unavailable):
             service.lyrics("netease", "228908")
         assert kuwo.calls == []
+
+
+# ---------- issue 174: Kuwo playlists and the playlist standby ----------
+
+def hot_item(pid: str = "3678617986", digest: str = "8", total: str = "104") -> dict:
+    return {"id": pid, "name": "古风 &amp; 戏腔", "img": "http://img1.kuwo.cn/star/userpl2015/a.jpg",
+            "total": total, "digest": digest}
+
+
+def pl_song(rid: str = "6304356") -> dict:
+    return {"id": rid, "name": "牵丝戏", "artist": "银临&Aki阿杰", "album": "牵丝戏", "duration": "239",
+            "albumpic": "http://img1.kuwo.cn/star/albumcover/120/6/48/1406239650.jpg"}
+
+
+class FakeKuwoLists(FakeKuwo):
+    """FakeKuwo plus the hot list (wapi), playlist search (ft=playlist) and playlist detail (pl.svc)."""
+
+    def __init__(self, *, hot=None, hot_total: int = 1754, found=None, found_total: str = "45",
+                 songs=None, song_total: str = "104", detail_failures: int = 0, **kwargs):
+        super().__init__(**kwargs)
+        self.hot = [hot_item()] if hot is None else hot
+        self.hot_total, self.found, self.found_total = hot_total, found, found_total
+        self.songs = [pl_song()] if songs is None else songs
+        self.song_total, self.detail_failures = song_total, detail_failures
+
+    def fetch(self, url: str, headers=None, *, strict_type: bool = True) -> dict:
+        host = urlsplit(url).hostname
+        params = parse_qs(urlsplit(url).query)
+        if host == "wapi.kuwo.cn":
+            self.calls.append((url, {}))
+            return {"code": 200, "data": {"data": self.hot, "pn": 1, "rn": 36, "total": self.hot_total}}
+        if host == "nplserver.kuwo.cn":
+            self.calls.append((url, {}))
+            if self.detail_failures:
+                self.detail_failures -= 1
+                return {"result": "error"}
+            return {"result": "ok", "total": self.song_total, "musiclist": self.songs}
+        if host == "search.kuwo.cn" and params.get("ft") == ["playlist"]:
+            self.calls.append((url, {}))
+            found = [{"playlistid": "2891238463", "name": "流行", "pic": "http://img1.kwcdn.kuwo.cn/a.jpg",
+                      "songnum": "45"}] if self.found is None else self.found
+            return {"TOTAL": self.found_total, "abslist": found}
+        return super().fetch(url, headers, strict_type=strict_type)
+
+
+def test_酷我热门歌单恰好请求一次_只留普通歌单并映射封面与歌曲数() -> None:
+    kuwo = FakeKuwoLists(hot=[hot_item(), hot_item("99", digest="13"), hot_item("bad.id")])
+    result = kuwo.adapter().playlists(BASE, "kuwo", 2)
+    assert kuwo.hosts() == ["wapi.kuwo.cn"]
+    params = parse_qs(urlsplit(kuwo.calls[0][0]).query)
+    assert params["pn"] == ["2"] and params["rn"] == ["36"] and params["order"] == ["hot"]
+    assert [item["id"] for item in result["items"]] == ["kuwo:3678617986"]
+    item = result["items"][0]
+    assert item["name"] == "古风 & 戏腔" and item["song_count"] == 104
+    assert "img1.kuwo.cn%2Fstar%2Fuserpl2015" in item["artwork_url"]
+    assert result["total_pages"] == 49 and result["has_more"] is True
+
+
+def test_酷我热门歌单响应结构变化时来源不可用() -> None:
+    kuwo = FakeKuwoLists()
+    kuwo.fetch = lambda url, headers=None, *, strict_type=True: {"code": 500, "data": None}
+    with pytest.raises(V2Unavailable):
+        kuwo.adapter().playlists(BASE, "kuwo", 1)
+
+
+def test_酷我歌单搜索用kt参数_页码从0开始且按20条判断下一页() -> None:
+    kuwo = FakeKuwoLists(found_total="45")
+    first = kuwo.adapter().search_playlists(BASE, "kuwo", "流行", 2)
+    last = FakeKuwoLists(found_total="40").adapter().search_playlists(BASE, "kuwo", "流行", 2)
+    params = parse_qs(urlsplit(kuwo.calls[0][0]).query)
+    assert len(kuwo.calls) == 1
+    assert params["client"] == ["kt"] and params["ft"] == ["playlist"] and params["pn"] == ["1"]
+    assert params["rn"] == ["20"]
+    assert first["items"][0]["id"] == "kuwo:2891238463" and first["items"][0]["song_count"] == 45
+    assert first["has_more"] is True and last["has_more"] is False
+
+
+def test_酷我歌单详情映射歌曲且封面升到500_页码从0开始() -> None:
+    kuwo = FakeKuwoLists(song_total="41")
+    result = kuwo.adapter().playlist(BASE, "kuwo", "3678617986", 2)
+    params = parse_qs(urlsplit(kuwo.calls[0][0]).query)
+    assert len(kuwo.calls) == 1
+    assert params["pid"] == ["3678617986"] and params["pn"] == ["1"] and params["rn"] == ["20"]
+    song = result["items"][0]
+    assert result["id"] == "kuwo:3678617986" and song["id"] == "kuwo:6304356"
+    assert song["artists"] == ["银临、Aki阿杰"] and song["duration_ms"] == 239000
+    assert "albumcover%2F500%2F6%2F48" in song["artwork_url"]
+    assert result["has_more"] is True
+    assert FakeKuwoLists(song_total="40").adapter().playlist(BASE, "kuwo", "1", 2)["has_more"] is False
+
+
+def test_酷我歌单详情偶发失败时重试_连续三次失败就不可用() -> None:
+    flaky = FakeKuwoLists(detail_failures=2)
+    assert flaky.adapter().playlist(BASE, "kuwo", "1", 1)["items"]
+    assert len(flaky.calls) == 3
+    broken = FakeKuwoLists(detail_failures=5)
+    with pytest.raises(V2Unavailable):
+        broken.adapter().playlist(BASE, "kuwo", "1", 1)
+    assert len(broken.calls) == 3
+
+
+class FeiniaoLists(FeiniaoSwitch):
+    """Feiniao with a home playlist that passes the recommended filters, and an empty keyword search."""
+
+    def fetch(self, url: str) -> dict:
+        api = parse_qs(urlsplit(url).query)["api"][0]
+        if api in {"playlist_home", "search_playlist"}:
+            self.calls.append(api)
+            if self.down:
+                raise V2Unavailable("feiniao is down")
+            if api == "search_playlist":
+                return {"code": 200, "data": {"list": [{"id": "88", "name": "飞鸟搜到的", "total": "30"}],
+                                              "total": "1"}}
+            return {"code": 200, "pagination": {"total_pages": 1}, "data": [{
+                "id": "77", "name": "飞鸟精选", "total_songs": "30",
+                "img": "http://img1.kuwo.cn/star/userpl2015/b.jpg"}]}
+        return super().fetch(url)
+
+
+def lists_client(tmp_path, monkeypatch, kuwo: FakeKuwoLists | None = None):
+    feiniao = FeiniaoLists()
+    kuwo = kuwo or FakeKuwoLists()
+    monkeypatch.setitem(ADAPTERS, "feiniao", FeiniaoAdapter(fetch=feiniao.fetch))
+    client, service, _, kuwo = standby_client(tmp_path, monkeypatch, kuwo=kuwo)
+    ADAPTERS["feiniao"] = FeiniaoAdapter(fetch=feiniao.fetch)
+    return client, service, feiniao, kuwo
+
+
+def recommended(client: TestClient) -> list[str]:
+    response = client.get("/v2/music/recommended-albums?limit=10", headers=AUTH)
+    assert response.status_code == 200
+    return [item["id"] for item in response.json()["items"]]
+
+
+def test_飞鸟可用时首页推荐歌单只用飞鸟且不请求酷我(tmp_path, monkeypatch) -> None:
+    client, _, _, kuwo = lists_client(tmp_path, monkeypatch)
+    with client:
+        assert set(recommended(client)) == {"feiniao:77"}
+        assert kuwo.calls == []
+
+
+def test_飞鸟歌单不可用时推荐由酷我顶上且飞鸟只请求一页(tmp_path, monkeypatch) -> None:
+    client, _, feiniao, kuwo = lists_client(tmp_path, monkeypatch)
+    feiniao.down = True
+    with client:
+        kuwo_pool = {"kuwo:3678617986", "kuwo:2891238463"}  # hot list + the hourly keyword search
+        assert set(recommended(client)) == kuwo_pool
+        built = len(kuwo.calls)
+        assert set(recommended(client)) == kuwo_pool
+        assert len(kuwo.calls) == built  # the Kuwo pool is cached like Feiniao's
+        assert feiniao.calls == ["playlist_home"]
+
+
+def test_飞鸟熔断期间仍用它上次的推荐池且不重新请求(tmp_path, monkeypatch) -> None:
+    client, service, feiniao, kuwo = lists_client(tmp_path, monkeypatch)
+    with client:
+        def ids() -> set[str]:
+            return {item["id"] for item in service.recommended_albums(10)["items"]}
+        assert ids() == {"feiniao:77"}
+        service._recommended_pools["feiniao"] = (0.0, service._recommended_pools["feiniao"][1])  # expired
+        feiniao.down = True
+        service._mark_down("feiniao")
+        assert ids() == {"feiniao:77"}
+        assert feiniao.calls == ["playlist_home", "search_playlist"]
+        assert kuwo.calls == []
+
+
+def test_飞鸟歌单详情失败时由酷我按同pid同页提供且歌单ID仍是飞鸟的(tmp_path, monkeypatch) -> None:
+    client, _, feiniao, kuwo = lists_client(tmp_path, monkeypatch)
+    feiniao.down = True
+    with client:
+        response = client.get("/v2/music/sources/feiniao/playlists/77?page=2", headers=AUTH)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["id"] == "feiniao:77"
+        assert [song["id"] for song in body["items"]] == ["kuwo:6304356"]
+        assert len(kuwo.calls) == 1
+        params = parse_qs(urlsplit(kuwo.calls[0][0]).query)
+        assert params["pid"] == ["77"] and params["pn"] == ["1"]
+        assert feiniao.calls == ["playlist_detail"]
+
+
+def test_飞鸟可用时歌单搜索只返回飞鸟且不请求酷我(tmp_path, monkeypatch) -> None:
+    client, _, feiniao, kuwo = lists_client(tmp_path, monkeypatch)
+    with client:
+        body = client.get("/v2/music/playlists/search?q=流行", headers=AUTH).json()
+        assert [group["source_id"] for group in body["sources"]] == ["feiniao"]
+        assert kuwo.calls == [] and feiniao.calls == ["search_playlist"]
+
+
+def test_飞鸟歌单搜索不可用时由酷我顶上且六十秒内不再请求飞鸟(tmp_path, monkeypatch) -> None:
+    client, _, feiniao, kuwo = lists_client(tmp_path, monkeypatch)
+    feiniao.down = True
+    with client:
+        first = client.get("/v2/music/playlists/search?q=流行", headers=AUTH).json()
+        second = client.get("/v2/music/playlists/search?q=流行", headers=AUTH).json()
+        assert [group["source_id"] for group in first["sources"]] == ["kuwo"]
+        assert first["unavailable_sources"] == ["feiniao"] == second["unavailable_sources"]
+        assert feiniao.calls == ["search_playlist"]
+        assert kuwo.hosts() == ["search.kuwo.cn", "search.kuwo.cn"]
