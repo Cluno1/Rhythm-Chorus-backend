@@ -2,6 +2,16 @@
 
 Adding a different upstream protocol means registering another adapter here. Administrators
 manage instances, URLs, ordering and availability; client response shapes do not change.
+
+Feiniao catalog invariant (issue 172):
+- Only search, song detail, audio URL and lyrics take Feiniao's ``source`` parameter. Its
+  recommend, hot playlist, playlist search and playlist detail APIs ignore it and always answer
+  with Kuwo IDs. An instance whose ``upstream_source`` is not Kuwo (for example NetEase) therefore
+  browses nothing: those calls return empty pages, or not found for a playlist, without contacting
+  upstream. Otherwise its playlists would carry Kuwo song IDs under the NetEase instance, and
+  playing them would resolve unrelated NetEase songs or fail.
+- Rejected: a separate admin switch for browsing. It would let the same wrong IDs come back by
+  misconfiguration, and nothing besides Kuwo has a playlist API at Feiniao today.
 """
 
 from __future__ import annotations
@@ -35,6 +45,8 @@ FEINIAO_LYRIC_FILTERS = {
 }
 _PROXY_FAKE_IPS = ipaddress.ip_network("198.18.0.0/15")
 _PLAYLIST_PAGE_SIZE = 20
+# Feiniao's playlist and recommend APIs only serve this upstream; see the module docstring.
+_CATALOG_UPSTREAM = "酷我音乐"
 
 
 def _count(value: object) -> int:
@@ -172,6 +184,10 @@ class FeiniaoAdapter:
         )
         return adapter
 
+    @property
+    def browses_catalog(self) -> bool:
+        return self.upstream_source == _CATALOG_UPSTREAM
+
     def _get(self, base_url: str, api: str, **params: object) -> dict:
         # No arbitrary path/query is taken from clients. Every supported operation is a fixed GET.
         url = base_url + "?" + urlencode({"api": api, **params})
@@ -224,6 +240,8 @@ class FeiniaoAdapter:
         return self._page(source_id, data.get("songs"), page, data.get("hasMore") is True)
 
     def recommend(self, base_url: str, source_id: str, page: int) -> dict:
+        if not self.browses_catalog:
+            return self._page(source_id, [], page, False)
         payload = self._get(base_url, "recommend", pn=page)
         pagination = payload.get("pagination") or {}
         return self._page(
@@ -232,6 +250,8 @@ class FeiniaoAdapter:
         )
 
     def playlists(self, base_url: str, source_id: str, page: int) -> dict:
+        if not self.browses_catalog:
+            return {**self._page(source_id, [], page, False), "total_pages": page}
         payload = self._get(base_url, "playlist_home", pn=page)
         pagination = payload.get("pagination") or {}
         items = []
@@ -256,6 +276,8 @@ class FeiniaoAdapter:
 
     def search_playlists(self, base_url: str, source_id: str, query: str, page: int) -> dict:
         """issue 167: keyword playlist search; the upstream pages by 20 and reports a string total."""
+        if not self.browses_catalog:
+            return self._page(source_id, [], page, False)
         payload = self._get(base_url, "search_playlist", key=query, pn=page)
         data = payload.get("data")
         if not isinstance(data, dict) or not isinstance(data.get("list"), list):
@@ -278,6 +300,8 @@ class FeiniaoAdapter:
         return {"items": items, "page": page, "has_more": bool(data["list"]) and page * _PLAYLIST_PAGE_SIZE < total}
 
     def playlist(self, base_url: str, source_id: str, playlist_id: str, page: int) -> dict:
+        if not self.browses_catalog:
+            raise V2NotFound("this music source has no playlists")
         payload = self._get(base_url, "playlist_detail", pid=playlist_id, pn=page)
         pagination = payload.get("pagination") or {}
         result = self._page(

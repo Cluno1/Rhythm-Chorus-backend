@@ -1112,3 +1112,63 @@ def test_关键词搜索失败仍返回热门榜结果(tmp_path, monkeypatch) ->
     with client:
         assert recommended_names(client) == {"热门"}
         assert len(state["searches"]) == 1
+
+
+# issue 172: Feiniao only passes ``source`` to search, detail, audio and lyrics. Its playlist and
+# recommend APIs always answer with Kuwo IDs, so a NetEase instance must not browse them.
+def _netease_adapter(seen: list[tuple[str, str | None]]) -> FeiniaoAdapter:
+    def fetch(url: str) -> dict:
+        params = parse_qs(urlsplit(url).query)
+        seen.append((params["api"][0], params.get("source", [None])[0]))
+        return fake_fetch(url)
+
+    config = MusicSourceConfig(upstream_source="网易云音乐").model_dump()
+    return FeiniaoAdapter(fetch=fetch).configured(config)
+
+
+def test_非酷我上游实例的推荐_热门歌单_歌单搜索为空且不请求上游() -> None:
+    seen: list[tuple[str, str | None]] = []
+    adapter = _netease_adapter(seen)
+    base = "https://example.org/"
+    assert adapter.recommend(base, "netease", 1)["items"] == []
+    assert adapter.playlists(base, "netease", 1)["items"] == []
+    assert adapter.search_playlists(base, "netease", "流行", 1)["items"] == []
+    assert seen == []
+
+
+def test_非酷我上游实例打开歌单返回不存在且不请求上游() -> None:
+    seen: list[tuple[str, str | None]] = []
+    adapter = _netease_adapter(seen)
+    with pytest.raises(V2NotFound):
+        adapter.playlist("https://example.org/", "netease", "77", 1)
+    assert seen == []
+
+
+def test_非酷我上游实例的搜索和歌词各请求一次且带自身source() -> None:
+    seen: list[tuple[str, str | None]] = []
+    adapter = _netease_adapter(seen)
+    assert adapter.search("https://example.org/", "netease", "旅人", 1)["items"][0]["id"] == "netease:493285911"
+    assert adapter.lyrics("https://example.org/", "netease", "493285911")["lrc"]
+    assert seen == [("search_with_source", "网易云音乐"), ("get_lyrics_with_source", "网易云音乐")]
+
+
+def test_首页推荐只为酷我实例建池_网易实例的歌单路由返回404(tmp_path, monkeypatch, caplog) -> None:
+    hosts: list[tuple[str, str]] = []
+
+    def fetch(url: str) -> dict:
+        hosts.append((urlsplit(url).hostname or "", parse_qs(urlsplit(url).query)["api"][0]))
+        return fake_fetch(url) if "search_playlist" not in url else {"code": 200, "data": {"list": [], "total": "0"}}
+
+    client, service = _enabled_client(tmp_path, monkeypatch, fetch)
+    with client:
+        service.create(MusicSourceCreate(
+            id="netease", name="网易云", adapter="feiniao", base_url="https://netease.example.org/",
+            priority=200, enabled=True, config=MusicSourceConfig(upstream_source="网易云音乐"),
+        ))
+        with caplog.at_level("INFO", logger=music_sources.__name__):
+            assert client.get("/v2/music/recommended-albums?limit=12", headers=AUTH).status_code == 200
+        refreshed = [r.getMessage() for r in caplog.records if "Recommended pool refreshed" in r.getMessage()]
+        assert len(refreshed) == 1 and "source=feiniao" in refreshed[0]
+        assert client.get("/v2/music/sources/netease/playlists/77", headers=AUTH).status_code == 404
+        assert not [api for host, api in hosts if host == "netease.example.org"]
+        assert ("music.xn--q35am7h.site", "playlist_home") in hosts

@@ -37,6 +37,8 @@ Recommended album invariants:
   users. A restart or a second worker starts with an empty record, which only falls back to plain
   random picks for a while; it is capped so it cannot grow without bound. Rejected: a table or
   Redis for this, which adds a write to every home screen request for a best-effort preference.
+- issue 172: sources whose adapter does not browse playlists (a Feiniao instance on NetEase) are
+  skipped when building pools, so they never trigger an empty refresh and its five-minute retry.
 """
 
 from __future__ import annotations
@@ -715,6 +717,8 @@ class MusicSourceService:
     def recommended_albums(self, limit: int) -> dict:
         candidates: dict[str, dict] = {}
         for source in self._enabled_sources():
+            if not getattr(self._adapter(source), "browses_catalog", True):
+                continue
             low = source.config.get("recommended_min_songs", _RECOMMENDED_MIN_SONGS)
             high = source.config.get("recommended_max_songs", _RECOMMENDED_MAX_SONGS)
             for item in self._recommended_pool(source):
