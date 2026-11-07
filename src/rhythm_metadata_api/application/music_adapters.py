@@ -518,13 +518,20 @@ class KuwoAdapter:
     def _song_info(self, song_id: str) -> dict:
         url = _KUWO_SONG_INFO + "?" + urlencode({"musicId": song_id})
         for _ in range(_KUWO_ATTEMPTS):
-            data = self.fetch(url, strict_type=False).get("data")
-            if isinstance(data, dict):
+            payload = self.fetch(url, strict_type=False)
+            data = payload.get("data")
+            # issue 176: "301 音乐查询失败" sometimes still carries a data object without songinfo.
+            if isinstance(data, dict) and payload.get("status", 200) == 200:
                 return data
         raise V2NotFound("kuwo song is unavailable")
 
     def song(self, base_url: str, source_id: str, song_id: str) -> dict:
-        info = self._song_info(song_id).get("songinfo") or {}
+        try:
+            info = self._song_info(song_id).get("songinfo") or {}
+        except V2NotFound:
+            # issue 176: the song itself still plays through the resolvers; only its cover is missing.
+            log.warning("Kuwo song info unavailable, detail has no cover: song=%s", song_id)
+            info = {}
         cover = str(info.get("pic") or "").replace("/albumcover/240/", "/albumcover/500/")
         return {
             "id": f"{source_id}:{song_id}", "source_id": source_id,

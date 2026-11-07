@@ -57,6 +57,11 @@ Standby source invariants (issue 173):
   hits "unavailable" marks the source down and stops, rather than timing out on every page.
   ``feiniao:<pid>`` playlist pages fall back to Kuwo with the same pid and page and keep the
   ``feiniao:`` playlist ID; their songs carry the serving source's IDs, which play either way.
+- issue 176: Kuwo direct details may carry no cover, so clients fill in the cover they display,
+  which is the raw upstream ``http://`` URL (or the gateway proxy URL with this server's host).
+  ``put_metadata`` turns any whitelisted upstream image into the proxy path and strips the host
+  from an absolute proxy URL. Any other unusable image only drops that field (warning logged) and
+  keeps the stored value: rejecting the whole write used to lose the lyrics with it (HTTP 422).
 - Not covered: a URL that resolves but whose CDN then fails mid-stream; the stream route's single
   retry handles that as before. Configuration errors (a host rule rejection, V2DomainError) do not
   fall back, so a bad rule stays visible instead of being masked by the standby.
@@ -90,6 +95,7 @@ from rhythm_metadata_api.application.music_adapters import (
     AUTO_QUALITY,
     DEFAULT_AUDIO_QUALITY_ORDER,
     adapter_kinds,
+    artwork_proxy,
     clean_lyrics,
     split_lyrics,
 )
@@ -104,6 +110,7 @@ from rhythm_metadata_api.domain.v2.errors import (
 from rhythm_metadata_api.infrastructure.db.models import MusicSongMetadata, MusicSource, utc_now
 
 log = logging.getLogger(__name__)
+_KEEP = object()  # issue 176: marker for "leave the stored image as it is"
 
 _SOURCE_ID = re.compile(r"^[a-z][a-z0-9_-]{1,39}$")
 _AUDIO_URL_TTL_SECONDS = 150
@@ -636,14 +643,26 @@ class MusicSourceService:
         artists = [name.strip() for name in data.artists]
         if not title or any(not name or len(name) > 200 for name in artists):
             raise V2DomainError("title and artist names must be nonempty")
-        def image_value(value: str | None) -> str | None:
+        hosts = self.artwork_hosts(source.id)
+
+        def image_value(field: str, value: str | None) -> str | None | object:
+            value = (value or "").strip() or None
+            if value is not None:
+                parts = urlsplit(value)
+                if parts.scheme and parts.path == "/v2/music/artwork" and parts.query:
+                    value = f"{parts.path}?{parts.query}"  # issue 176: our own proxy URL with a host
+                else:
+                    value = artwork_proxy(value, source.id, hosts) or value
             try:
-                normalized = self.images.normalize(value)
-            except MusicImageArchiveError as error:
-                raise V2DomainError("invalid music image URL") from error
-            checked = _image_url(normalized)
+                checked = _image_url(self.images.normalize(value))
+            except (MusicImageArchiveError, V2DomainError) as error:
+                log.warning(
+                    "Music image dropped from metadata write: source=%s song=%s field=%s error=%s",
+                    source.id, song_id, field, error,
+                )
+                return _KEEP
             try:
-                return self.images.archive(checked, hosts=self.artwork_hosts(source.id))
+                return self.images.archive(checked, hosts=hosts)
             except MusicImageArchiveError:
                 # Keep the display URL; administrators can retry archival later.
                 return checked
@@ -653,8 +672,8 @@ class MusicSourceService:
             "artists": artists,
             "album": data.album.strip() or None if data.album is not None else None,
             "duration_ms": data.duration_ms,
-            "artwork_url": image_value(data.artwork_url),
-            "artist_avatar_url": image_value(data.artist_avatar_url),
+            "artwork_url": image_value("artwork_url", data.artwork_url),
+            "artist_avatar_url": image_value("artist_avatar_url", data.artist_avatar_url),
             "lyrics_lrc": (
                 clean_lyrics(data.lyrics_lrc, source.config.get("lyric_filters", {}))
                 if data.lyrics_lrc and data.mode != "manual"
@@ -670,6 +689,9 @@ class MusicSourceService:
             )
         else:
             changes.update(lyrics_mode=None, lyrics_provider=None, lyrics_updated_at=None)
+        for key in ("artwork_url", "artist_avatar_url"):
+            if changes[key] is _KEEP:
+                changes.pop(key)  # issue 176: an unusable image keeps what is stored (None for a new row)
         with self.sessions() as session:
             item = session.get(MusicSongMetadata, (source_id, song_id))
             if item is None:

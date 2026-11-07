@@ -1,4 +1,4 @@
-"""issue 173/174: Kuwo direct adapter (LX Music's APIs) and same-catalog standby sources."""
+"""issue 173/174/176: Kuwo direct adapter (LX Music's APIs) and same-catalog standby sources."""
 
 from __future__ import annotations
 
@@ -550,3 +550,81 @@ def test_飞鸟歌单搜索不可用时由酷我顶上且六十秒内不再请�
         assert first["unavailable_sources"] == ["feiniao"] == second["unavailable_sources"]
         assert feiniao.calls == ["search_playlist"]
         assert kuwo.hosts() == ["search.kuwo.cn", "search.kuwo.cn"]
+
+
+# ---------- issue 176: metadata writes with the cover a client displays ----------
+
+def kuwo_metadata_client(tmp_path, monkeypatch, kuwo: FakeKuwo | None = None):
+    client, service, _, kuwo = standby_client(tmp_path, monkeypatch, kuwo=kuwo)
+    return client, service, kuwo
+
+
+def put_kuwo(client: TestClient, **fields) -> object:
+    body = {"title": "那时雨", "artists": ["徐良"], "lyrics_lrc": "[00:01.00]石板桥下", **fields}
+    return client.put("/v2/music/sources/kuwo/songs/3274963/metadata", headers=AUTH, json=body)
+
+
+RAW_COVER = "http://img1.kwcdn.kuwo.cn/star/albumcover/500/s4s56/18/1580751311.jpg"
+PROXY_COVER = "/v2/music/artwork?url=http%3A%2F%2Fimg1.kwcdn.kuwo.cn%2Fstar%2Falbumcover%2F500%2Fs4s56%2F18%2F1580751311.jpg&source=kuwo"
+
+
+def test_白名单域名的http封面改写成代理路径且歌词照常保存(tmp_path, monkeypatch) -> None:
+    client, _, _ = kuwo_metadata_client(tmp_path, monkeypatch)
+    with client:
+        response = put_kuwo(client, artwork_url=RAW_COVER)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["artwork_url"] == PROXY_COVER
+        assert body["lyrics_lrc"] == "[00:01.00]石板桥下"
+
+
+def test_带主机名的本站代理封面去掉主机名后保存(tmp_path, monkeypatch) -> None:
+    client, _, _ = kuwo_metadata_client(tmp_path, monkeypatch)
+    with client:
+        response = put_kuwo(client, artwork_url="http://117.72.208.153:8010" + PROXY_COVER)
+        assert response.status_code == 200
+        assert response.json()["artwork_url"] == PROXY_COVER
+
+
+def test_不合规封面只丢掉封面_已存封面保留且歌词照常写入(tmp_path, monkeypatch, caplog) -> None:
+    client, _, _ = kuwo_metadata_client(tmp_path, monkeypatch)
+    with client:
+        assert put_kuwo(client, artwork_url=PROXY_COVER, lyrics_lrc=None).status_code == 200
+        response = put_kuwo(client, artwork_url="http://evil.example.org/a.jpg", mode="manual")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["artwork_url"] == PROXY_COVER
+        assert body["lyrics_lrc"] == "[00:01.00]石板桥下"
+        assert "Music image dropped from metadata write" in caplog.text
+
+
+def test_新记录的不合规封面存为空而不是报错(tmp_path, monkeypatch) -> None:
+    client, _, _ = kuwo_metadata_client(tmp_path, monkeypatch)
+    with client:
+        response = put_kuwo(client, artwork_url="http://evil.example.org/a.jpg")
+        assert response.status_code == 200
+        assert response.json()["artwork_url"] is None
+
+
+def test_酷我歌曲信息带非200状态时重试() -> None:
+    kuwo = FakeKuwo()
+    real = kuwo.fetch
+    answers = [{"status": 301, "msg": "音乐查询失败", "data": {}}]
+
+    def fetch(url, headers=None, *, strict_type=True):
+        if urlsplit(url).hostname == "m.kuwo.cn" and answers:
+            kuwo.calls.append((url, {}))
+            return answers.pop()
+        return real(url, headers, strict_type=strict_type)
+
+    kuwo.fetch = fetch
+    song = kuwo.adapter().song(BASE, "kuwo", "228908")
+    assert kuwo.hosts() == ["m.kuwo.cn", "m.kuwo.cn"]
+    assert "albumcover%2F500%2Fa.jpg" in song["artwork_url"]
+
+
+def test_酷我歌曲信息三次都失败时详情照常返回只是没有封面() -> None:
+    kuwo = FakeKuwo(info_failures=5)
+    song = kuwo.adapter().song(BASE, "kuwo", "228908")
+    assert song["id"] == "kuwo:228908" and song["artwork_url"] is None
+    assert kuwo.hosts() == ["m.kuwo.cn"] * 3

@@ -570,7 +570,9 @@ def test_music_images_are_uploaded_to_cos_and_delivered_by_stable_url(
             "title": "演员", "artists": ["薛之谦"],
             "artwork_url": "/v2/music/images/not-a-hash.jpg",
         })
-        assert malformed.status_code == 422
+        # issue 176: a malformed image no longer rejects the write; the stored cover is kept.
+        assert malformed.status_code == 200
+        assert malformed.json()["artwork_url"] == data["artwork_url"]
 
 
 def test_invalid_upstream_targets_are_rejected_without_network(monkeypatch) -> None:
