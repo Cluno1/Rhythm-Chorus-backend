@@ -12,22 +12,41 @@ Feiniao catalog invariant (issue 172):
   playing them would resolve unrelated NetEase songs or fail.
 - Rejected: a separate admin switch for browsing. It would let the same wrong IDs come back by
   misconfiguration, and nothing besides Kuwo has a playlist API at Feiniao today.
+
+Kuwo direct adapter invariants (issue 173):
+- Search, song info and lyrics call Kuwo's own anonymous APIs, the ones LX Music uses. Kuwo has no
+  anonymous full-length audio API, so audio comes from administrator-configured resolvers, tried
+  in order. A resolver either answers JSON holding the URL or redirects to it; either way the final
+  URL must be on the instance's audio host list, so a resolver cannot point the gateway anywhere.
+- A failing resolver, including one whose URL is off the host list, is logged and the next one is
+  tried. Unlike Feiniao's single answer, falling through here is the point: third-party resolvers
+  rate-limit and disappear without notice. Only when all fail is the source unavailable.
+- Kuwo's song info answers "音乐查询失败" (status 301) for about half of identical requests, and its
+  search sometimes reports a total with nothing shown. Both are retried at once, at most three
+  calls in all, as LX does for search; a song that fails three times reads as having no lyrics.
+- ``catalog`` names the platform whose IDs an adapter speaks. Feiniao on Kuwo and Kuwo direct both
+  speak Kuwo ``rid``s, so one can stand in for the other with the same song ID (see the service).
 """
 
 from __future__ import annotations
 
+import html
 import ipaddress
 import json
+import logging
+import math
 import re
 import socket
 import unicodedata
 from copy import copy
 from typing import Any, ClassVar, Protocol
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import quote, urlencode, urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from rhythm_metadata_api.domain.v2.errors import V2DomainError, V2NotFound, V2Unavailable
+
+log = logging.getLogger(__name__)
 
 MAX_JSON_BYTES = 2_000_000
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
@@ -47,6 +66,29 @@ _PROXY_FAKE_IPS = ipaddress.ip_network("198.18.0.0/15")
 _PLAYLIST_PAGE_SIZE = 20
 # Feiniao's playlist and recommend APIs only serve this upstream; see the module docstring.
 _CATALOG_UPSTREAM = "酷我音乐"
+_FEINIAO_CATALOGS = {"酷我音乐": "kuwo", "网易云音乐": "netease"}
+# issue 173: Kuwo's anonymous APIs, as used by LX Music (lyswhut/lx-music-desktop, Apache-2.0).
+_KUWO_SONG_INFO = "http://m.kuwo.cn/newh5/singles/songinfoandlrc"
+_KUWO_PAGE_SIZE = 30
+_KUWO_ATTEMPTS = 3
+_KUWO_COVER_PREFIX = "http://img1.kwcdn.kuwo.cn/star/albumcover/500/"
+_KUWO_ARTIST_PREFIX = "http://img1.kwcdn.kuwo.cn/star/starheads/500/"
+KUWO_AUDIO_HOSTS = (
+    "bd-er.kuwo.cn", "bd-lw.kuwo.cn", "car-bj.kuwo.cn", "car-er.kuwo.cn", "car-lv.kuwo.cn", "car-lw.kuwo.cn",
+)
+KUWO_ARTWORK_HOSTS = (
+    "img1.kwcdn.kuwo.cn", "img2.kwcdn.kuwo.cn", "img3.kwcdn.kuwo.cn", "img4.kwcdn.kuwo.cn", "star.kuwo.cn",
+)
+KUWO_DEFAULT_RESOLVERS = (
+    {"name": "haitangw", "kind": "redirect",
+     "url_template": "https://musicapi.haitangw.net/music/kw.php?type=mp3&id={id}&level=exhigh"},
+    {"name": "nxinxz", "kind": "redirect",
+     "url_template": "http://music.nxinxz.com/kw.php?id={id}&level=exhigh&type=mp3"},
+    # Shared public key published in the Huibq LX script; it rate-limits bursts, so it goes last.
+    {"name": "huibq", "kind": "json", "url_template": "https://lxmusicapi.onrender.com/url/kw/{id}/320k",
+     "headers": {"X-Request-Key": "share-v3", "User-Agent": "lx-music-mobile/2.0.0"}},
+)
+_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
 
 
 def _count(value: object) -> int:
@@ -129,12 +171,16 @@ def validate_public_url(url: str, *, hosts: frozenset[str] | None = None) -> str
     return url
 
 
-def fetch_json(url: str) -> dict[str, Any]:
+def fetch_json(
+    url: str, headers: dict[str, str] | None = None, *, strict_type: bool = True,
+) -> dict[str, Any]:
+    """Fetch one JSON object. ``strict_type=False`` accepts Kuwo's text/plain and text/html labels."""
     validate_public_url(url)
-    request = Request(url, headers={"Accept": "application/json"})
+    request = Request(url, headers={"Accept": "application/json", **(headers or {})})
     try:
         with _opener.open(request, timeout=8) as response:
-            if not response.headers.get("Content-Type", "").lower().startswith("application/json"):
+            content_type = response.headers.get("Content-Type", "").lower()
+            if strict_type and not content_type.startswith("application/json"):
                 raise V2Unavailable("upstream returned non-JSON content")
             body = response.read(MAX_JSON_BYTES + 1)
     except (HTTPError, URLError, TimeoutError) as error:
@@ -148,6 +194,47 @@ def fetch_json(url: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise V2Unavailable("music upstream returned an invalid object")
     return payload
+
+
+def fetch_redirect(url: str, headers: dict[str, str] | None = None) -> str:
+    """Return where a resolver redirects to, without following it (the caller checks the host)."""
+    validate_public_url(url)
+    try:
+        with _opener.open(Request(url, headers=headers or {}), timeout=8):
+            pass
+    except HTTPError as error:
+        location = error.headers.get("Location") if error.code in _REDIRECT_CODES else None
+        error.close()
+        if location:
+            return urljoin(url, location)
+        raise V2Unavailable("audio resolver returned no audio location") from error
+    except (URLError, TimeoutError) as error:
+        raise V2Unavailable("audio resolver is unavailable") from error
+    raise V2Unavailable("audio resolver did not redirect")
+
+
+def artwork_proxy(value: object, source_id: str, hosts: frozenset[str]) -> str | None:
+    """Gateway URL for an upstream image, or None when it is not on the instance's host list."""
+    if not isinstance(value, str) or len(value) > 2000:
+        return None
+    try:
+        parts = urlsplit(value)
+        if parts.scheme not in {"http", "https"} or parts.hostname not in hosts:
+            return None
+    except ValueError:
+        return None
+    return f"/v2/music/artwork?url={quote(value, safe='')}&source={quote(source_id, safe='')}"
+
+
+def _lrc_time(value: object) -> str | None:
+    try:
+        seconds = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    centiseconds = round(seconds * 100)
+    return f"{centiseconds // 6000:02d}:{centiseconds % 6000 / 100:05.2f}"
 
 
 class MusicAdapter(Protocol):
@@ -188,6 +275,10 @@ class FeiniaoAdapter:
     def browses_catalog(self) -> bool:
         return self.upstream_source == _CATALOG_UPSTREAM
 
+    @property
+    def catalog(self) -> str:
+        return _FEINIAO_CATALOGS.get(self.upstream_source, f"feiniao:{self.upstream_source}")
+
     def _get(self, base_url: str, api: str, **params: object) -> dict:
         # No arbitrary path/query is taken from clients. Every supported operation is a fixed GET.
         url = base_url + "?" + urlencode({"api": api, **params})
@@ -218,15 +309,7 @@ class FeiniaoAdapter:
         }
 
     def _artwork(self, value: object, source_id: str) -> str | None:
-        if not isinstance(value, str) or len(value) > 2000:
-            return None
-        try:
-            parts = urlsplit(value)
-            if parts.scheme not in {"http", "https"} or parts.hostname not in self.artwork_hosts:
-                return None
-        except ValueError:
-            return None
-        return f"/v2/music/artwork?url={quote(value, safe='')}&source={quote(source_id, safe='')}"
+        return artwork_proxy(value, source_id, self.artwork_hosts)
 
     def _page(self, source_id: str, items: object, page: int, more: bool) -> dict:
         songs = [self._song(source_id, item) for item in items if isinstance(item, dict)] if isinstance(items, list) else []
@@ -342,14 +425,161 @@ class FeiniaoAdapter:
         raise V2NotFound("requested audio quality is unavailable")
 
 
-ADAPTERS: dict[str, MusicAdapter] = {"feiniao": FeiniaoAdapter()}
+class KuwoAdapter:
+    """issue 173: Kuwo's own APIs as LX Music calls them; audio through configured resolvers."""
+
+    kind = "kuwo"
+    catalog = "kuwo"
+    browses_catalog = False
+    default_config: ClassVar[dict] = {
+        "audio_hosts": list(KUWO_AUDIO_HOSTS),
+        "artwork_hosts": list(KUWO_ARTWORK_HOSTS),
+        "audio_quality_order": ["mp3"],
+        "lyric_filters": {"exact_lines": [], "by_tag_contains": []},
+        "url_resolvers": [dict(item) for item in KUWO_DEFAULT_RESOLVERS],
+    }
+
+    def __init__(self, fetch=fetch_json, locate=fetch_redirect) -> None:
+        self.fetch = fetch
+        self.locate = locate
+        self.audio_hosts = frozenset(KUWO_AUDIO_HOSTS)
+        self.artwork_hosts = frozenset(KUWO_ARTWORK_HOSTS)
+        self.resolvers: list[dict] = [dict(item) for item in KUWO_DEFAULT_RESOLVERS]
+
+    def configured(self, config: dict) -> KuwoAdapter:
+        adapter = copy(self)
+        adapter.audio_hosts = frozenset(config.get("audio_hosts") or KUWO_AUDIO_HOSTS)
+        adapter.artwork_hosts = frozenset(config.get("artwork_hosts") or KUWO_ARTWORK_HOSTS)
+        adapter.resolvers = [
+            item for item in config.get("url_resolvers") or [] if item.get("enabled", True)
+        ]
+        return adapter
+
+    @staticmethod
+    def _text(value: object) -> str:
+        return html.unescape(str(value or "")).strip()
+
+    def _song(self, source_id: str, item: dict) -> dict | None:
+        rid = str(item.get("MUSICRID") or "").removeprefix("MUSIC_")
+        if not _ID.fullmatch(rid):
+            return None
+        duration = str(item.get("DURATION") or "")
+        # About a third of results carry no album cover; the artist photo is the next best picture.
+        album_cover = str(item.get("web_albumpic_short") or "")
+        artist_cover = str(item.get("web_artistpic_short") or "")
+        cover = (
+            _KUWO_COVER_PREFIX + album_cover.split("/", 1)[1] if "/" in album_cover
+            else _KUWO_ARTIST_PREFIX + artist_cover.split("/", 1)[1] if "/" in artist_cover
+            else None
+        )
+        return {
+            "id": f"{source_id}:{rid}",
+            "source_id": source_id,
+            "external_id": rid,
+            "title": self._text(item.get("SONGNAME")),
+            "artists": [self._text(item.get("ARTIST")).replace("&", "、")],
+            "album": self._text(item.get("ALBUM")) or None,
+            "duration_ms": int(duration) * 1000 if duration.isdigit() else None,
+            "artwork_url": artwork_proxy(cover, source_id, self.artwork_hosts),
+        }
+
+    def search(self, base_url: str, source_id: str, query: str, page: int) -> dict:
+        params = {
+            "client": "kt", "all": query, "pn": page - 1, "rn": _KUWO_PAGE_SIZE, "uid": "794762570",
+            "ver": "kwplayer_ar_9.2.2.1", "vipver": 1, "show_copyright_off": 1, "newver": 1,
+            "ft": "music", "cluster": 0, "strategy": 2012, "encoding": "utf8", "rformat": "json",
+            "vermerge": 1, "mobi": 1, "issubtitle": 1,
+        }
+        url = base_url + "r.s?" + urlencode(params)
+        for _ in range(_KUWO_ATTEMPTS):
+            payload = self.fetch(url, strict_type=False)
+            items = payload.get("abslist")
+            glitch = str(payload.get("TOTAL")) != "0" and str(payload.get("SHOW")) == "0"
+            if isinstance(items, list) and not glitch:
+                break
+        else:
+            raise V2Unavailable("kuwo search response changed")
+        songs = [self._song(source_id, item) for item in items if isinstance(item, dict)]
+        return {
+            "items": [song for song in songs if song], "page": page,
+            "has_more": page * _KUWO_PAGE_SIZE < _count(payload.get("TOTAL")),
+        }
+
+    def _song_info(self, song_id: str) -> dict:
+        url = _KUWO_SONG_INFO + "?" + urlencode({"musicId": song_id})
+        for _ in range(_KUWO_ATTEMPTS):
+            data = self.fetch(url, strict_type=False).get("data")
+            if isinstance(data, dict):
+                return data
+        raise V2NotFound("kuwo song is unavailable")
+
+    def song(self, base_url: str, source_id: str, song_id: str) -> dict:
+        info = self._song_info(song_id).get("songinfo") or {}
+        cover = str(info.get("pic") or "").replace("/albumcover/240/", "/albumcover/500/")
+        return {
+            "id": f"{source_id}:{song_id}", "source_id": source_id,
+            "external_id": song_id, "qualities": ["mp3"] if self.resolvers else [],
+            "artwork_url": artwork_proxy(cover, source_id, self.artwork_hosts),
+        }
+
+    def lyrics(self, base_url: str, source_id: str, song_id: str) -> dict:
+        lines = []
+        for item in self._song_info(song_id).get("lrclist") or []:
+            stamp = _lrc_time(item.get("time")) if isinstance(item, dict) else None
+            if stamp is not None:
+                lines.append(f"[{stamp}]{self._text(item.get('lineLyric'))}")
+        if not lines:
+            raise V2NotFound("lyrics are unavailable")
+        return {"id": f"{source_id}:{song_id}", "source_id": source_id, "lrc": "\n".join(lines)}
+
+    def _resolve(self, resolver: dict, song_id: str) -> str:
+        url = resolver["url_template"].replace("{id}", quote(song_id, safe=""))
+        headers = resolver.get("headers") or {}
+        if resolver.get("kind") == "json":
+            target = self.fetch(url, headers, strict_type=False).get(resolver.get("json_url_field") or "url")
+            if not isinstance(target, str):
+                raise V2Unavailable("audio resolver returned no URL")
+        else:
+            target = self.locate(url, headers)
+        return validate_public_url(target, hosts=self.audio_hosts)
+
+    def audio_url(self, base_url: str, song_id: str, quality: str) -> str:
+        if quality not in {AUTO_QUALITY, "mp3"}:
+            raise V2NotFound("requested audio quality is unavailable")
+        last_error: Exception | None = None
+        for resolver in self.resolvers:
+            try:
+                return self._resolve(resolver, song_id)
+            except (V2Unavailable, V2DomainError, V2NotFound) as error:
+                log.warning(
+                    "Kuwo audio resolver failed: resolver=%s song=%s error=%s",
+                    resolver.get("name"), song_id, error,
+                )
+                last_error = error
+        raise V2Unavailable("every configured audio resolver failed") from last_error
+
+    def recommend(self, base_url: str, source_id: str, page: int) -> dict:
+        return {"items": [], "page": page, "has_more": False}
+
+    def playlists(self, base_url: str, source_id: str, page: int) -> dict:
+        return {"items": [], "page": page, "has_more": False, "total_pages": page}
+
+    def search_playlists(self, base_url: str, source_id: str, query: str, page: int) -> dict:
+        return {"items": [], "page": page, "has_more": False}
+
+    def playlist(self, base_url: str, source_id: str, playlist_id: str, page: int) -> dict:
+        raise V2NotFound("this music source has no playlists")
+
+
+ADAPTERS: dict[str, MusicAdapter] = {"feiniao": FeiniaoAdapter(), "kuwo": KuwoAdapter()}
+_ADAPTER_NAMES = {"feiniao": "飞鸟轻音", "kuwo": "酷我直连（LX 接口）"}
 
 
 def adapter_kinds() -> list[dict]:
     return [
         {
             "id": key,
-            "name": "飞鸟轻音" if key == "feiniao" else key,
+            "name": _ADAPTER_NAMES.get(key, key),
             "default_config": getattr(adapter, "default_config", {}),
         }
         for key, adapter in ADAPTERS.items()

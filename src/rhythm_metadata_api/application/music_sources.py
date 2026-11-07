@@ -39,6 +39,20 @@ Recommended album invariants:
   Redis for this, which adds a write to every home screen request for a best-effort preference.
 - issue 172: sources whose adapter does not browse playlists (a Feiniao instance on NetEase) are
   skipped when building pools, so they never trigger an empty refresh and its five-minute retry.
+
+Standby source invariants (issue 173):
+- Sources whose adapters share a ``catalog`` (Feiniao on Kuwo and Kuwo direct both use Kuwo rids)
+  stand in for each other. Search asks only the first healthy one per catalog in priority order,
+  so the same songs are not listed twice; detail, lyrics and audio for ``a:<rid>`` fall back to
+  ``b:<rid>`` and keep the ``a:`` ID, so songs already saved on phones keep playing.
+- A source that answered "unavailable" is skipped for 60 seconds while a standby exists, so an
+  outage does not add an upstream timeout to every request. The record lives in process memory:
+  a restart forgets it and the source is simply tried again (self-healing, no table).
+- A fallback audio URL is cached under the requested source's key, so seeks reuse it and the
+  existing invalidate-and-retry path re-resolves through the same fallback.
+- Not covered: a URL that resolves but whose CDN then fails mid-stream; the stream route's single
+  retry handles that as before. Configuration errors (a host rule rejection, V2DomainError) do not
+  fall back, so a bad rule stays visible instead of being masked by the standby.
 """
 
 from __future__ import annotations
@@ -97,6 +111,7 @@ _RECOMMENDED_KEYWORDS = (
     "流行", "民谣", "摇滚", "古典", "治愈", "轻音乐", "爵士", "粤语", "经典老歌", "华语",
     "欧美", "日语", "说唱", "电子", "学习", "运动", "睡前", "咖啡馆", "钢琴", "怀旧",
 )
+_SOURCE_DOWN_SECONDS = 60
 _RECOMMENDED_MIN_SONGS = 10
 _RECOMMENDED_MAX_SONGS = 200
 _HOST = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.IGNORECASE)
@@ -124,6 +139,44 @@ class LyricFilters(BaseModel):
         return list(dict.fromkeys(normalized))
 
 
+_HEADER_NAME = re.compile(r"^[A-Za-z0-9-]{1,40}$")
+
+
+class UrlResolver(BaseModel):
+    """issue 173: one third-party audio URL resolver; ``{id}`` is replaced by the song ID."""
+
+    name: str = Field(min_length=1, max_length=40)
+    kind: Literal["json", "redirect"]
+    url_template: str = Field(min_length=10, max_length=500)
+    headers: dict[str, str] = Field(default_factory=dict, max_length=5)
+    json_url_field: str = Field(default="url", min_length=1, max_length=40)
+    enabled: bool = True
+
+    @field_validator("url_template")
+    @classmethod
+    def valid_template(cls, value: str) -> str:
+        value = value.strip()
+        parts = urlsplit(value.replace("{id}", "0"))
+        host = (parts.hostname or "").lower()
+        if value.count("{id}") != 1 or "{" in value.replace("{id}", ""):
+            raise ValueError("url_template must contain {id} exactly once and no other placeholder")
+        if parts.scheme not in {"http", "https"} or parts.username or parts.password or not _HOST.fullmatch(host):
+            raise ValueError("url_template must be an http(s) URL on a public DNS name")
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            return value
+        raise ValueError("IP addresses are not allowed in resolver URLs")
+
+    @field_validator("headers")
+    @classmethod
+    def valid_headers(cls, values: dict[str, str]) -> dict[str, str]:
+        for name, value in values.items():
+            if not _HEADER_NAME.fullmatch(name) or len(value) > 200 or any(c in value for c in "\r\n"):
+                raise ValueError("resolver headers need simple names and single-line values")
+        return values
+
+
 class MusicSourceConfig(BaseModel):
     audio_hosts: list[str] = Field(default_factory=lambda: sorted(_AUDIO_HOSTS), max_length=20)
     artwork_hosts: list[str] = Field(default_factory=lambda: sorted(_ARTWORK_HOSTS), max_length=20)
@@ -137,6 +190,8 @@ class MusicSourceConfig(BaseModel):
     recommended_max_songs: int = Field(default=_RECOMMENDED_MAX_SONGS, ge=1, le=100000)
     # issue 171: one of these is searched per hourly pool refresh; empty turns the mix-in off.
     recommended_keywords: list[str] = Field(default_factory=lambda: list(_RECOMMENDED_KEYWORDS), max_length=100)
+    # issue 173: only adapters that resolve audio through third parties (Kuwo direct) read this.
+    url_resolvers: list[UrlResolver] = Field(default_factory=list, max_length=8)
 
     @field_validator("recommended_keywords")
     @classmethod
@@ -320,6 +375,8 @@ class MusicSourceService:
         # issue 171: playlist id -> wall-clock time it was last returned, oldest first.
         self._recommended_seen: OrderedDict[str, float] = OrderedDict()
         self._recommended_seen_lock = threading.Lock()
+        # issue 173: source id -> monotonic time until which it is skipped in favour of a standby.
+        self._down_until: dict[str, float] = {}
 
     def adapters(self) -> dict:
         return {"items": adapter_kinds()}
@@ -411,11 +468,11 @@ class MusicSourceService:
             raise V2DomainError("source id must contain lowercase letters, digits, '-' or '_'")
         if data.adapter not in ADAPTERS:
             raise V2DomainError("unsupported music adapter")
-        config = data.config.model_dump()
-        if "lyric_filters" not in data.config.model_fields_set:
-            # Filter text belongs to the adapter; other protocols start without any rules.
-            defaults = getattr(ADAPTERS[data.adapter], "default_config", {})
-            config["lyric_filters"] = defaults.get("lyric_filters", config["lyric_filters"])
+        # Fields the administrator did not send come from the adapter (filter text, Kuwo hosts and
+        # resolvers), then from the model defaults; sent fields always win.
+        defaults = getattr(ADAPTERS[data.adapter], "default_config", {})
+        explicit = data.config.model_dump(include=data.config.model_fields_set)
+        config = MusicSourceConfig.model_validate({**defaults, **explicit}).model_dump()
         source = MusicSource(
             id=data.id, name=data.name.strip(), adapter=data.adapter,
             base_url=validate_base_url(data.base_url), enabled=data.enabled,
@@ -495,6 +552,43 @@ class MusicSourceService:
         if adapter is None:
             raise V2Unavailable("configured music adapter is not installed")
         return adapter.configured(source.config) if hasattr(adapter, "configured") else adapter
+
+    def _catalog(self, source: MusicSource) -> str | None:
+        return getattr(self._adapter(source), "catalog", None)
+
+    def _is_down(self, source_id: str) -> bool:
+        return self._down_until.get(source_id, 0.0) > monotonic()
+
+    def _mark_down(self, source_id: str) -> None:
+        self._down_until[source_id] = monotonic() + _SOURCE_DOWN_SECONDS
+
+    def _with_standby(self, source: MusicSource, operation):
+        """Run ``operation(source, adapter)``, then on same-catalog standbys (issue 173)."""
+        catalog = self._catalog(source)
+        standbys = [
+            other for other in self._enabled_sources()
+            if other.id != source.id and catalog is not None and self._catalog(other) == catalog
+        ] if catalog is not None else []
+        if not standbys:
+            return source, operation(source, self._adapter(source))
+        order = [*standbys, source] if self._is_down(source.id) else [source, *standbys]
+        last_error: Exception | None = None
+        for candidate in order:
+            try:
+                value = operation(candidate, self._adapter(candidate))
+            except (V2Unavailable, V2NotFound) as error:
+                if isinstance(error, V2Unavailable):
+                    self._mark_down(candidate.id)
+                log.warning(
+                    "Music source failed, trying standby: source=%s tried=%s error=%s",
+                    source.id, candidate.id, error,
+                )
+                last_error = error
+                continue
+            if candidate.id != source.id:
+                log.info("Served by standby source: source=%s standby=%s", source.id, candidate.id)
+            return candidate, value
+        raise last_error  # type: ignore[misc]
 
     def artwork_hosts(self, source_id: str | None = None) -> frozenset[str]:
         sources = [self._active(source_id)] if source_id else self._enabled_sources()
@@ -668,16 +762,32 @@ class MusicSourceService:
         )
         results = []
         unavailable = []
+        served: set[str] = set()
+        catalogs = {source.id: None if source_id else self._catalog(source) for source in sources}
         for source in sources:
+            catalog = catalogs[source.id]
+            if catalog is not None and catalog in served:
+                continue  # issue 173: a healthier source of the same catalog already answered
+            if catalog is not None and self._is_down(source.id) and any(
+                other.id != source.id and catalogs[other.id] == catalog and not self._is_down(other.id)
+                for other in sources
+            ):
+                unavailable.append(source.id)
+                continue
             try:
                 result = self._overlay(
                     source.id,
                     self._adapter(source).search(source.base_url, source.id, query.strip(), page),
                 )
                 results.append({"source_id": source.id, **result})
+                if catalog is not None:
+                    served.add(catalog)
             except (V2Unavailable, V2DomainError) as error:
                 if source_id:
                     raise V2Unavailable("configured music source is unavailable") from error
+                if isinstance(error, V2Unavailable):
+                    self._mark_down(source.id)
+                log.warning("Music search failed: source=%s page=%s error=%s", source.id, page, error)
                 unavailable.append(source.id)
         if sources and not results:
             raise V2Unavailable("all configured music sources are unavailable")
@@ -824,7 +934,11 @@ class MusicSourceService:
                 return self.metadata(source_id, song_id)
             except V2NotFound:
                 pass
-        return self._adapter(source).song(source.base_url, source.id, self._id(song_id))
+        song_id = self._id(song_id)
+        _, result = self._with_standby(
+            source, lambda serving, adapter: adapter.song(serving.base_url, serving.id, song_id),
+        )
+        return {**result, "id": f"{source.id}:{song_id}", "source_id": source.id}
 
     def lyrics(self, source_id: str, song_id: str, refresh: bool = False) -> dict:
         source = self._active(source_id)
@@ -835,8 +949,14 @@ class MusicSourceService:
                     return {"id": cached["id"], "source_id": source_id, "lrc": cached["lyrics_lrc"], "mode": cached["mode"]}
             except V2NotFound:
                 pass
-        result = self._adapter(source).lyrics(source.base_url, source.id, self._id(song_id))
-        return {**result, "lrc": clean_lyrics(result["lrc"], source.config.get("lyric_filters", {}))}
+        song_id = self._id(song_id)
+        serving, result = self._with_standby(
+            source, lambda serving, adapter: adapter.lyrics(serving.base_url, serving.id, song_id),
+        )
+        return {
+            **result, "id": f"{source.id}:{song_id}", "source_id": source.id,
+            "lrc": clean_lyrics(result["lrc"], serving.config.get("lyric_filters", {})),
+        }
 
     def audio_url(self, source_id: str, song_id: str, quality: str) -> str:
         if quality != AUTO_QUALITY and quality not in AUDIO_QUALITIES:
@@ -854,7 +974,9 @@ class MusicSourceService:
                 cached = self._audio_urls.get(key)
             if cached and cached[0] > monotonic():
                 return cached[1]
-            url = self._adapter(source).audio_url(source.base_url, song_id, quality)
+            _, url = self._with_standby(
+                source, lambda serving, adapter: adapter.audio_url(serving.base_url, song_id, quality),
+            )
             with self._audio_urls_guard:
                 ttl = MusicSourceConfig.model_validate(source.config).audio_url_ttl_seconds
                 self._audio_urls[key] = (monotonic() + ttl, url)
