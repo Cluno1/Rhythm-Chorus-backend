@@ -54,6 +54,19 @@ class MusicSource(Base):
     __table_args__ = (Index("v2_music_sources_enabled_priority_idx", "enabled", "priority"),)
 
 
+class MusicSettings(Base):
+    """issue 181: music configuration shared by every source; one row with id ``global``."""
+
+    __tablename__ = "v2_music_settings"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default="global")
+    recommended_keywords: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+
 class MusicSongMetadata(Base):
     """Shared display metadata learned by clients, independent of transient stream URLs."""
 

@@ -37,6 +37,10 @@ Recommended album invariants:
   users. A restart or a second worker starts with an empty record, which only falls back to plain
   random picks for a while; it is capped so it cannot grow without bound. Rejected: a table or
   Redis for this, which adds a write to every home screen request for a best-effort preference.
+- issue 181: the keyword list is one setting for all sources (``v2_music_settings``, edited on the
+  Web music-sources page), not part of each source's config: every source used the same words, and
+  the per-source field had no editor. A missing row (in-memory databases) means the default words.
+  An old per-source ``recommended_keywords`` key is ignored and dropped on that source's next save.
 - issue 172: sources whose adapter does not browse playlists (a Feiniao instance on NetEase) are
   skipped when building pools, so they never trigger an empty refresh and its five-minute retry.
 
@@ -107,7 +111,12 @@ from rhythm_metadata_api.domain.v2.errors import (
     V2NotFound,
     V2Unavailable,
 )
-from rhythm_metadata_api.infrastructure.db.models import MusicSongMetadata, MusicSource, utc_now
+from rhythm_metadata_api.infrastructure.db.models import (
+    MusicSettings,
+    MusicSongMetadata,
+    MusicSource,
+    utc_now,
+)
 
 log = logging.getLogger(__name__)
 _KEEP = object()  # issue 176: marker for "leave the stored image as it is"
@@ -202,18 +211,8 @@ class MusicSourceConfig(BaseModel):
     )
     recommended_min_songs: int = Field(default=_RECOMMENDED_MIN_SONGS, ge=1, le=100000)
     recommended_max_songs: int = Field(default=_RECOMMENDED_MAX_SONGS, ge=1, le=100000)
-    # issue 171: one of these is searched per hourly pool refresh; empty turns the mix-in off.
-    recommended_keywords: list[str] = Field(default_factory=lambda: list(_RECOMMENDED_KEYWORDS), max_length=100)
     # issue 173: only adapters that resolve audio through third parties (Kuwo direct) read this.
     url_resolvers: list[UrlResolver] = Field(default_factory=list, max_length=8)
-
-    @field_validator("recommended_keywords")
-    @classmethod
-    def valid_recommended_keywords(cls, values: list[str]) -> list[str]:
-        normalized = [value.strip() for value in values if value.strip()]
-        if any(len(value) > 40 for value in normalized):
-            raise ValueError("each recommended keyword must contain at most 40 characters")
-        return list(dict.fromkeys(normalized))
 
     @model_validator(mode="after")
     def valid_recommended_range(self) -> Self:
@@ -266,6 +265,25 @@ class MusicSourcePatch(BaseModel):
     enabled: bool | None = None
     priority: int | None = Field(default=None, ge=0, le=10000)
     config: MusicSourceConfig | None = None
+
+
+def _valid_keywords(values: list[str]) -> list[str]:
+    normalized = [value.strip() for value in values if value.strip()]
+    if any(len(value) > 40 for value in normalized):
+        raise ValueError("each recommended keyword must contain at most 40 characters")
+    return list(dict.fromkeys(normalized))
+
+
+class MusicSettingsPatch(BaseModel):
+    """issue 181: one of these keywords is searched per hourly pool refresh; empty turns it off."""
+
+    recommended_keywords: list[str] = Field(max_length=100)
+    revision: int = Field(ge=1)
+
+    @field_validator("recommended_keywords")
+    @classmethod
+    def valid_recommended_keywords(cls, values: list[str]) -> list[str]:
+        return _valid_keywords(values)
 
 
 class MusicSongMetadataWrite(BaseModel):
@@ -553,6 +571,45 @@ class MusicSourceService:
                 source_id, source.revision, sorted(fields - {"revision"}),
             )
             return serialize_source(source)
+
+    def settings(self) -> dict:
+        with self.sessions() as session:
+            row = session.get(MusicSettings, "global")
+        if row is None:
+            return {"recommended_keywords": list(_RECOMMENDED_KEYWORDS), "revision": 1, "updated_at": None}
+        return {
+            "recommended_keywords": list(row.recommended_keywords),
+            "revision": row.revision,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        }
+
+    def patch_settings(self, data: MusicSettingsPatch) -> dict:
+        with self.sessions() as session:
+            row = session.get(MusicSettings, "global")
+            current = row.revision if row is not None else 1
+            if data.revision != current:
+                raise V2Conflict("music settings were changed by another administrator")
+            if row is None:
+                session.add(MusicSettings(
+                    id="global", recommended_keywords=data.recommended_keywords, revision=current + 1,
+                ))
+            else:
+                result = session.execute(
+                    update(MusicSettings)
+                    .where(MusicSettings.id == "global", MusicSettings.revision == data.revision)
+                    .values(recommended_keywords=data.recommended_keywords, revision=current + 1,
+                            updated_at=utc_now())
+                )
+                if result.rowcount != 1:
+                    session.rollback()
+                    raise V2Conflict("music settings were changed by another administrator")
+            try:
+                session.commit()
+            except IntegrityError as error:
+                session.rollback()
+                raise V2Conflict("music settings were changed by another administrator") from error
+        log.info("music settings updated to revision %s; keywords=%s", current + 1, len(data.recommended_keywords))
+        return self.settings()
 
     def _active(self, source_id: str) -> MusicSource:
         with self.sessions() as session:
@@ -963,7 +1020,7 @@ class MusicSourceService:
                             break
                         continue
                     items.update((item["id"], item) for item in result["items"])
-            keywords = source.config.get("recommended_keywords", list(_RECOMMENDED_KEYWORDS))
+            keywords = self.settings()["recommended_keywords"]
             if keywords and hasattr(adapter, "search_playlists") and not self._is_down(source.id):
                 keyword = keywords[int(time.time() // 3600) % len(keywords)]
                 try:

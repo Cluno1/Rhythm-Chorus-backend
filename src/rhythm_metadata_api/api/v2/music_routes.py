@@ -23,6 +23,7 @@ from rhythm_metadata_api.application.music_adapters import (
 from rhythm_metadata_api.application.music_images import MusicImageArchiveError
 from rhythm_metadata_api.application.music_sources import (
     LyricFilters,
+    MusicSettingsPatch,
     MusicSongLyricsWrite,
     MusicSongMetadataWrite,
     MusicSourceCreate,
@@ -33,6 +34,8 @@ from rhythm_metadata_api.domain.v2.errors import V2DomainError, V2Unavailable
 
 router = APIRouter(prefix="/v2/music", tags=["music sources"])
 admin_router = APIRouter(prefix="/v2/admin/music-sources", tags=["music source administration"])
+# issue 181: its own prefix, so it can never collide with a source named "settings".
+settings_router = APIRouter(prefix="/v2/admin/music-settings", tags=["music source administration"])
 _SINGLE_RANGE = re.compile(r"^bytes=\d*-\d*$")
 
 
@@ -99,6 +102,16 @@ def create_source(body: MusicSourceCreate, service: Sources, _: AdminActor) -> d
 @admin_router.patch("/{source_id}")
 def patch_source(source_id: str, body: MusicSourcePatch, service: Sources, _: AdminActor) -> dict:
     return service.patch(source_id, body)
+
+
+@settings_router.get("")
+def music_settings(service: Sources, _: AdminActor) -> dict:
+    return service.settings()
+
+
+@settings_router.patch("")
+def patch_music_settings(body: MusicSettingsPatch, service: Sources, _: AdminActor) -> dict:
+    return service.patch_settings(body)
 
 
 @router.get("/sources")

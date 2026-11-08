@@ -21,6 +21,7 @@ from rhythm_metadata_api.application.music_adapters import (
 )
 from rhythm_metadata_api.application.music_sources import (
     LyricFilters,
+    MusicSettingsPatch,
     MusicSongMetadataWrite,
     MusicSourceConfig,
     MusicSourceCreate,
@@ -1088,8 +1089,8 @@ def test_关键词每小时轮换并混入候选池(tmp_path, monkeypatch) -> No
         tmp_path, monkeypatch, [], keyword_rows=[keyword_row("900", "关键词歌单")],
     )
     with client:
-        client.app.state.v2_container.music_sources.patch("feiniao", MusicSourcePatch(
-            revision=2, config=MusicSourceConfig(recommended_keywords=["民谣", "摇滚", "治愈"]),
+        client.app.state.v2_container.music_sources.patch_settings(MusicSettingsPatch(
+            revision=1, recommended_keywords=["民谣", "摇滚", "治愈"],
         ))
         assert recommended_names(client) == {"关键词歌单"}
         now["value"] += 3601
@@ -1101,8 +1102,8 @@ def test_关键词每小时轮换并混入候选池(tmp_path, monkeypatch) -> No
 def test_关键词为空时不搜索(tmp_path, monkeypatch) -> None:
     client, _, state = recommended_client(tmp_path, monkeypatch, [playlist_row("1", "热门")])
     with client:
-        client.app.state.v2_container.music_sources.patch("feiniao", MusicSourcePatch(
-            revision=2, config=MusicSourceConfig(recommended_keywords=[]),
+        client.app.state.v2_container.music_sources.patch_settings(MusicSettingsPatch(
+            revision=1, recommended_keywords=[],
         ))
         assert recommended_names(client) == {"热门"}
         assert state["searches"] == []
@@ -1114,6 +1115,96 @@ def test_关键词搜索失败仍返回热门榜结果(tmp_path, monkeypatch) ->
     with client:
         assert recommended_names(client) == {"热门"}
         assert len(state["searches"]) == 1
+
+
+# issue 181: one keyword list for all sources, edited on the Web music-sources page.
+def admin_settings_client(tmp_path: Path) -> tuple[TestClient, dict]:
+    client = TestClient(create_public_app(settings(tmp_path)))
+    client.__enter__()
+    session = client.post("/v2/admin/session", json={
+        "username": "admin", "password": "correct horse battery staple",
+    }).json()
+    return client, {"Authorization": f"Bearer {session['accessToken']}"}
+
+
+def test_全局音乐设置默认是原来的二十个关键词(tmp_path) -> None:
+    client, admin = admin_settings_client(tmp_path)
+    with client:
+        response = client.get("/v2/admin/music-settings", headers=admin)
+        assert response.status_code == 200
+        assert response.json()["recommended_keywords"] == list(music_sources._RECOMMENDED_KEYWORDS)
+        assert response.json()["revision"] == 1
+        assert client.get("/v2/admin/music-settings").status_code == 401
+        assert client.patch("/v2/admin/music-settings", json={
+            "recommended_keywords": [], "revision": 1,
+        }).status_code == 401
+
+
+def test_全局关键词保存一次升版本并去空去重(tmp_path) -> None:
+    client, admin = admin_settings_client(tmp_path)
+    with client:
+        response = client.patch("/v2/admin/music-settings", headers=admin, json={
+            "recommended_keywords": [" 民谣 ", "", "民谣", "爵士"], "revision": 1,
+        })
+        assert response.status_code == 200
+        assert response.json()["recommended_keywords"] == ["民谣", "爵士"]
+        assert response.json()["revision"] == 2
+        assert client.get("/v2/admin/music-settings", headers=admin).json()["revision"] == 2
+
+
+def test_全局关键词用旧版本保存时冲突且不覆盖(tmp_path) -> None:
+    client, admin = admin_settings_client(tmp_path)
+    with client:
+        assert client.patch("/v2/admin/music-settings", headers=admin, json={
+            "recommended_keywords": ["民谣"], "revision": 1,
+        }).status_code == 200
+        stale = client.patch("/v2/admin/music-settings", headers=admin, json={
+            "recommended_keywords": ["摇滚"], "revision": 1,
+        })
+        assert stale.status_code == 409
+        assert client.get("/v2/admin/music-settings", headers=admin).json()["recommended_keywords"] == ["民谣"]
+
+
+def test_全局关键词过长时拒绝(tmp_path) -> None:
+    client, admin = admin_settings_client(tmp_path)
+    with client:
+        assert client.patch("/v2/admin/music-settings", headers=admin, json={
+            "recommended_keywords": ["长" * 41], "revision": 1,
+        }).status_code == 422
+
+
+def test_没有全局设置行时用默认关键词(tmp_path) -> None:
+    client, admin = admin_settings_client(tmp_path)
+    with client:
+        service = client.app.state.v2_container.music_sources
+        with service.sessions() as session:
+            session.delete(session.get(music_sources.MusicSettings, "global"))
+            session.commit()
+        response = client.get("/v2/admin/music-settings", headers=admin).json()
+        assert response["recommended_keywords"] == list(music_sources._RECOMMENDED_KEYWORDS)
+
+
+def test_两处同时从同一版本保存时只有一处成功(tmp_path) -> None:
+    client, _ = admin_settings_client(tmp_path)
+    with client:
+        service = client.app.state.v2_container.music_sources
+        service.patch_settings(MusicSettingsPatch(revision=1, recommended_keywords=["民谣"]))
+        with pytest.raises(V2Conflict):
+            service.patch_settings(MusicSettingsPatch(revision=1, recommended_keywords=["摇滚"]))
+        assert service.settings()["recommended_keywords"] == ["民谣"]
+
+
+def test_音源自己的旧关键词配置不再生效(tmp_path, monkeypatch) -> None:
+    client, _, state = recommended_client(tmp_path, monkeypatch, [playlist_row("1", "热门")])
+    with client:
+        service = client.app.state.v2_container.music_sources
+        with service.sessions() as session:
+            source = session.get(music_sources.MusicSource, "feiniao")
+            source.config = {**source.config, "recommended_keywords": []}
+            session.commit()
+        service.patch_settings(MusicSettingsPatch(revision=1, recommended_keywords=["怀旧"]))
+        recommended_names(client)
+        assert state["searches"] == ["怀旧"]
 
 
 # issue 172: Feiniao only passes ``source`` to search, detail, audio and lyrics. Its playlist and
