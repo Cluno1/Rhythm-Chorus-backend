@@ -83,7 +83,6 @@ async def admin_upload_image(
     request: Request,
     service: Announcements,
     actor: AdminActor,
-    content_type: Annotated[str, Header(alias="Content-Type")] = "",
 ) -> Response:
     chunks: list[bytes] = []
     size = 0
@@ -92,7 +91,7 @@ async def admin_upload_image(
         if size > MAX_IMAGE_BYTES:
             raise AnnouncementImageTooLarge("announcement image must not exceed 10 MB")
         chunks.append(chunk)
-    result = await run_in_threadpool(service.upload_image, b"".join(chunks), content_type, actor.actor_id)
+    result = await run_in_threadpool(service.upload_image, b"".join(chunks), actor.actor_id)
     return model_response(result, status_code=201, headers=_NO_STORE)
 
 

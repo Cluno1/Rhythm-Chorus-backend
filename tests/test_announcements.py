@@ -254,7 +254,8 @@ def test_列表未变化时返回304_发布后ETag变化(public: TestClient) -> 
 @pytest.mark.parametrize("body", [
     {"type": "paragraph"},
     doc({"type": "script", "content": []}),
-    doc({"type": "heading", "attrs": {"level": 1}, "content": [{"type": "text", "text": "x"}]}),
+    doc({"type": "heading", "attrs": {"level": 4}, "content": [{"type": "text", "text": "x"}]}),
+    doc({"type": "heading", "attrs": {"level": True}, "content": [{"type": "text", "text": "x"}]}),
     doc({"type": "codeBlock", "content": [{"type": "text", "text": "x"}]}),
     doc({"type": "paragraph", "content": [{"type": "text", "text": "x", "marks": [{"type": "code"}]}]}),
     doc({"type": "paragraph", "content": [{"type": "text", "text": "x", "marks": [
@@ -267,7 +268,7 @@ def test_列表未变化时返回304_发布后ETag变化(public: TestClient) -> 
     doc({"type": "image", "attrs": {"src": 123}}),
     doc({"type": "image", "attrs": {"src": "/v2/announcements/images/../../secret.png"}}),
     doc({"type": "bulletList", "content": [paragraph("list children must be items")]}),
-    doc({"type": "blockquote", "content": [{"type": "image", "attrs": {"src": "/v2/announcements/images/x"}}]}),
+    doc({"type": "blockquote", "content": [{"type": "image", "attrs": {"src": "https://evil.example/x.png"}}]}),
 ])
 def test_不在白名单内的内容被拒绝(body: dict) -> None:
     with pytest.raises(ValidationError):
@@ -281,10 +282,50 @@ def test_过大的正文被拒绝() -> None:
 
 def test_过深的嵌套被拒绝() -> None:
     node: dict = paragraph("x")
-    for _ in range(12):
+    for _ in range(20):
         node = {"type": "blockquote", "content": [node]}
     with pytest.raises(ValueError, match="too deeply"):
         normalize_body(doc(node))
+
+
+IMAGE_NODE = {"type": "image", "attrs": {"src": f"/v2/announcements/images/{'a' * 64}.jpg"}}
+HEADING_NODE = {"type": "heading", "attrs": {"level": 3}, "content": [{"type": "text", "text": "x"}]}
+
+
+@pytest.mark.parametrize("child", [IMAGE_NODE, HEADING_NODE, {"type": "horizontalRule"}])
+@pytest.mark.parametrize("wrap", [
+    lambda child: {"type": "blockquote", "content": [child]},
+    lambda child: {"type": "bulletList", "content": [{"type": "listItem", "content": [paragraph("x"), child]}]},
+])
+def test_列表和引用内可以放图片标题和分隔线(wrap, child: dict) -> None:
+    body = doc(wrap(child))
+    assert normalize_body(body) == body
+
+
+@pytest.mark.parametrize("level", [1, 2, 3])
+def test_一到三级标题都保留层级(level: int) -> None:
+    body = doc({"type": "heading", "attrs": {"level": level}, "content": [{"type": "text", "text": "x"}]})
+    assert normalize_body(body) == body
+
+
+def test_四层嵌套列表可以保存() -> None:
+    node: dict = {"type": "bulletList", "content": [{"type": "listItem", "content": [paragraph("x")]}]}
+    for _ in range(3):
+        node = {"type": "bulletList", "content": [{"type": "listItem", "content": [paragraph("x"), node]}]}
+    assert normalize_body(doc(node)) == doc(node)
+
+
+def test_超长图片只丢弃超限的尺寸不拒绝保存() -> None:
+    src = IMAGE_NODE["attrs"]["src"]
+    normalized = normalize_body(doc({"type": "image", "attrs": {"src": src, "width": 1080, "height": 20_001}}))
+    assert normalized == doc({"type": "image", "attrs": {"src": src, "width": 1080}})
+
+
+@pytest.mark.parametrize("width", [0, -1, 1.5, True, "640"])
+def test_无效的图片宽度仍被拒绝(width: object) -> None:
+    src = IMAGE_NODE["attrs"]["src"]
+    with pytest.raises(ValueError, match="image width is invalid"):
+        normalize_body(doc({"type": "image", "attrs": {"src": src, "width": width}}))
 
 
 def test_已知节点上的样式属性被丢弃() -> None:
@@ -324,8 +365,15 @@ def test_存储失败时不记录图片(public: TestClient) -> None:
     assert row_count(public, AnnouncementImage) == 0
 
 
+def test_图片按实际字节识别类型不看声明(public: TestClient, storage: FakeStorage) -> None:
+    response = upload(public, admin(public), PNG, "image/jpeg")
+    assert response.status_code == 201
+    assert response.json()["media_type"] == "image/png"
+    assert response.json()["path"].endswith(".png")
+    assert len(storage.calls) == 1
+
+
 @pytest.mark.parametrize(("content", "media_type", "status"), [
-    (PNG, "image/jpeg", 422),
     (b"<svg></svg>", "image/svg+xml", 422),
     (b"", "image/png", 422),
     (b"\x89PNG\r\n\x1a\n" + b"0" * 10_000_001, "image/png", 413),

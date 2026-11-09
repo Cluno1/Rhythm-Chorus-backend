@@ -221,7 +221,7 @@ class AnnouncementService:
 
     # ---- images ----
 
-    def upload_image(self, body: bytes, declared_type: str, actor_id: str) -> AnnouncementImageResponse:
+    def upload_image(self, body: bytes, actor_id: str) -> AnnouncementImageResponse:
         if len(body) > MAX_IMAGE_BYTES:
             raise AnnouncementImageTooLarge("announcement image must not exceed 10 MB")
         if not body:
@@ -230,8 +230,6 @@ class AnnouncementService:
             media_type, suffix = _detected_type(body)
         except MusicImageArchiveError as error:
             raise V2DomainError("announcement image must be JPEG, PNG, WebP or GIF") from error
-        if declared_type.split(";", 1)[0].strip().lower() != media_type:
-            raise V2DomainError("announcement image type does not match its bytes")
         self._require_storage()
         name = f"{hashlib.sha256(body).hexdigest()}.{suffix}"
         with self.uow_factory() as uow:

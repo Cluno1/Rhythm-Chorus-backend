@@ -24,9 +24,10 @@ SCHEMA_VERSION = 1
 IMAGE_PATH_PREFIX = "/v2/announcements/images/"
 IMAGE_NAME = re.compile(r"^[a-f0-9]{64}\.(?:jpg|png|webp|gif)$")
 MAX_BODY_BYTES = 256 * 1024
-_MAX_DEPTH = 8
+_MAX_DEPTH = 16
 _MAX_DIMENSION = 20_000
 _EXCERPT_LENGTH = 120
+_HEADING_LEVELS = (1, 2, 3)
 
 Importance = Literal["normal", "important"]
 Status = Literal["draft", "published", "archived"]
@@ -102,9 +103,11 @@ def _image_attrs(node: dict) -> dict:
         value = attrs.get(name)
         if value is None:
             continue
-        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= _MAX_DIMENSION:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"image {name} is invalid")
-        result[name] = value
+        # Size only reserves layout space, so a very long image still saves and displays without it.
+        if value <= _MAX_DIMENSION:
+            result[name] = value
     return result
 
 
@@ -119,9 +122,10 @@ def _block(node: Any, depth: int, *, allowed: frozenset[str] | None = None) -> d
     if kind == "paragraph":
         return _inline_container({"type": "paragraph"}, node)
     if kind == "heading":
-        if (node.get("attrs") or {}).get("level") != 2:
-            raise ValueError("only level 2 headings are allowed")
-        return _inline_container({"type": "heading", "attrs": {"level": 2}}, node)
+        level = (node.get("attrs") or {}).get("level")
+        if isinstance(level, bool) or not isinstance(level, int) or level not in _HEADING_LEVELS:
+            raise ValueError("only heading levels 1 to 3 are allowed")
+        return _inline_container({"type": "heading", "attrs": {"level": level}}, node)
     if kind == "bulletList":
         return {"type": "bulletList", "content": _blocks(node, depth, allowed=_LIST_ITEM)}
     if kind == "orderedList":
@@ -131,9 +135,9 @@ def _block(node: Any, depth: int, *, allowed: frozenset[str] | None = None) -> d
         attrs = {"attrs": {"start": start}} if start != 1 else {}
         return {"type": "orderedList", **attrs, "content": _blocks(node, depth, allowed=_LIST_ITEM)}
     if kind == "listItem":
-        return {"type": "listItem", "content": _blocks(node, depth, allowed=_ITEM_CHILDREN)}
+        return {"type": "listItem", "content": _blocks(node, depth, allowed=_BLOCKS)}
     if kind == "blockquote":
-        return {"type": "blockquote", "content": _blocks(node, depth, allowed=_ITEM_CHILDREN)}
+        return {"type": "blockquote", "content": _blocks(node, depth, allowed=_BLOCKS)}
     if kind == "horizontalRule":
         return {"type": "horizontalRule"}
     if kind == "image":
@@ -142,8 +146,8 @@ def _block(node: Any, depth: int, *, allowed: frozenset[str] | None = None) -> d
 
 
 _LIST_ITEM = frozenset({"listItem"})
-_ITEM_CHILDREN = frozenset({"paragraph", "bulletList", "orderedList", "blockquote"})
-_TOP_LEVEL = frozenset({"paragraph", "heading", "bulletList", "orderedList", "blockquote", "horizontalRule", "image"})
+# issue 182: lists and quotes take the same blocks as the top level, matching what the editor can write.
+_BLOCKS = frozenset({"paragraph", "heading", "bulletList", "orderedList", "blockquote", "horizontalRule", "image"})
 
 
 def normalize_body(value: Any) -> dict:
@@ -154,7 +158,7 @@ def normalize_body(value: Any) -> dict:
         raise ValueError("body is too large")
     return {
         "type": "doc",
-        "content": [_block(child, 1, allowed=_TOP_LEVEL) for child in _nodes(value.get("content"), "doc")],
+        "content": [_block(child, 1, allowed=_BLOCKS) for child in _nodes(value.get("content"), "doc")],
     }
 
 
