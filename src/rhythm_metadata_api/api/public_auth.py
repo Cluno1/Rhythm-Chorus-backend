@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -25,6 +26,10 @@ from rhythm_metadata_api.domain.auth_schemas import (
     InviteCreateResponse,
     NonceResponse,
     RevokeResponse,
+    UserDeleteRequest,
+    UserDeletionPreviewResponse,
+    UserStatusRequest,
+    UserStatusResponse,
 )
 from rhythm_metadata_api.infrastructure.db.models import utc_now
 
@@ -216,6 +221,46 @@ def list_users(request: Request, _: AdminActor) -> AdminUserListResponse:
             for invite in invites
         ],
     )
+
+
+@router.get(
+    "/admin/users/{user_id}/deletion-preview",
+    response_model=UserDeletionPreviewResponse,
+)
+def preview_user_deletion(
+    user_id: str, request: Request, _: AdminActor
+) -> UserDeletionPreviewResponse:
+    try:
+        impact = request.app.state.v2_container.user_admin.deletion_preview(user_id)
+    except DeviceAuthError as error:
+        _raise(error)
+    return UserDeletionPreviewResponse(**asdict(impact))
+
+
+@router.post("/admin/users/{user_id}/delete", response_model=UserDeletionPreviewResponse)
+def delete_user(
+    user_id: str, body: UserDeleteRequest, request: Request, admin: AdminActor
+) -> UserDeletionPreviewResponse:
+    try:
+        impact = request.app.state.v2_container.user_admin.delete(
+            user_id, body.confirm_user_id, admin
+        )
+    except DeviceAuthError as error:
+        _raise(error)
+    return UserDeletionPreviewResponse(**asdict(impact))
+
+
+@router.post("/admin/users/{user_id}/status", response_model=UserStatusResponse)
+def change_user_status(
+    user_id: str, body: UserStatusRequest, request: Request, admin: AdminActor
+) -> UserStatusResponse:
+    try:
+        status = request.app.state.v2_container.user_admin.set_status(
+            user_id, body.status, admin
+        )
+    except DeviceAuthError as error:
+        _raise(error)
+    return UserStatusResponse(user_id=user_id, status=status)
 
 
 @router.post(

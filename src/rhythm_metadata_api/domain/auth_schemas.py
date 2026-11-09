@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -130,3 +132,23 @@ class AdministratorChangeResponse(CamelModel):
 
 class RevokeResponse(CamelModel):
     revoked: bool
+
+
+class UserDeletionPreviewResponse(CamelModel):
+    user_id: str
+    device_count: int
+    room_count: int
+    image_count: int
+
+
+class UserDeleteRequest(CamelModel):
+    confirm_user_id: str | None = Field(default=None, max_length=100)
+
+
+class UserStatusRequest(CamelModel):
+    status: Literal["active", "disabled"]
+
+
+class UserStatusResponse(CamelModel):
+    user_id: str
+    status: Literal["active", "disabled"]

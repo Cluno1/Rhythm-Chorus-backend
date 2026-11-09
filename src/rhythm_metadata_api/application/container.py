@@ -13,6 +13,7 @@ from rhythm_metadata_api.application.external_lyrics import ExternalLyricsServic
 from rhythm_metadata_api.application.music_sources import MusicSourceService
 from rhythm_metadata_api.application.room_service import RoomService
 from rhythm_metadata_api.application.unit_of_work import UnitOfWorkFactory
+from rhythm_metadata_api.application.user_admin_service import UserAdminService
 from rhythm_metadata_api.core.config import Settings
 from rhythm_metadata_api.infrastructure.db.database import (
     create_session_factory,
@@ -35,6 +36,7 @@ class V2Container:
     external_lyrics: ExternalLyricsService
     music_sources: MusicSourceService
     device_song_lyrics: DeviceSongLyricsService
+    user_admin: UserAdminService
 
     @classmethod
     def build(cls, settings: Settings) -> V2Container:
@@ -97,6 +99,7 @@ class V2Container:
             external_lyrics=external_lyrics,
             music_sources=MusicSourceService(sessions, settings),
             device_song_lyrics=DeviceSongLyricsService(sessions),
+            user_admin=UserAdminService(UnitOfWorkFactory(sessions), settings, client_images),
         )
 
     def close(self) -> None:

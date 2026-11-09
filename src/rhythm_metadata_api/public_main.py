@@ -126,6 +126,7 @@ _PUBLIC_WRITE_ROUTES = (
 )
 _PUBLIC_ADMIN_DEVICE_WRITE_ROUTES = (
     ("POST", re.compile(r"^/v2/admin/invites$")),
+    ("POST", re.compile(r"^/v2/admin/users/[^/]+/(?:delete|status)$")),
     ("POST", re.compile(r"^/v2/admin/devices/[^/]+/administrator$")),
     ("DELETE", re.compile(r"^/v2/admin/devices/[^/]+/administrator$")),
     ("POST", re.compile(r"^/v2/admin/devices/[^/]+/revoke$")),
