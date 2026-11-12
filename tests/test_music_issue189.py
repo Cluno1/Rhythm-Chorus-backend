@@ -19,6 +19,7 @@ from rhythm_metadata_api.application.music_adapters import (
     ADAPTERS,
     FeiniaoAdapter,
     MetingSearchAdapter,
+    adapter_kinds,
 )
 from rhythm_metadata_api.application.music_playback import _same_recording
 from rhythm_metadata_api.application.music_sources import (
@@ -40,6 +41,7 @@ def disable_background_health(monkeypatch):
 
 def test_meting_search_queries_every_enabled_connection_on_the_same_platform(tmp_path, monkeypatch):
     calls = []
+    assert next(item for item in adapter_kinds() if item["id"] == "meting_search")["supported_operations"] == ["song_search"]
 
     def fetch(url):
         query = parse_qs(urlsplit(url).query)

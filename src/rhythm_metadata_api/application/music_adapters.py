@@ -754,6 +754,13 @@ def adapter_kinds() -> list[dict]:
             "id": key,
             "name": _ADAPTER_NAMES.get(key, key),
             "default_config": getattr(adapter, "default_config", {}),
+            "supported_operations": sorted(
+                getattr(adapter, "supported_operations", (
+                    {"song_search", "song_detail", "audio_resolve", "lyrics"}
+                    | ({"playlist_search", "playlist_detail", "recommend"}
+                       if getattr(adapter, "browses_catalog", True) else set())
+                ))
+            ),
         }
         for key, adapter in ADAPTERS.items()
     ]
