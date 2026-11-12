@@ -44,6 +44,10 @@ class MusicSource(Base):
     base_url: Mapped[str] = mapped_column(String(500), nullable=False)
     config: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    health_failed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    health_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    health_latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    health_error: Mapped[str | None] = mapped_column(String(300), nullable=True)
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
@@ -61,6 +65,8 @@ class MusicSettings(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default="global")
     recommended_keywords: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    health_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    health_interval_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now

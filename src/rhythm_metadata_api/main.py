@@ -20,6 +20,7 @@ from rhythm_metadata_api.api.v2.room_routes import router as room_router
 from rhythm_metadata_api.api.v2.routes import router as v2_router
 from rhythm_metadata_api.application.container import V2Container
 from rhythm_metadata_api.application.device_auth import DeviceAuthService
+from rhythm_metadata_api.application.music_health import MusicHealthScheduler
 from rhythm_metadata_api.core.config import Settings, get_settings
 from rhythm_metadata_api.domain.v2.errors import V2DomainError
 from rhythm_metadata_api.infrastructure.storage.base import (
@@ -70,11 +71,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(lifespan_app: FastAPI) -> AsyncIterator[None]:
         container = V2Container.build(resolved_settings)
+        scheduler = MusicHealthScheduler(container.music_sources, resolved_settings.v2_database_path)
+        scheduler.start()
+        lifespan_app.state.music_health_scheduler = scheduler
         lifespan_app.state.v2_container = container
         lifespan_app.state.device_auth = DeviceAuthService(container.engine, resolved_settings)
         try:
             yield
         finally:
+            scheduler.stop()
             container.close()
 
     app = FastAPI(

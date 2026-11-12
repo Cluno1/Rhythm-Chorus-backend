@@ -279,6 +279,8 @@ class MusicSettingsPatch(BaseModel):
 
     recommended_keywords: list[str] = Field(max_length=100)
     revision: int = Field(ge=1)
+    health_enabled: bool | None = None
+    health_interval_minutes: int | None = Field(default=None, ge=1, le=10080)
 
     @field_validator("recommended_keywords")
     @classmethod
@@ -389,6 +391,10 @@ def serialize_source(source: MusicSource) -> dict:
         "base_url": source.base_url,
         "config": source.config,
         "enabled": source.enabled,
+        "health_failed": source.health_failed,
+        "health_checked_at": source.health_checked_at.isoformat() if source.health_checked_at else None,
+        "health_error": source.health_error,
+        "health_latency_ms": source.health_latency_ms,
         "priority": source.priority,
         "revision": source.revision,
     }
@@ -554,6 +560,8 @@ class MusicSourceService:
                     **current,
                     **{key: submitted[key] for key in data.config.model_fields_set},
                 }
+            if any(key in changes and changes[key] != getattr(source, key) for key in ("enabled", "config", "base_url")):
+                changes.update(health_failed=False, health_checked_at=None, health_error=None, health_latency_ms=None)
             changes["revision"] = data.revision + 1
             changes["updated_at"] = utc_now()
             result = session.execute(
@@ -576,9 +584,11 @@ class MusicSourceService:
         with self.sessions() as session:
             row = session.get(MusicSettings, "global")
         if row is None:
-            return {"recommended_keywords": list(_RECOMMENDED_KEYWORDS), "revision": 1, "updated_at": None}
+            return {"recommended_keywords": list(_RECOMMENDED_KEYWORDS), "health_enabled": True, "health_interval_minutes": 60, "revision": 1, "updated_at": None}
         return {
             "recommended_keywords": list(row.recommended_keywords),
+            "health_enabled": row.health_enabled,
+            "health_interval_minutes": row.health_interval_minutes,
             "revision": row.revision,
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         }
@@ -592,12 +602,16 @@ class MusicSourceService:
             if row is None:
                 session.add(MusicSettings(
                     id="global", recommended_keywords=data.recommended_keywords, revision=current + 1,
+                    health_enabled=data.health_enabled if data.health_enabled is not None else True,
+                    health_interval_minutes=data.health_interval_minutes or 60,
                 ))
             else:
                 result = session.execute(
                     update(MusicSettings)
                     .where(MusicSettings.id == "global", MusicSettings.revision == data.revision)
                     .values(recommended_keywords=data.recommended_keywords, revision=current + 1,
+                            health_enabled=data.health_enabled if data.health_enabled is not None else row.health_enabled,
+                            health_interval_minutes=data.health_interval_minutes or row.health_interval_minutes,
                             updated_at=utc_now())
                 )
                 if result.rowcount != 1:
@@ -649,7 +663,7 @@ class MusicSourceService:
         ] if catalog is not None else []
         if not standbys:
             return source, operation(source, self._adapter(source))
-        order = [*standbys, source] if self._is_down(source.id) else [source, *standbys]
+        order = [*standbys, source] if self._is_down(source.id) or source.health_failed else [source, *standbys]
         last_error: Exception | None = None
         for candidate in order:
             try:
@@ -849,12 +863,10 @@ class MusicSourceService:
     def search(self, query: str, page: int, source_id: str | None = None) -> dict:
         if not query.strip() or len(query) > 100:
             raise V2DomainError("search query must contain 1 to 100 characters")
-        sources = (
-            [self._active(source_id)] if source_id else
-            self._enabled_sources()
-        )
+        enabled = [] if source_id else self._enabled_sources()
+        sources = [self._active(source_id)] if source_id else [s for s in enabled if not s.health_failed]
         results = []
-        unavailable = []
+        unavailable = [s.id for s in enabled if s.health_failed]
         served: set[str] = set()
         catalogs = {source.id: None if source_id else self._catalog(source) for source in sources}
         for source in sources:
@@ -879,7 +891,7 @@ class MusicSourceService:
                     self._mark_down(source.id)
                 log.warning("Music search failed: source=%s page=%s error=%s", source.id, page, error)
                 unavailable.append(source.id)
-        if sources and not results:
+        if (sources or unavailable) and not results:
             raise V2Unavailable("all configured music sources are unavailable")
         return {"sources": results, "unavailable_sources": unavailable}
 
@@ -888,9 +900,10 @@ class MusicSourceService:
         query = query.strip()
         if not query or len(query) > 100:
             raise V2DomainError("search query must contain 1 to 100 characters")
-        sources = [self._active(source_id)] if source_id else self._enabled_sources()
+        enabled = [] if source_id else self._enabled_sources()
+        sources = [self._active(source_id)] if source_id else [s for s in enabled if not s.health_failed]
         results = []
-        unavailable = []
+        unavailable = [s.id for s in enabled if s.health_failed]
         served: set[str] = set()
         catalogs = {source.id: None if source_id else self._catalog(source) for source in sources}
         for source in sources:
@@ -915,7 +928,7 @@ class MusicSourceService:
                 if source_id:
                     raise V2Unavailable("configured music source is unavailable") from error
                 unavailable.append(source.id)
-        if sources and not results and unavailable:
+        if not results and unavailable:
             raise V2Unavailable("all configured music sources are unavailable")
         return {"sources": results, "unavailable_sources": unavailable}
 
@@ -923,7 +936,8 @@ class MusicSourceService:
         with self.sessions() as session:
             return list(session.scalars(
                 select(MusicSource).where(MusicSource.enabled.is_(True))
-                .order_by(MusicSource.priority, MusicSource.id)
+                .order_by(MusicSource.health_failed, func.coalesce(MusicSource.health_latency_ms, 2147483647),
+                          MusicSource.priority, MusicSource.id)
             ))
 
     def recommended_albums(self, limit: int) -> dict:

@@ -104,6 +104,15 @@ def patch_source(source_id: str, body: MusicSourcePatch, service: Sources, _: Ad
     return service.patch(source_id, body)
 
 
+@settings_router.post("/health-check", status_code=202)
+def trigger_music_health(request: Request, _: AdminActor) -> dict:
+    scheduler = request.app.state.music_health_scheduler
+    if not scheduler.trigger():
+        from rhythm_metadata_api.domain.v2.errors import V2Conflict
+        raise V2Conflict("music source health check is already running")
+    return {"accepted": True}
+
+
 @settings_router.get("")
 def music_settings(service: Sources, _: AdminActor) -> dict:
     return service.settings()

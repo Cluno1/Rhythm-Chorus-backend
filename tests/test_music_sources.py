@@ -32,6 +32,15 @@ from rhythm_metadata_api.domain.v2.errors import V2Conflict, V2DomainError, V2No
 from rhythm_metadata_api.main import create_app
 from rhythm_metadata_api.public_main import _public_read_allowed, create_public_app
 
+
+@pytest.fixture(autouse=True)
+def disable_background_health_scheduler(monkeypatch):
+    """These tests exercise request behavior; health checks have their own tests."""
+    from rhythm_metadata_api.application.music_health import MusicHealthScheduler
+    monkeypatch.setattr(MusicHealthScheduler, "start", lambda self: None)
+    monkeypatch.setattr(MusicHealthScheduler, "stop", lambda self: None)
+
+
 TOKEN = "issue140-test-bootstrap-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
