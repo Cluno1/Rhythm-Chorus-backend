@@ -60,11 +60,12 @@ def test_meting_search_queries_every_enabled_connection_on_the_same_platform(tmp
     with TestClient(create_app(configured)) as client:
         service = client.app.state.v2_container.music_sources
         for source_id, priority in (("meting-a", 20), ("meting-b", 30)):
-            service.create(MusicSourceCreate(
+            created = service.create(MusicSourceCreate(
                 id=source_id, name=source_id, adapter="meting_search",
                 base_url="http://127.0.0.1:8787/", priority=priority, enabled=True,
                 config=MusicSourceConfig(upstream_source="netease"),
             ))
+            assert created["effective_capabilities"]["audio_resolve"]["enabled"] is False
         response = client.get("/v2/music/search", headers=AUTH, params={"q": "周杰伦 安静", "page": 2})
         assert response.status_code == 200
         assert [group["source_id"] for group in response.json()["sources"]] == ["meting-a", "meting-b"]

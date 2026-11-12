@@ -512,6 +512,7 @@ class MusicSourceService:
             operation: {
                 "supported": operation in supported,
                 **self._capability(source, operation),
+                "enabled": operation in supported and self._capability(source, operation)["enabled"],
                 "health_state": (source.operation_health or {}).get(operation, {}).get(
                     "state", "unhealthy" if operation == "song_search" and source.health_failed else "unknown",
                 ),
