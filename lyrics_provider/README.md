@@ -9,7 +9,7 @@ Rhythm-Chorus-backend 的内网歌词来源，封装 [metowolf/Meting](https://g
 | 接口 | 说明 |
 | --- | --- |
 | `GET /health` | 存活检查 |
-| `GET /search?server=netease\|tencent\|kugou&q=&type=title\|lyrics&limit=1..50` | 返回 `items[]`：`source`、`id`、`title`、`artists`、`album`、`duration_ms`、`snippet`。只有网易云支持按歌词全文搜索（`type=lyrics`），并会返回命中的那一行 |
+| `GET /search?server=netease\|tencent\|kugou&q=&type=title\|lyrics&limit=1..50&page=1..1000` | 返回 `items[]`：`source`、`id`、`title`、`artists`、`album`、`duration_ms`、`snippet`。`page` 默认 1；只有网易云支持按歌词全文搜索（`type=lyrics`），并会返回命中的那一行 |
 | `GET /lyric?server=&id=` | 返回 `{lyric, tlyric}`，均为 LRC 原文 |
 
 上游失败时返回 502，后端会跳过这个来源。

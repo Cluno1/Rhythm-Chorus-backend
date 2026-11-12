@@ -5,6 +5,7 @@ import fcntl
 import logging
 import threading
 import time
+from concurrent.futures import TimeoutError as FutureTimeout
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select, update
@@ -72,14 +73,30 @@ class MusicHealthScheduler:
         for source in sources:
             if self.stop_event.is_set():
                 return
+            if not self.service._allows(source, "song_search", healthy=False):
+                continue
             checked = source.health_checked_at
             if not force and checked and checked.replace(tzinfo=UTC) + timedelta(minutes=interval) > now:
                 continue
             started = time.monotonic()
             try:
-                result = self.service._adapter(source).search(source.base_url, source.id, '周杰伦', 1)
-                if time.monotonic() - started > 8:
-                    raise TimeoutError('搜索检测超过 8 秒')
+                if not self.service._search_slots.acquire(blocking=False):
+                    raise TimeoutError('搜索检测并发已满')
+                def probe(item=source):
+                    return self.service._adapter(item).search(item.base_url, item.id, '周杰伦', 1)
+                try:
+                    future = self.service._search_pool.submit(probe)
+                except RuntimeError:
+                    self.service._search_slots.release()
+                    raise
+                future.add_done_callback(lambda _: self.service._search_slots.release())
+                try:
+                    result = future.result(timeout=self.service._capability(source, "song_search")["timeout_ms"] / 1000)
+                except FutureTimeout as exc:
+                    if future.done():
+                        raise
+                    future.cancel()
+                    raise TimeoutError('search probe timeout') from exc
                 if not result.get('items'):
                     raise ValueError('检测搜索未返回歌曲')
                 error = None
@@ -89,10 +106,18 @@ class MusicHealthScheduler:
                 settings = session.get(MusicSettings, 'global')
                 if not force and settings is not None and not settings.health_enabled:
                     return
+                health = dict(source.operation_health or {})
+                health['song_search'] = {
+                    'state': 'unhealthy' if error is not None else 'healthy',
+                    'checked_at': utc_now().isoformat(),
+                    'latency_ms': round((time.monotonic() - started) * 1000),
+                    'error': error,
+                }
                 session.execute(update(MusicSource).where(
                     MusicSource.id == source.id, MusicSource.enabled.is_(True),
                     MusicSource.revision == source.revision,
-                ).values(health_failed=error is not None, health_checked_at=utc_now(), health_error=error,
+                ).values(operation_health=health, health_failed=error is not None,
+                         health_checked_at=utc_now(), health_error=error,
                          health_latency_ms=round((time.monotonic() - started) * 1000)))
                 session.commit()
             log.info('Music health check source=%s result=%s', source.id, error or 'ok')

@@ -25,6 +25,14 @@ from rhythm_metadata_api.application.music_sources import (
 from rhythm_metadata_api.domain.v2.errors import V2NotFound, V2Unavailable
 from rhythm_metadata_api.main import create_app
 
+
+@pytest.fixture(autouse=True)
+def disable_background_music_health(monkeypatch):
+    """Adapter and routing assertions must not race the independent scheduler."""
+    from rhythm_metadata_api.application.music_health import MusicHealthScheduler
+    monkeypatch.setattr(MusicHealthScheduler, "start", lambda self: None)
+    monkeypatch.setattr(MusicHealthScheduler, "stop", lambda self: None)
+
 BASE = "http://search.kuwo.cn/"
 
 
@@ -277,12 +285,12 @@ def search(client: TestClient) -> dict:
     return response.json()
 
 
-def test_飞鸟可用时搜索只返回飞鸟且不请求酷我(tmp_path, monkeypatch) -> None:
+def test_飞鸟可用时搜索返回两个已启用来源(tmp_path, monkeypatch) -> None:
     client, _, feiniao, kuwo = standby_client(tmp_path, monkeypatch)
     with client:
         body = search(client)
-        assert [group["source_id"] for group in body["sources"]] == ["feiniao"]
-        assert kuwo.calls == []
+        assert [group["source_id"] for group in body["sources"]] == ["feiniao", "kuwo"]
+        assert len(kuwo.calls) == 1
         assert feiniao.calls == ["search_with_source"]
 
 
@@ -309,13 +317,13 @@ def test_飞鸟取链失败时按同一rid走酷我且缓存期内只解析一�
         assert feiniao.calls == ["get_song_with_source"]
 
 
-def test_飞鸟熔断期间新歌曲直接走酷我不再等飞鸟(tmp_path, monkeypatch, public_dns) -> None:
+def test_飞鸟取链失败不阻止后续搜索或独立取链尝试(tmp_path, monkeypatch, public_dns) -> None:
     client, service, feiniao, _ = standby_client(tmp_path, monkeypatch)
     feiniao.down = True
     with client:
         service.audio_url("feiniao", "1", "mp3")
         service.audio_url("feiniao", "2", "mp3")
-        assert feiniao.calls == ["get_song_with_source"]
+        assert feiniao.calls == ["get_song_with_source", "get_song_with_source"]
 
 
 def test_飞鸟歌词失败时由酷我提供且ID仍是飞鸟的(tmp_path, monkeypatch) -> None:
@@ -511,7 +519,7 @@ def test_飞鸟熔断期间仍用它上次的推荐池且不重新请求(tmp_pat
         assert ids() == {"feiniao:77"}
         service._recommended_pools["feiniao"] = (0.0, service._recommended_pools["feiniao"][1])  # expired
         feiniao.down = True
-        service._mark_down("feiniao")
+        service._mark_down("feiniao", "recommend")
         assert ids() == {"feiniao:77"}
         assert feiniao.calls == ["playlist_home", "search_playlist"]
         assert kuwo.calls == []

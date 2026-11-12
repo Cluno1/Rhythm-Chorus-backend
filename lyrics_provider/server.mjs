@@ -69,10 +69,10 @@ function withTimeout(promise) {
   ]).finally(() => clearTimeout(timer));
 }
 
-export async function search(server, q, type, limit) {
+export async function search(server, q, type, limit, page = 1) {
   const meting = new Meting(server);
   meting.format(false);
-  const option = { page: 1, limit };
+  const option = { page, limit };
   if (server === 'netease') option.type = NETEASE_TYPE[type];
   const raw = JSON.parse(await withTimeout(meting.search(q, option)));
   return normalizeSearch(server, raw, (item) => meting.provider.format(item), limit);
@@ -103,11 +103,14 @@ export function createServer() {
         const q = (url.searchParams.get('q') || '').trim();
         const type = url.searchParams.get('type') || 'title';
         const limit = Number(url.searchParams.get('limit') || 20);
-        if (!q || q.length > 100 || !['title', 'lyrics'].includes(type) || !(limit >= 1 && limit <= 50)) {
+        const page = Number(url.searchParams.get('page') || 1);
+        if (!q || q.length > 100 || !['title', 'lyrics'].includes(type) ||
+            !Number.isInteger(limit) || !(limit >= 1 && limit <= 50) ||
+            !Number.isInteger(page) || !(page >= 1 && page <= 1000)) {
           return send(res, 400, { error: 'invalid_query' });
         }
         // Only NetEase has a dedicated lyric index; the other platforms answer both kinds the same.
-        return send(res, 200, { items: await search(server, q, type, Math.floor(limit)) });
+        return send(res, 200, { items: await search(server, q, type, limit, page) });
       }
       if (url.pathname === '/lyric') {
         const id = url.searchParams.get('id') || '';

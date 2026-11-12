@@ -46,8 +46,8 @@ Recommended album invariants:
 
 Standby source invariants (issue 173):
 - Sources whose adapters share a ``catalog`` (Feiniao on Kuwo and Kuwo direct both use Kuwo rids)
-  stand in for each other. Search asks only the first healthy one per catalog in priority order,
-  so the same songs are not listed twice; detail, lyrics and audio for ``a:<rid>`` fall back to
+  stand in for each other. Song search asks every healthy enabled connection, including peers in
+  the same catalog; detail, lyrics and audio for ``a:<rid>`` fall back to
   ``b:<rid>`` and keep the ``a:`` ID, so songs already saved on phones keep playing.
 - A source that answered "unavailable" is skipped for 60 seconds while a standby exists, so an
   outage does not add an upstream timeout to every request. The record lives in process memory:
@@ -80,6 +80,7 @@ import re
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import UTC
 from time import monotonic
 from typing import Literal, Self
@@ -122,6 +123,10 @@ log = logging.getLogger(__name__)
 _KEEP = object()  # issue 176: marker for "leave the stored image as it is"
 
 _SOURCE_ID = re.compile(r"^[a-z][a-z0-9_-]{1,39}$")
+_OPERATIONS = (
+    "song_search", "song_detail", "audio_resolve", "lyrics",
+    "playlist_search", "playlist_detail", "recommend",
+)
 _AUDIO_URL_TTL_SECONDS = 150
 _RECOMMENDED_POOL_TTL_SECONDS = 3600
 _RECOMMENDED_RETRY_SECONDS = 300
@@ -200,6 +205,12 @@ class UrlResolver(BaseModel):
         return values
 
 
+class CapabilityConfig(BaseModel):
+    enabled: bool = True
+    priority: int | None = Field(default=None, ge=0, le=10000)
+    timeout_ms: int = Field(default=4000, ge=500, le=15000)
+
+
 class MusicSourceConfig(BaseModel):
     audio_hosts: list[str] = Field(default_factory=lambda: sorted(_AUDIO_HOSTS), max_length=20)
     artwork_hosts: list[str] = Field(default_factory=lambda: sorted(_ARTWORK_HOSTS), max_length=20)
@@ -213,6 +224,12 @@ class MusicSourceConfig(BaseModel):
     recommended_max_songs: int = Field(default=_RECOMMENDED_MAX_SONGS, ge=1, le=100000)
     # issue 173: only adapters that resolve audio through third parties (Kuwo direct) read this.
     url_resolvers: list[UrlResolver] = Field(default_factory=list, max_length=8)
+    # Missing entries preserve the adapter's historical behavior. Administrators can narrow
+    # individual operations without disabling a platform connection or changing song IDs.
+    capabilities: dict[Literal[
+        "song_search", "song_detail", "audio_resolve", "lyrics", "playlist_search",
+        "playlist_detail", "recommend",
+    ], CapabilityConfig] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def valid_recommended_range(self) -> Self:
@@ -253,6 +270,7 @@ class MusicSourceCreate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     adapter: str = Field(min_length=1, max_length=40)
     base_url: str = Field(min_length=1, max_length=500)
+    service_group_id: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_-]{1,39}$")
     enabled: bool = False
     priority: int = Field(default=100, ge=0, le=10000)
     config: MusicSourceConfig = Field(default_factory=MusicSourceConfig)
@@ -262,9 +280,14 @@ class MusicSourcePatch(BaseModel):
     revision: int = Field(ge=1)
     name: str | None = Field(default=None, min_length=1, max_length=100)
     base_url: str | None = Field(default=None, min_length=1, max_length=500)
+    service_group_id: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_-]{1,39}$")
     enabled: bool | None = None
     priority: int | None = Field(default=None, ge=0, le=10000)
     config: MusicSourceConfig | None = None
+
+
+class MusicSourceRevision(BaseModel):
+    revision: int = Field(ge=1)
 
 
 def _valid_keywords(values: list[str]) -> list[str]:
@@ -281,6 +304,7 @@ class MusicSettingsPatch(BaseModel):
     revision: int = Field(ge=1)
     health_enabled: bool | None = None
     health_interval_minutes: int | None = Field(default=None, ge=1, le=10080)
+    cross_platform_playback_enabled: bool | None = None
 
     @field_validator("recommended_keywords")
     @classmethod
@@ -389,12 +413,15 @@ def serialize_source(source: MusicSource) -> dict:
         "name": source.name,
         "adapter": source.adapter,
         "base_url": source.base_url,
+        "service_group_id": source.service_group_id,
+        "archived_at": source.archived_at.isoformat() if source.archived_at else None,
         "config": source.config,
         "enabled": source.enabled,
         "health_failed": source.health_failed,
         "health_checked_at": source.health_checked_at.isoformat() if source.health_checked_at else None,
         "health_error": source.health_error,
         "health_latency_ms": source.health_latency_ms,
+        "operation_health": source.operation_health or {},
         "priority": source.priority,
         "revision": source.revision,
     }
@@ -403,6 +430,7 @@ def serialize_source(source: MusicSource) -> dict:
 class MusicSourceService:
     def __init__(self, sessions: sessionmaker[Session], settings: Settings) -> None:
         self.sessions = sessions
+        self.settings_config = settings
         self.images = MusicImageArchive(settings)
         self._audio_urls: dict[tuple[str, int, str, str], tuple[float, str]] = {}
         self._audio_urls_guard = threading.Lock()
@@ -414,17 +442,77 @@ class MusicSourceService:
         self._recommended_seen: OrderedDict[str, float] = OrderedDict()
         self._recommended_seen_lock = threading.Lock()
         # issue 173: source id -> monotonic time until which it is skipped in favour of a standby.
-        self._down_until: dict[str, float] = {}
+        self._down_until: dict[tuple[str, str], float] = {}
+        # Bound in-flight upstream calls across concurrent API requests. Timed-out synchronous
+        # adapters can keep running until their own socket timeout, but cannot queue indefinitely.
+        self._search_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="music-search")
+        self._search_slots = threading.BoundedSemaphore(8)
+
+    def close(self) -> None:
+        self._search_pool.shutdown(wait=False, cancel_futures=True)
 
     def adapters(self) -> dict:
         return {"items": adapter_kinds()}
+
+    def _supported_operations(self, source: MusicSource) -> frozenset[str]:
+        adapter = self._adapter(source)
+        declared = getattr(adapter, "supported_operations", None)
+        if declared is not None:
+            return frozenset(declared)
+        operations = {"song_search", "song_detail", "audio_resolve", "lyrics"}
+        if getattr(adapter, "browses_catalog", True):
+            operations.update({"playlist_search", "playlist_detail", "recommend"})
+        return frozenset(operations)
+
+    @staticmethod
+    def _capability(source: MusicSource, operation: str) -> dict:
+        config = source.config or {}
+        entry = (config.get("capabilities") or {}).get(operation) or {}
+        return {
+            "enabled": entry.get("enabled", True),
+            "priority": entry.get("priority") if entry.get("priority") is not None else source.priority,
+            "timeout_ms": entry.get("timeout_ms", 4000),
+        }
+
+    def _allows(self, source: MusicSource, operation: str, *, healthy: bool = True) -> bool:
+        if not source.enabled or source.archived_at or operation not in self._supported_operations(source):
+            return False
+        if not self._capability(source, operation)["enabled"]:
+            return False
+        if not healthy:
+            return True
+        state = (source.operation_health or {}).get(operation, {}).get("state")
+        if operation == "song_search" and state is None and source.health_failed:
+            state = "unhealthy"
+        return state != "unhealthy"
+
+    def _operation_sources(self, operation: str, *, healthy: bool = True) -> list[MusicSource]:
+        return sorted(
+            (source for source in self._enabled_sources() if self._allows(source, operation, healthy=healthy)),
+            key=lambda source: (self._capability(source, operation)["priority"], source.id),
+        )
 
     def list_sources(self, *, enabled_only: bool = False) -> dict:
         with self.sessions() as session:
             query = select(MusicSource).order_by(MusicSource.priority, MusicSource.id)
             if enabled_only:
-                query = query.where(MusicSource.enabled.is_(True))
-            return {"items": [serialize_source(item) for item in session.scalars(query)]}
+                query = query.where(MusicSource.enabled.is_(True), MusicSource.archived_at.is_(None))
+            return {"items": [self._source_view(item) for item in session.scalars(query)]}
+
+    def _source_view(self, source: MusicSource) -> dict:
+        supported = self._supported_operations(source)
+        capabilities = {
+            operation: {
+                "supported": operation in supported,
+                **self._capability(source, operation),
+                "health_state": (source.operation_health or {}).get(operation, {}).get(
+                    "state", "unhealthy" if operation == "song_search" and source.health_failed else "unknown",
+                ),
+            }
+            for operation in _OPERATIONS
+        }
+        return {**serialize_source(source), "platform": self._catalog(source),
+                "supported_operations": sorted(supported), "effective_capabilities": capabilities}
 
     def list_metadata(
         self, *, page: int = 1, page_size: int = 25,
@@ -511,9 +599,15 @@ class MusicSourceService:
         defaults = getattr(ADAPTERS[data.adapter], "default_config", {})
         explicit = data.config.model_dump(include=data.config.model_fields_set)
         config = MusicSourceConfig.model_validate({**defaults, **explicit}).model_dump()
+        if data.adapter == "meting_search" and config["upstream_source"] not in {
+            "netease", "tencent", "kugou",
+        }:
+            raise V2DomainError("unsupported Meting platform")
+        base_url = self._validated_source_url(data.adapter, data.base_url)
         source = MusicSource(
             id=data.id, name=data.name.strip(), adapter=data.adapter,
-            base_url=validate_base_url(data.base_url), enabled=data.enabled,
+            base_url=base_url, enabled=data.enabled,
+            service_group_id=data.service_group_id,
             priority=data.priority, config=config, revision=1,
         )
         if not source.name:
@@ -525,7 +619,7 @@ class MusicSourceService:
             except IntegrityError as error:
                 session.rollback()
                 raise V2Conflict("music source id already exists") from error
-            return serialize_source(source)
+            return self._source_view(source)
 
     def patch(self, source_id: str, data: MusicSourcePatch) -> dict:
         with self.sessions() as session:
@@ -534,6 +628,8 @@ class MusicSourceService:
                 raise V2NotFound("music source not found")
             if source.revision != data.revision:
                 raise V2Conflict("music source was changed by another administrator")
+            if source.archived_at and data.enabled:
+                raise V2Conflict("restore the archived music source before enabling it")
             fields = data.model_fields_set
             changes: dict = {}
             if "name" in fields:
@@ -542,7 +638,9 @@ class MusicSourceService:
                     raise V2DomainError("source name is required")
                 changes["name"] = name
             if "base_url" in fields:
-                changes["base_url"] = validate_base_url(data.base_url or "")
+                changes["base_url"] = self._validated_source_url(source.adapter, data.base_url or "")
+            if "service_group_id" in fields:
+                changes["service_group_id"] = data.service_group_id
             if "enabled" in fields:
                 if data.enabled is None:
                     raise V2DomainError("enabled must be a boolean")
@@ -560,8 +658,23 @@ class MusicSourceService:
                     **current,
                     **{key: submitted[key] for key in data.config.model_fields_set},
                 }
+                if "capabilities" in data.config.model_fields_set:
+                    changes["config"]["capabilities"] = {
+                        **current.get("capabilities", {}), **submitted["capabilities"],
+                    }
+                if source.adapter == "meting_search" and changes["config"]["upstream_source"] not in {
+                    "netease", "tencent", "kugou",
+                }:
+                    raise V2DomainError("unsupported Meting platform")
+                if changes["config"]["upstream_source"] != current["upstream_source"]:
+                    has_history = session.scalar(select(MusicSongMetadata.source_id).where(
+                        MusicSongMetadata.source_id == source.id,
+                    ).limit(1)) is not None
+                    if has_history:
+                        raise V2Conflict("create a new source ID when changing the music platform")
             if any(key in changes and changes[key] != getattr(source, key) for key in ("enabled", "config", "base_url")):
                 changes.update(health_failed=False, health_checked_at=None, health_error=None, health_latency_ms=None)
+                changes["operation_health"] = {}
             changes["revision"] = data.revision + 1
             changes["updated_at"] = utc_now()
             result = session.execute(
@@ -578,17 +691,41 @@ class MusicSourceService:
                 "music source %s updated to revision %s; fields: %s",
                 source_id, source.revision, sorted(fields - {"revision"}),
             )
-            return serialize_source(source)
+            return self._source_view(source)
+
+    def set_archived(self, source_id: str, revision: int, archived: bool) -> dict:
+        with self.sessions() as session:
+            source = session.get(MusicSource, source_id)
+            if source is None:
+                raise V2NotFound("music source not found")
+            if source.revision != revision:
+                raise V2Conflict("music source was changed by another administrator")
+            result = session.execute(update(MusicSource).where(
+                MusicSource.id == source_id, MusicSource.revision == revision,
+            ).values(
+                archived_at=utc_now() if archived else None,
+                enabled=False,
+                revision=revision + 1,
+                updated_at=utc_now(),
+            ))
+            if result.rowcount != 1:
+                raise V2Conflict("music source was changed by another administrator")
+            session.commit()
+            session.refresh(source)
+            return self._source_view(source)
 
     def settings(self) -> dict:
         with self.sessions() as session:
             row = session.get(MusicSettings, "global")
         if row is None:
-            return {"recommended_keywords": list(_RECOMMENDED_KEYWORDS), "health_enabled": True, "health_interval_minutes": 60, "revision": 1, "updated_at": None}
+            return {"recommended_keywords": list(_RECOMMENDED_KEYWORDS), "health_enabled": True,
+                    "health_interval_minutes": 60, "cross_platform_playback_enabled": False,
+                    "revision": 1, "updated_at": None}
         return {
             "recommended_keywords": list(row.recommended_keywords),
             "health_enabled": row.health_enabled,
             "health_interval_minutes": row.health_interval_minutes,
+            "cross_platform_playback_enabled": row.cross_platform_playback_enabled,
             "revision": row.revision,
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         }
@@ -604,6 +741,7 @@ class MusicSourceService:
                     id="global", recommended_keywords=data.recommended_keywords, revision=current + 1,
                     health_enabled=data.health_enabled if data.health_enabled is not None else True,
                     health_interval_minutes=data.health_interval_minutes or 60,
+                    cross_platform_playback_enabled=bool(data.cross_platform_playback_enabled),
                 ))
             else:
                 result = session.execute(
@@ -612,6 +750,11 @@ class MusicSourceService:
                     .values(recommended_keywords=data.recommended_keywords, revision=current + 1,
                             health_enabled=data.health_enabled if data.health_enabled is not None else row.health_enabled,
                             health_interval_minutes=data.health_interval_minutes or row.health_interval_minutes,
+                            cross_platform_playback_enabled=(
+                                data.cross_platform_playback_enabled
+                                if data.cross_platform_playback_enabled is not None
+                                else row.cross_platform_playback_enabled
+                            ),
                             updated_at=utc_now())
                 )
                 if result.rowcount != 1:
@@ -626,9 +769,15 @@ class MusicSourceService:
         return self.settings()
 
     def _active(self, source_id: str) -> MusicSource:
+        source = self._known(source_id)
+        if not source.enabled or source.archived_at:
+            raise V2NotFound("music source is unavailable")
+        return source
+
+    def _known(self, source_id: str) -> MusicSource:
         with self.sessions() as session:
             source = session.get(MusicSource, source_id)
-            if source is None or not source.enabled:
+            if source is None:
                 raise V2NotFound("music source is unavailable")
             return source
 
@@ -636,41 +785,51 @@ class MusicSourceService:
         adapter = ADAPTERS.get(source.adapter)
         if adapter is None:
             raise V2Unavailable("configured music adapter is not installed")
+        if source.adapter == "meting_search":
+            self._validated_source_url(source.adapter, source.base_url)
         return adapter.configured(source.config) if hasattr(adapter, "configured") else adapter
+
+    def _validated_source_url(self, adapter: str, url: str) -> str:
+        if adapter == "meting_search":
+            trusted = self.settings_config.external_lyrics_provider_url.rstrip("/")
+            if not trusted or url.rstrip("/") != trusted:
+                raise V2DomainError("Meting search must use the configured internal provider URL")
+            return trusted + "/"
+        return validate_base_url(url)
 
     def _catalog(self, source: MusicSource) -> str | None:
         return getattr(self._adapter(source), "catalog", None)
 
-    def _is_down(self, source_id: str) -> bool:
-        return self._down_until.get(source_id, 0.0) > monotonic()
+    def _is_down(self, source_id: str, operation: str = "song_search") -> bool:
+        return self._down_until.get((source_id, operation), 0.0) > monotonic()
 
-    def _mark_down(self, source_id: str) -> None:
-        self._down_until[source_id] = monotonic() + _SOURCE_DOWN_SECONDS
+    def _mark_down(self, source_id: str, operation: str = "song_search") -> None:
+        self._down_until[(source_id, operation)] = monotonic() + _SOURCE_DOWN_SECONDS
 
-    def _yields_to_standby(self, source_id: str, catalog: str | None, catalogs: dict[str, str | None]) -> bool:
+    def _yields_to_standby(self, source_id: str, catalog: str | None, catalogs: dict[str, str | None], operation: str = "song_search") -> bool:
         """True while ``source_id`` is marked down and a healthy source of its catalog is enabled."""
-        return catalog is not None and self._is_down(source_id) and any(
-            other != source_id and other_catalog == catalog and not self._is_down(other)
+        return catalog is not None and self._is_down(source_id, operation) and any(
+            other != source_id and other_catalog == catalog and not self._is_down(other, operation)
             for other, other_catalog in catalogs.items()
         )
 
-    def _with_standby(self, source: MusicSource, operation):
-        """Run ``operation(source, adapter)``, then on same-catalog standbys (issue 173)."""
+    def _with_standby(self, source: MusicSource, operation, operation_name: str):
+        """Run one enabled capability, then ID-compatible same-platform capabilities."""
         catalog = self._catalog(source)
         standbys = [
-            other for other in self._enabled_sources()
+            other for other in self._operation_sources(operation_name)
             if other.id != source.id and catalog is not None and self._catalog(other) == catalog
         ] if catalog is not None else []
-        if not standbys:
-            return source, operation(source, self._adapter(source))
-        order = [*standbys, source] if self._is_down(source.id) or source.health_failed else [source, *standbys]
+        order = ([source] if self._allows(source, operation_name) else []) + standbys
+        if not order:
+            raise V2Unavailable("no enabled capability can serve this music item")
         last_error: Exception | None = None
         for candidate in order:
             try:
                 value = operation(candidate, self._adapter(candidate))
             except (V2Unavailable, V2NotFound) as error:
                 if isinstance(error, V2Unavailable):
-                    self._mark_down(candidate.id)
+                    self._mark_down(candidate.id, operation_name)
                 log.warning(
                     "Music source failed, trying standby: source=%s tried=%s error=%s",
                     source.id, candidate.id, error,
@@ -680,6 +839,8 @@ class MusicSourceService:
             if candidate.id != source.id:
                 log.info("Served by standby source: source=%s standby=%s", source.id, candidate.id)
             return candidate, value
+        if not source.enabled:
+            raise V2NotFound("music source is unavailable") from last_error
         raise last_error  # type: ignore[misc]
 
     def artwork_hosts(self, source_id: str | None = None) -> frozenset[str]:
@@ -700,7 +861,7 @@ class MusicSourceService:
         return value
 
     def metadata(self, source_id: str, song_id: str) -> dict:
-        self._active(source_id)
+        self._known(source_id)
         with self.sessions() as session:
             item = session.get(MusicSongMetadata, (source_id, self._id(song_id)))
             if item is None:
@@ -863,35 +1024,68 @@ class MusicSourceService:
     def search(self, query: str, page: int, source_id: str | None = None) -> dict:
         if not query.strip() or len(query) > 100:
             raise V2DomainError("search query must contain 1 to 100 characters")
-        enabled = [] if source_id else self._enabled_sources()
-        sources = [self._active(source_id)] if source_id else [s for s in enabled if not s.health_failed]
-        results = []
-        unavailable = [s.id for s in enabled if s.health_failed]
-        served: set[str] = set()
-        catalogs = {source.id: None if source_id else self._catalog(source) for source in sources}
+        if source_id:
+            explicit = self._active(source_id)
+            if not self._allows(explicit, "song_search"):
+                raise V2Unavailable("configured music source search is unavailable")
+            sources = [explicit]
+            unavailable: list[str] = []
+        else:
+            enabled = self._operation_sources("song_search", healthy=False)
+            sources = [source for source in enabled if self._allows(source, "song_search") and not self._is_down(source.id)]
+            unavailable = [source.id for source in enabled if source not in sources]
+        if not sources:
+            if unavailable:
+                raise V2Unavailable("all configured music sources are unavailable")
+            return {"sources": [], "unavailable_sources": []}
+
+        started = monotonic()
+        total_deadline = started + 4.0
+        pending = {}
+        found = {}
         for source in sources:
-            catalog = catalogs[source.id]
-            if catalog is not None and catalog in served:
-                continue  # issue 173: a healthier source of the same catalog already answered
-            if self._yields_to_standby(source.id, catalog, catalogs):
+            if not self._search_slots.acquire(blocking=False):
                 unavailable.append(source.id)
                 continue
+
+            def run(item=source):
+                return self._overlay(item.id, self._adapter(item).search(
+                    item.base_url, item.id, query.strip(), page,
+                ))
+
             try:
-                result = self._overlay(
-                    source.id,
-                    self._adapter(source).search(source.base_url, source.id, query.strip(), page),
-                )
-                results.append({"source_id": source.id, **result})
-                if catalog is not None:
-                    served.add(catalog)
-            except (V2Unavailable, V2DomainError) as error:
-                if source_id:
-                    raise V2Unavailable("configured music source is unavailable") from error
-                if isinstance(error, V2Unavailable):
-                    self._mark_down(source.id)
-                log.warning("Music search failed: source=%s page=%s error=%s", source.id, page, error)
+                future = self._search_pool.submit(run)
+            except RuntimeError:
+                self._search_slots.release()
                 unavailable.append(source.id)
-        if (sources or unavailable) and not results:
+                continue
+            future.add_done_callback(lambda _: self._search_slots.release())
+            deadline = min(total_deadline, monotonic() + self._capability(source, "song_search")["timeout_ms"] / 1000)
+            pending[future] = (source, deadline)
+
+        while pending:
+            now = monotonic()
+            due = [future for future, (_, deadline) in pending.items() if deadline <= now]
+            if not due:
+                wait(pending, timeout=max(0, min(deadline for _, deadline in pending.values()) - now),
+                     return_when=FIRST_COMPLETED)
+                due = [future for future, (_, deadline) in pending.items()
+                       if future.done() or deadline <= monotonic()]
+            for future in due:
+                source, _ = pending.pop(future)
+                if not future.done():
+                    future.cancel()
+                    self._mark_down(source.id)
+                    unavailable.append(source.id)
+                    continue
+                try:
+                    found[source.id] = {"source_id": source.id, **future.result()}
+                except Exception as error:  # noqa: BLE001 - one provider cannot fail the aggregate
+                    self._mark_down(source.id)
+                    log.warning("Music search failed: source=%s page=%s error=%s", source.id, page, error)
+                    unavailable.append(source.id)
+        results = [found[source.id] for source in sources if source.id in found]
+        if not results:
             raise V2Unavailable("all configured music sources are unavailable")
         return {"sources": results, "unavailable_sources": unavailable}
 
@@ -900,10 +1094,12 @@ class MusicSourceService:
         query = query.strip()
         if not query or len(query) > 100:
             raise V2DomainError("search query must contain 1 to 100 characters")
-        enabled = [] if source_id else self._enabled_sources()
-        sources = [self._active(source_id)] if source_id else [s for s in enabled if not s.health_failed]
+        enabled = [] if source_id else self._operation_sources("playlist_search", healthy=False)
+        sources = [self._active(source_id)] if source_id else [s for s in enabled if self._allows(s, "playlist_search")]
+        if source_id and not self._allows(sources[0], "playlist_search"):
+            raise V2Unavailable("configured music source playlist search is unavailable")
         results = []
-        unavailable = [s.id for s in enabled if s.health_failed]
+        unavailable = [s.id for s in enabled if s not in sources]
         served: set[str] = set()
         catalogs = {source.id: None if source_id else self._catalog(source) for source in sources}
         for source in sources:
@@ -913,7 +1109,7 @@ class MusicSourceService:
             catalog = catalogs[source.id]
             if catalog is not None and catalog in served:
                 continue  # issue 174: one source per catalog, as in song search
-            if self._yields_to_standby(source.id, catalog, catalogs):
+            if self._yields_to_standby(source.id, catalog, catalogs, "playlist_search"):
                 unavailable.append(source.id)
                 continue
             try:
@@ -923,7 +1119,7 @@ class MusicSourceService:
                     served.add(catalog)
             except (V2Unavailable, V2DomainError) as error:
                 if isinstance(error, V2Unavailable) and not source_id:
-                    self._mark_down(source.id)
+                    self._mark_down(source.id, "playlist_search")
                 log.warning("Playlist search failed: source=%s page=%s error=%s", source.id, page, error)
                 if source_id:
                     raise V2Unavailable("configured music source is unavailable") from error
@@ -936,23 +1132,20 @@ class MusicSourceService:
         with self.sessions() as session:
             return list(session.scalars(
                 select(MusicSource).where(MusicSource.enabled.is_(True))
-                .order_by(MusicSource.health_failed, func.coalesce(MusicSource.health_latency_ms, 2147483647),
-                          MusicSource.priority, MusicSource.id)
+                .where(MusicSource.archived_at.is_(None))
+                .order_by(MusicSource.priority, MusicSource.id)
             ))
 
     def recommended_albums(self, limit: int) -> dict:
         candidates: dict[str, dict] = {}
-        browsing = [
-            (source, self._adapter(source)) for source in self._enabled_sources()
-            if getattr(self._adapter(source), "browses_catalog", True)
-        ]
+        browsing = [(source, self._adapter(source)) for source in self._operation_sources("recommend")]
         catalogs = {source.id: getattr(adapter, "catalog", None) for source, adapter in browsing}
         served: set[str] = set()
         for source, _adapter in browsing:
             catalog = catalogs[source.id]
             if catalog is not None and catalog in served:
                 continue  # issue 174: a source of this catalog already has a pool
-            if self._yields_to_standby(source.id, catalog, catalogs):
+            if self._yields_to_standby(source.id, catalog, catalogs, "recommend"):
                 cached = self._recommended_pools.get(source.id)
                 pool = cached[1] if cached else []  # keep the last pool, do not wait on a down source
             else:
@@ -1016,7 +1209,7 @@ class MusicSourceService:
                 except (V2Unavailable, V2DomainError) as error:
                     log.warning("Recommended playlists failed: source=%s page=%s error=%s", source.id, page, error)
                     if isinstance(error, V2Unavailable):
-                        self._mark_down(source.id)
+                        self._mark_down(source.id, "recommend")
                         break
                     continue
                 items.update((item["id"], item) for item in result["items"])
@@ -1030,12 +1223,14 @@ class MusicSourceService:
                     except (V2Unavailable, V2DomainError) as error:
                         log.warning("Recommended playlists failed: source=%s page=%s error=%s", source.id, page, error)
                         if isinstance(error, V2Unavailable):
-                            self._mark_down(source.id)
+                            self._mark_down(source.id, "recommend")
                             break
                         continue
                     items.update((item["id"], item) for item in result["items"])
             keywords = self.settings()["recommended_keywords"]
-            if keywords and hasattr(adapter, "search_playlists") and not self._is_down(source.id):
+            if (keywords and hasattr(adapter, "search_playlists") and self._allows(source, "playlist_search")
+                    and not self._is_down(source.id, "playlist_search")
+                    and not self._is_down(source.id, "recommend")):
                 keyword = keywords[int(time.time() // 3600) % len(keywords)]
                 try:
                     result = adapter.search_playlists(source.base_url, source.id, keyword, 1)
@@ -1052,22 +1247,29 @@ class MusicSourceService:
 
     def recommend(self, source_id: str, page: int) -> dict:
         source = self._active(source_id)
+        if not self._allows(source, "recommend"):
+            raise V2Unavailable("music recommendations are unavailable")
         return self._overlay(source.id, self._adapter(source).recommend(source.base_url, source.id, page))
 
     def playlists(self, source_id: str, page: int) -> dict:
         source = self._active(source_id)
+        if not self._allows(source, "recommend"):
+            raise V2Unavailable("music playlists are unavailable")
         return self._adapter(source).playlists(source.base_url, source.id, page)
 
     def playlist(self, source_id: str, playlist_id: str, page: int) -> dict:
         source = self._active(source_id)
+        if "playlist_detail" not in self._supported_operations(source):
+            raise V2NotFound("this music source has no playlists")
         playlist_id = self._id(playlist_id)
         serving, result = self._with_standby(
             source, lambda serving, adapter: adapter.playlist(serving.base_url, serving.id, playlist_id, page),
+            "playlist_detail",
         )
         return self._overlay(serving.id, {**result, "id": f"{source.id}:{playlist_id}"})
 
     def song(self, source_id: str, song_id: str, refresh: bool = False) -> dict:
-        source = self._active(source_id)
+        source = self._known(source_id)
         if not refresh:
             try:
                 return self.metadata(source_id, song_id)
@@ -1076,11 +1278,12 @@ class MusicSourceService:
         song_id = self._id(song_id)
         _, result = self._with_standby(
             source, lambda serving, adapter: adapter.song(serving.base_url, serving.id, song_id),
+            "song_detail",
         )
         return {**result, "id": f"{source.id}:{song_id}", "source_id": source.id}
 
     def lyrics(self, source_id: str, song_id: str, refresh: bool = False) -> dict:
-        source = self._active(source_id)
+        source = self._known(source_id)
         if not refresh:
             try:
                 cached = self.metadata(source_id, song_id)
@@ -1091,6 +1294,7 @@ class MusicSourceService:
         song_id = self._id(song_id)
         serving, result = self._with_standby(
             source, lambda serving, adapter: adapter.lyrics(serving.base_url, serving.id, song_id),
+            "lyrics",
         )
         return {
             **result, "id": f"{source.id}:{song_id}", "source_id": source.id,
@@ -1100,7 +1304,7 @@ class MusicSourceService:
     def audio_url(self, source_id: str, song_id: str, quality: str) -> str:
         if quality != AUTO_QUALITY and quality not in AUDIO_QUALITIES:
             raise V2DomainError("unsupported audio quality")
-        source = self._active(source_id)
+        source = self._known(source_id)
         song_id = self._id(song_id)
         key = (source.id, source.revision, song_id, quality)
         with self._audio_urls_guard:
@@ -1115,6 +1319,7 @@ class MusicSourceService:
                 return cached[1]
             _, url = self._with_standby(
                 source, lambda serving, adapter: adapter.audio_url(serving.base_url, song_id, quality),
+                "audio_resolve",
             )
             with self._audio_urls_guard:
                 ttl = MusicSourceConfig.model_validate(source.config).audio_url_ttl_seconds
@@ -1130,7 +1335,7 @@ class MusicSourceService:
     def invalidate_audio_url(
         self, source_id: str, song_id: str, quality: str, failed_url: str,
     ) -> None:
-        source = self._active(source_id)
+        source = self._known(source_id)
         key = (source.id, source.revision, self._id(song_id), quality)
         with self._audio_urls_guard:
             if (cached := self._audio_urls.get(key)) and cached[1] == failed_url:

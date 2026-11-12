@@ -58,6 +58,7 @@ test('HTTP 层拒绝不支持的来源与非法参数', async () => {
     assert.equal((await fetch(`${base}/search?server=kuwo&q=a`)).status, 400);
     assert.equal((await fetch(`${base}/search?server=netease&q=`)).status, 400);
     assert.equal((await fetch(`${base}/search?server=netease&q=a&limit=99`)).status, 400);
+    assert.equal((await fetch(`${base}/search?server=netease&q=a&page=0`)).status, 400);
     assert.equal((await fetch(`${base}/lyric?server=netease&id=../x`)).status, 400);
     assert.equal((await fetch(`${base}/url?server=netease&id=1`)).status, 404);
   } finally {

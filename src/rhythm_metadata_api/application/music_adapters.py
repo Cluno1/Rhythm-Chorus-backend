@@ -260,6 +260,82 @@ class MusicAdapter(Protocol):
     def audio_url(self, base_url: str, song_id: str, quality: str) -> str: ...
 
 
+class MetingSearchAdapter:
+    """Search-only connector for the trusted local lyrics_provider service."""
+
+    kind = "meting_search"
+    browses_catalog = False
+    supported_operations = frozenset({"song_search"})
+    default_config: ClassVar[dict] = {"upstream_source": "netease"}
+    page_size = 20
+
+    def __init__(self, fetch=None) -> None:
+        self.fetch = fetch or self._fetch
+        self.upstream_source = "netease"
+
+    def configured(self, config: dict) -> MetingSearchAdapter:
+        adapter = copy(self)
+        adapter.upstream_source = config["upstream_source"]
+        if adapter.upstream_source not in {"netease", "tencent", "kugou"}:
+            raise V2DomainError("unsupported Meting platform")
+        return adapter
+
+    @property
+    def catalog(self) -> str:
+        return self.upstream_source
+
+    @staticmethod
+    def _fetch(url: str) -> dict:
+        # Only the administrator-configured internal provider URL is passed here. Redirects are
+        # disabled so an internal service cannot turn this into a request to another host.
+        try:
+            with _opener.open(Request(url, headers={"Accept": "application/json"}), timeout=5) as response:
+                if not response.headers.get("Content-Type", "").lower().startswith("application/json"):
+                    raise V2Unavailable("Meting search returned non-JSON content")
+                body = response.read(MAX_JSON_BYTES + 1)
+        except (HTTPError, URLError, TimeoutError) as error:
+            raise V2Unavailable("Meting search is unavailable") from error
+        if len(body) > MAX_JSON_BYTES:
+            raise V2Unavailable("Meting search response is too large")
+        try:
+            payload = json.loads(body)
+        except (ValueError, UnicodeError) as error:
+            raise V2Unavailable("Meting search returned invalid JSON") from error
+        if not isinstance(payload, dict):
+            raise V2Unavailable("Meting search returned an invalid object")
+        return payload
+
+    def search(self, base_url: str, source_id: str, query: str, page: int) -> dict:
+        url = base_url.rstrip("/") + "/search?" + urlencode({
+            "server": self.upstream_source, "q": query, "type": "title",
+            "limit": self.page_size, "page": page,
+        })
+        payload = self.fetch(url)
+        rows = payload.get("items")
+        if not isinstance(rows, list):
+            raise V2Unavailable("Meting search response changed")
+        items = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            external_id = str(row.get("id") or "")
+            title = row.get("title")
+            artists = row.get("artists")
+            if not _ID.fullmatch(external_id) or not isinstance(title, str) or not title.strip():
+                continue
+            if not isinstance(artists, list) or not all(isinstance(item, str) for item in artists):
+                continue
+            duration = row.get("duration_ms")
+            items.append({
+                "id": f"{source_id}:{external_id}", "source_id": source_id,
+                "external_id": external_id, "title": title.strip(),
+                "artists": artists, "album": row.get("album") if isinstance(row.get("album"), str) else None,
+                "duration_ms": duration if isinstance(duration, int) and duration > 0 else None,
+                "artwork_url": None,
+            })
+        return {"items": items, "page": page, "has_more": len(rows) >= self.page_size}
+
+
 class FeiniaoAdapter:
     kind = "feiniao"
     upstream_source = "酷我音乐"
@@ -663,8 +739,13 @@ class KuwoAdapter:
         }
 
 
-ADAPTERS: dict[str, MusicAdapter] = {"feiniao": FeiniaoAdapter(), "kuwo": KuwoAdapter()}
-_ADAPTER_NAMES = {"feiniao": "飞鸟轻音", "kuwo": "酷我直连（LX 接口）"}
+ADAPTERS: dict[str, MusicAdapter] = {
+    "feiniao": FeiniaoAdapter(), "kuwo": KuwoAdapter(), "meting_search": MetingSearchAdapter(),
+}
+_ADAPTER_NAMES = {
+    "feiniao": "飞鸟轻音", "kuwo": "酷我直连（LX 接口）",
+    "meting_search": "Meting 搜索（网易/QQ/酷狗）",
+}
 
 
 def adapter_kinds() -> list[dict]:

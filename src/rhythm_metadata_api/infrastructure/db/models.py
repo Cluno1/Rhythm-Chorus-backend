@@ -42,12 +42,16 @@ class MusicSource(Base):
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     adapter: Mapped[str] = mapped_column(String(40), nullable=False)
     base_url: Mapped[str] = mapped_column(String(500), nullable=False)
+    service_group_id: Mapped[str | None] = mapped_column(String(40))
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     config: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     health_failed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     health_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     health_latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     health_error: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    # Per-operation health; the columns above remain a compatibility view of song_search.
+    operation_health: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
@@ -67,6 +71,7 @@ class MusicSettings(Base):
     recommended_keywords: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     health_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     health_interval_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
+    cross_platform_playback_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
@@ -97,6 +102,30 @@ class MusicSongMetadata(Base):
     lyrics_mode: Mapped[str | None] = mapped_column(String(12))
     lyrics_provider: Mapped[str | None] = mapped_column(String(40))
     lyrics_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class MusicPlaybackTicket(Base):
+    """One immutable resolved audio URL shared by API workers for a short playback window."""
+
+    __tablename__ = "v2_music_playback_tickets"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    actor_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    device_id: Mapped[str | None] = mapped_column(String(100))
+    origin_source_id: Mapped[str] = mapped_column(String(40), nullable=False)
+    origin_song_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    serving_source_id: Mapped[str] = mapped_column(String(40), nullable=False)
+    serving_song_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    quality: Mapped[str] = mapped_column(String(12), nullable=False)
+    audio_entity_id: Mapped[str] = mapped_column(String(96), nullable=False)
+    encrypted_url: Mapped[str] = mapped_column(Text, nullable=False)
+    content_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    content_length: Mapped[int] = mapped_column(Integer, nullable=False)
+    etag: Mapped[str | None] = mapped_column(String(200))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+
+    __table_args__ = (Index("v2_music_playback_tickets_expires_idx", "expires_at"),)
 
 
 class DeviceSongLyrics(Base):

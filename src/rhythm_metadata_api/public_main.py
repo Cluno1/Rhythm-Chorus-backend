@@ -49,6 +49,8 @@ _EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85
 _PUBLIC_READ_ROUTES = (
     ("GET", re.compile(r"^/v2/music/sources$")),
     ("GET", re.compile(r"^/v2/music/search$")),
+    ("GET", re.compile(r"^/v2/music/playback/[A-Za-z0-9_-]{32,64}/stream$")),
+    ("HEAD", re.compile(r"^/v2/music/playback/[A-Za-z0-9_-]{32,64}/stream$")),
     ("GET", re.compile(r"^/v2/music/playlists/search$")),
     ("GET", re.compile(r"^/v2/music/device-lyrics$")),
     ("GET", re.compile(r"^/v2/music/recommended-albums$")),
@@ -102,6 +104,7 @@ _PUBLIC_READ_ROUTES = (
     ("GET", re.compile(r"^/v2/labs/images/[^/]+/delivery$")),
 )
 _PUBLIC_WRITE_ROUTES = (
+    ("POST", re.compile(r"^/v2/music/playback/prepare$")),
     ("PUT", re.compile(r"^/v2/music/sources/[a-z][a-z0-9_-]{1,39}/songs/[A-Za-z0-9_-]{1,80}/(?:metadata|lyrics)$")),
     ("PUT", re.compile(r"^/v2/music/device-lyrics$")),
     ("PUT", re.compile(r"^/v2/renditions/[^/]+/lyrics/[^/]+$")),

@@ -103,4 +103,5 @@ class V2Container:
         )
 
     def close(self) -> None:
+        self.music_sources.close()
         self.engine.dispose()

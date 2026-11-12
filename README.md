@@ -24,6 +24,14 @@ Rhythm 私有作品库后端。v2 以 `Work → Arrangement → Score/Rendition 
 
 设备客户端使用 `GET /v2/music/sources` 列出已启用来源，`GET /v2/music/search?q=&page=&source=` 搜索；`GET /v2/music/recommended-albums?limit=` 随机返回推荐歌单（只有名称、封面、歌曲数，歌曲走 `/playlists/{id}`）；浏览接口为 `/v2/music/sources/{id}/recommend`、`/playlists`、`/playlists/{playlist_id}`，歌曲接口为 `/songs/{song_id}`、`/songs/{song_id}/lyrics`、`/songs/{song_id}/stream?quality=mp3`。封面 `artwork_url` 是相对自家 API 根地址的 `/v2/music/artwork?...`。歌曲身份为 `{来源ID}:{上游歌曲ID}`；请求路径使用不带来源前缀的上游歌曲 ID。设备接口沿用现有设备签名；音频 `GET/HEAD` 支持单个字节 Range。飞鸟适配器仅调用匿名只读接口，不转发登录 Cookie 或账号数据。
 
+### 来源能力与播放票据（issue 189）
+
+来源的 `config.capabilities` 可分别配置 `song_search`、`song_detail`、`audio_resolve`、`lyrics`、`playlist_search`、`playlist_detail`、`recommend` 的 `enabled`、`priority`、`timeout_ms`。优先级数字越小越靠前；未配置的能力沿用适配器默认值。`GET /v2/admin/music-sources/adapters` 返回适配器支持的能力；来源列表返回 `effective_capabilities`、`operation_health`、`service_group_id` 和 `archived_at`。管理员可通过 `POST /v2/admin/music-sources/{id}/archive|restore`（请求体含 `revision`）归档或恢复来源，归档保留歌曲身份及元数据。原有健康定时开关、间隔和立即检测接口继续使用，只探测启用的歌曲搜索能力。
+
+歌曲搜索并发请求全部已启用且搜索健康的连接，按各连接的搜索优先级排序返回；单连接和整次请求均有截止时间。`meting_search` 适配器使用本机歌词服务搜索网易云、QQ 和酷狗，创建来源时分别设置 `config.upstream_source` 为 `netease`、`tencent`、`kugou`；它只支持搜索，不支持取链，且不会自动创建或启用来源。
+
+新客户端播放先调用 `POST /v2/music/playback/prepare`，传 `source_id`、`song_id`、可选 `quality` 和用于严格跨平台匹配的标题/歌手/专辑/时长；返回 `playback_ticket`、`audio_entity_id`、`stream_url` 和实际服务来源。随后对 `stream_url` 发起受鉴权的 `GET/HEAD` 或单段 `Range`。同一票据固定来源、歌曲、上游 URL、强 ETag、类型和长度；上游实体变化时返回 409，客户端应重新 prepare，并在实体 ID 改变时换缓存键、按毫秒位置重新定位。没有强 ETag 的上游不能签发新票据。`previous_ticket` 可在重新 prepare 时排除刚失败的来源。跨平台回退由全局 `cross_platform_playback_enabled` 控制，默认关闭；当前 Android 尚未接入票据协议，旧 stream 接口保持兼容。
+
 ## 本地运行
 
 要求 Python 3.12–3.14。

@@ -21,6 +21,7 @@ from rhythm_metadata_api.application.music_adapters import (
     validate_public_url,
 )
 from rhythm_metadata_api.application.music_images import MusicImageArchiveError
+from rhythm_metadata_api.application.music_playback import MusicPlaybackService, PlaybackPrepare
 from rhythm_metadata_api.application.music_sources import (
     LyricFilters,
     MusicSettingsPatch,
@@ -28,9 +29,10 @@ from rhythm_metadata_api.application.music_sources import (
     MusicSongMetadataWrite,
     MusicSourceCreate,
     MusicSourcePatch,
+    MusicSourceRevision,
     MusicSourceService,
 )
-from rhythm_metadata_api.domain.v2.errors import V2DomainError, V2Unavailable
+from rhythm_metadata_api.domain.v2.errors import V2Conflict, V2DomainError, V2Unavailable
 
 router = APIRouter(prefix="/v2/music", tags=["music sources"])
 admin_router = APIRouter(prefix="/v2/admin/music-sources", tags=["music source administration"])
@@ -102,6 +104,16 @@ def create_source(body: MusicSourceCreate, service: Sources, _: AdminActor) -> d
 @admin_router.patch("/{source_id}")
 def patch_source(source_id: str, body: MusicSourcePatch, service: Sources, _: AdminActor) -> dict:
     return service.patch(source_id, body)
+
+
+@admin_router.post("/{source_id}/archive")
+def archive_source(source_id: str, body: MusicSourceRevision, service: Sources, _: AdminActor) -> dict:
+    return service.set_archived(source_id, body.revision, True)
+
+
+@admin_router.post("/{source_id}/restore")
+def restore_source(source_id: str, body: MusicSourceRevision, service: Sources, _: AdminActor) -> dict:
+    return service.set_archived(source_id, body.revision, False)
 
 
 @settings_router.post("/health-check", status_code=202)
@@ -315,3 +327,89 @@ def head_song(
     quality: str = "mp3", range_header: Annotated[str | None, Header(alias="Range")] = None,
 ) -> Response:
     return _audio_response(source_id, song_id, service, quality, range_header, True)
+
+
+@router.post("/playback/prepare")
+def prepare_playback(body: PlaybackPrepare, service: Sources, actor: Actor) -> dict:
+    return MusicPlaybackService(service).prepare(body, actor)
+
+
+def _ticket_audio_response(
+    ticket_id: str, service: MusicSourceService, actor,
+    range_header: str | None, head: bool,
+) -> Response:
+    if range_header and not _SINGLE_RANGE.fullmatch(range_header):
+        raise V2DomainError("only one byte range is supported")
+    ticket, url = MusicPlaybackService(service).resolve(ticket_id, actor)
+    headers = {"Range": range_header} if range_header else {}
+    if range_header and ticket.etag:
+        headers["If-Range"] = ticket.etag
+    try:
+        upstream = _opener.open(
+            UrlRequest(url, headers=headers, method="HEAD" if head else "GET"), timeout=15,
+        )
+    except HTTPError as error:
+        if error.code == 416:
+            return Response(status_code=416, headers={
+                "Content-Range": f"bytes */{ticket.content_length}", "Cache-Control": "no-store",
+            })
+        raise V2Conflict("audio entity is unavailable; prepare a new playback ticket") from error
+    except (URLError, TimeoutError) as error:
+        raise V2Unavailable("audio upstream is unavailable") from error
+    content_type = upstream.headers.get("Content-Type", "").split(";", 1)[0].lower()
+    content_range = upstream.headers.get("Content-Range", "")
+    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range)
+    requested_range_valid = not range_header or match is not None
+    if range_header and match:
+        requested = range_header.removeprefix("bytes=")
+        requested_start, requested_end = requested.split("-", 1)
+        actual_start, actual_end = int(match.group(1)), int(match.group(2))
+        if requested_start:
+            expected_end = min(int(requested_end), ticket.content_length - 1) if requested_end else ticket.content_length - 1
+            requested_range_valid = actual_start == int(requested_start) and actual_end == expected_end
+        else:
+            expected_start = max(0, ticket.content_length - int(requested_end)) if requested_end else -1
+            requested_range_valid = actual_start == expected_start and actual_end == ticket.content_length - 1
+        requested_range_valid = requested_range_valid and upstream.headers.get("Content-Length") == str(actual_end - actual_start + 1)
+    valid = (
+        content_type == ticket.content_type
+        and upstream.status in {200, 206}
+        and (upstream.status == 206 if range_header else upstream.status == 200)
+        and (upstream.status != 206 or (match is not None and int(match.group(3)) == ticket.content_length))
+        and (upstream.status != 200 or upstream.headers.get("Content-Length") == str(ticket.content_length))
+        and (not ticket.etag or upstream.headers.get("ETag") == ticket.etag)
+        and requested_range_valid
+    )
+    if not valid:
+        upstream.close()
+        raise V2Conflict("audio entity changed; prepare a new playback ticket")
+    response_headers = {"Content-Type": content_type, "Cache-Control": "no-store"}
+    for header in ("Content-Length", "Content-Range", "Accept-Ranges", "ETag"):
+        if upstream.headers.get(header):
+            response_headers[header] = upstream.headers[header]
+    if head:
+        upstream.close()
+        return Response(status_code=upstream.status, headers=response_headers)
+
+    def chunks():
+        with upstream:
+            while chunk := upstream.read(64 * 1024):
+                yield chunk
+
+    return StreamingResponse(chunks(), status_code=upstream.status, headers=response_headers)
+
+
+@router.get("/playback/{ticket_id}/stream")
+def playback_stream(
+    ticket_id: str, service: Sources, actor: Actor,
+    range_header: Annotated[str | None, Header(alias="Range")] = None,
+) -> Response:
+    return _ticket_audio_response(ticket_id, service, actor, range_header, False)
+
+
+@router.head("/playback/{ticket_id}/stream")
+def playback_stream_head(
+    ticket_id: str, service: Sources, actor: Actor,
+    range_header: Annotated[str | None, Header(alias="Range")] = None,
+) -> Response:
+    return _ticket_audio_response(ticket_id, service, actor, range_header, True)
