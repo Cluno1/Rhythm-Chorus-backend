@@ -24,6 +24,7 @@ from rhythm_metadata_api.application.music_images import MusicImageArchiveError
 from rhythm_metadata_api.application.music_playback import MusicPlaybackService, PlaybackPrepare
 from rhythm_metadata_api.application.music_sources import (
     LyricFilters,
+    MusicCapabilityPatch,
     MusicSettingsPatch,
     MusicSongLyricsWrite,
     MusicSongMetadataWrite,
@@ -104,6 +105,13 @@ def create_source(body: MusicSourceCreate, service: Sources, _: AdminActor) -> d
 @admin_router.patch("/{source_id}")
 def patch_source(source_id: str, body: MusicSourcePatch, service: Sources, _: AdminActor) -> dict:
     return service.patch(source_id, body)
+
+
+@admin_router.patch("/{source_id}/capabilities/{operation}")
+def patch_source_capability(
+    source_id: str, operation: str, body: MusicCapabilityPatch, service: Sources, _: AdminActor,
+) -> dict:
+    return service.patch_capability(source_id, operation, body)
 
 
 @admin_router.post("/{source_id}/archive")

@@ -24,12 +24,16 @@ from rhythm_metadata_api.application.music_adapters import (
 from rhythm_metadata_api.application.music_playback import _same_recording
 from rhythm_metadata_api.application.music_sources import (
     CapabilityConfig,
+    MusicCapabilityPatch,
     MusicSourceConfig,
     MusicSourceCreate,
     MusicSourcePatch,
 )
+from rhythm_metadata_api.domain.v2.errors import V2DomainError
 from rhythm_metadata_api.infrastructure.db import database as database_module
+from rhythm_metadata_api.infrastructure.db.models import MusicSource
 from rhythm_metadata_api.main import create_app
+from rhythm_metadata_api.public_main import create_public_app
 
 
 @pytest.fixture(autouse=True)
@@ -206,6 +210,59 @@ def test_capability_switch_isolated_from_search(tmp_path, monkeypatch):
             "source_id": "feiniao", "song_id": "42",
         }).status_code == 503
         assert calls == ["search_with_source"]
+
+
+def test_search_and_playback_capabilities_can_be_changed_independently(tmp_path):
+    with TestClient(create_app(settings(tmp_path))) as client:
+        service = client.app.state.v2_container.music_sources
+        search = service.patch_capability("feiniao", "song_search", MusicCapabilityPatch(
+            revision=1, enabled=False, priority=25, timeout_ms=1500,
+        ))
+        assert search["effective_capabilities"]["song_search"]["enabled"] is False
+        assert search["effective_capabilities"]["song_search"]["priority"] == 25
+        assert search["effective_capabilities"]["audio_resolve"]["enabled"] is True
+        with service.sessions() as session:
+            source = session.get(MusicSource, "feiniao")
+            assert source is not None
+            source.operation_health = {"song_search": {"state": "healthy", "latency_ms": 88}}
+            session.commit()
+        playback = service.patch_capability("feiniao", "audio_resolve", MusicCapabilityPatch(
+            revision=2, enabled=False, priority=75,
+        ))
+        assert playback["effective_capabilities"]["audio_resolve"]["enabled"] is False
+        assert playback["effective_capabilities"]["audio_resolve"]["priority"] == 75
+        assert playback["effective_capabilities"]["song_search"]["priority"] == 25
+        assert playback["operation_health"]["song_search"]["state"] == "healthy"
+        with pytest.raises(V2DomainError):
+            service.patch_capability("feiniao", "not-an-operation", MusicCapabilityPatch(
+                revision=3, enabled=True,
+            ))
+
+
+def test_admin_search_and_playback_patch_routes_are_separate(tmp_path):
+    with TestClient(create_public_app(settings(tmp_path))) as client:
+        login = client.post("/v2/admin/session", json={
+            "username": "admin", "password": "correct horse battery staple",
+        })
+        assert login.status_code == 200
+        headers = {"Authorization": f"Bearer {login.json()['accessToken']}"}
+        base = "/v2/admin/music-sources/feiniao/capabilities/"
+        search = client.patch(base + "song_search", headers=headers, json={
+            "revision": 1, "enabled": False, "priority": 10,
+        })
+        assert search.status_code == 200
+        playback = client.patch(base + "audio_resolve", headers=headers, json={
+            "revision": 2, "enabled": True, "priority": 20,
+        })
+        assert playback.status_code == 200
+        capabilities = playback.json()["effective_capabilities"]
+        assert capabilities["song_search"]["enabled"] is False
+        assert capabilities["audio_resolve"]["enabled"] is True
+        assert capabilities["song_search"]["priority"] == 10
+        assert capabilities["audio_resolve"]["priority"] == 20
+        assert client.patch(base + "song_search", headers=headers, json={
+            "revision": 1, "enabled": True,
+        }).status_code == 409
 
 
 def test_upgrade_preserves_source_and_backfills_search_health(tmp_path):

@@ -290,6 +290,13 @@ class MusicSourceRevision(BaseModel):
     revision: int = Field(ge=1)
 
 
+class MusicCapabilityPatch(BaseModel):
+    revision: int = Field(ge=1)
+    enabled: bool | None = None
+    priority: int | None = Field(default=None, ge=0, le=10000)
+    timeout_ms: int | None = Field(default=None, ge=500, le=15000)
+
+
 def _valid_keywords(values: list[str]) -> list[str]:
     normalized = [value.strip() for value in values if value.strip()]
     if any(len(value) > 40 for value in normalized):
@@ -672,9 +679,34 @@ class MusicSourceService:
                     ).limit(1)) is not None
                     if has_history:
                         raise V2Conflict("create a new source ID when changing the music platform")
-            if any(key in changes and changes[key] != getattr(source, key) for key in ("enabled", "config", "base_url")):
-                changes.update(health_failed=False, health_checked_at=None, health_error=None, health_latency_ms=None)
+            reset_all_health = any(
+                key in changes and changes[key] != getattr(source, key)
+                for key in ("enabled", "base_url")
+            )
+            changed_operations: set[str] = set()
+            if "config" in changes:
+                previous_config = MusicSourceConfig.model_validate(source.config).model_dump()
+                next_config = changes["config"]
+                reset_all_health |= any(
+                    value != next_config.get(key) for key, value in previous_config.items()
+                    if key != "capabilities"
+                )
+                old_capabilities = previous_config.get("capabilities", {})
+                new_capabilities = next_config.get("capabilities", {})
+                changed_operations = {
+                    operation for operation in old_capabilities.keys() | new_capabilities.keys()
+                    if old_capabilities.get(operation) != new_capabilities.get(operation)
+                }
+            if reset_all_health:
                 changes["operation_health"] = {}
+            elif changed_operations:
+                changes["operation_health"] = {
+                    operation: value for operation, value in (source.operation_health or {}).items()
+                    if operation not in changed_operations
+                }
+            if reset_all_health or "song_search" in changed_operations:
+                changes.update(health_failed=False, health_checked_at=None,
+                               health_error=None, health_latency_ms=None)
             changes["revision"] = data.revision + 1
             changes["updated_at"] = utc_now()
             result = session.execute(
@@ -692,6 +724,24 @@ class MusicSourceService:
                 source_id, source.revision, sorted(fields - {"revision"}),
             )
             return self._source_view(source)
+
+    def patch_capability(self, source_id: str, operation: str, data: MusicCapabilityPatch) -> dict:
+        """Change one operation without rewriting another operation's configuration."""
+        if operation not in _OPERATIONS:
+            raise V2DomainError("unsupported music operation")
+        source = self._known(source_id)
+        if operation not in self._supported_operations(source):
+            raise V2DomainError("adapter does not support this music operation")
+        submitted = data.model_dump(exclude={"revision"}, exclude_unset=True)
+        if not submitted or any(value is None for value in submitted.values()):
+            raise V2DomainError("capability update requires non-null fields")
+        current = MusicSourceConfig.model_validate(source.config)
+        previous = current.capabilities.get(operation, CapabilityConfig())
+        updated = CapabilityConfig.model_validate({**previous.model_dump(), **submitted})
+        return self.patch(source_id, MusicSourcePatch(
+            revision=data.revision,
+            config=MusicSourceConfig(capabilities={operation: updated}),
+        ))
 
     def set_archived(self, source_id: str, revision: int, archived: bool) -> dict:
         with self.sessions() as session:

@@ -26,7 +26,7 @@ Rhythm 私有作品库后端。v2 以 `Work → Arrangement → Score/Rendition 
 
 ### 来源能力与播放票据（issue 189）
 
-来源的 `config.capabilities` 可分别配置 `song_search`、`song_detail`、`audio_resolve`、`lyrics`、`playlist_search`、`playlist_detail`、`recommend` 的 `enabled`、`priority`、`timeout_ms`。优先级数字越小越靠前；未配置的能力沿用适配器默认值。`GET /v2/admin/music-sources/adapters` 返回适配器支持的能力；来源列表返回 `effective_capabilities`、`operation_health`、`service_group_id` 和 `archived_at`。管理员可通过 `POST /v2/admin/music-sources/{id}/archive|restore`（请求体含 `revision`）归档或恢复来源，归档保留歌曲身份及元数据。原有健康定时开关、间隔和立即检测接口继续使用，只探测启用的歌曲搜索能力。
+来源的 `config.capabilities` 可分别配置 `song_search`、`song_detail`、`audio_resolve`、`lyrics`、`playlist_search`、`playlist_detail`、`recommend` 的 `enabled`、`priority`、`timeout_ms`。优先级数字越小越靠前；未配置的能力沿用适配器默认值。管理员可通过 `PATCH /v2/admin/music-sources/{id}/capabilities/song_search` 和 `.../audio_resolve` 独立调整搜索、播放取链能力，请求体带 `revision` 及需要改的字段；更新一种能力不会重置另一种能力的健康结果。`GET /v2/admin/music-sources/adapters` 返回适配器支持的能力；来源列表返回 `effective_capabilities`、`operation_health`、`service_group_id` 和 `archived_at`。管理员可通过 `POST /v2/admin/music-sources/{id}/archive|restore`（请求体含 `revision`）归档或恢复来源，归档保留歌曲身份及元数据。原有健康定时开关、间隔和立即检测接口继续使用，只探测启用的歌曲搜索能力。
 
 歌曲搜索并发请求全部已启用且搜索健康的连接，按各连接的搜索优先级排序返回；单连接和整次请求均有截止时间。`meting_search` 适配器使用本机歌词服务搜索网易云、QQ 和酷狗，创建来源时分别设置 `config.upstream_source` 为 `netease`、`tencent`、`kugou`；它只支持搜索，不支持取链，且不会自动创建或启用来源。
 
